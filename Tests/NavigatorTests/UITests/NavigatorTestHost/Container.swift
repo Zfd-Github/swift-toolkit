@@ -9,6 +9,41 @@ import ReadiumShared
 import ReadiumStreamer
 import UIKit
 
+final class ResourceFailureController {
+    private(set) var failedHREF: AnyURL?
+
+    func failResource(at href: AnyURL) {
+        failedHREF = href
+    }
+
+    func shouldFail(_ url: any URLConvertible) -> Bool {
+        failedHREF?.isEquivalentTo(url) == true
+    }
+}
+
+private final class FailureInjectingContainer: ReadiumShared.Container {
+    let sourceURL: AbsoluteURL? = nil
+    let entries: Set<AnyURL> = []
+
+    private let publication: Publication
+    private let failureController: ResourceFailureController
+
+    init(
+        publication: Publication,
+        failureController: ResourceFailureController
+    ) {
+        self.publication = publication
+        self.failureController = failureController
+    }
+
+    subscript(url: any URLConvertible) -> Resource? {
+        guard !failureController.shouldFail(url) else {
+            return nil
+        }
+        return publication.get(url)
+    }
+}
+
 /// Shared Readium infrastructure for testing.
 @MainActor class Container {
     static let shared = Container()
@@ -17,6 +52,7 @@ import UIKit
     let httpClient: HTTPClient
     let assetRetriever: AssetRetriever
     let publicationOpener: PublicationOpener
+    var continuousScrollLocation: Locator?
 
     init() {
         httpClient = DefaultHTTPClient()
@@ -44,9 +80,32 @@ import UIKit
         return publication
     }
 
-    func navigator(for publication: Publication) throws -> VisualNavigator & UIViewController {
+    func publicationFailingResourcesOnDemand(
+        from publication: Publication
+    ) -> (Publication, ResourceFailureController) {
+        let failureController = ResourceFailureController()
+        let wrappedPublication = Publication(
+            manifest: publication.manifest,
+            container: FailureInjectingContainer(
+                publication: publication,
+                failureController: failureController
+            )
+        )
+        memoryTracker.track(wrappedPublication)
+        return (wrappedPublication, failureController)
+    }
+
+    func navigator(
+        for publication: Publication,
+        epubPreferences: EPUBPreferences = .empty,
+        disablePageTurnsWhileScrolling: Bool = false
+    ) throws -> VisualNavigator & UIViewController {
         if publication.conforms(to: .epub) {
-            return try epubNavigator(for: publication)
+            return try epubNavigator(
+                for: publication,
+                preferences: epubPreferences,
+                disablePageTurnsWhileScrolling: disablePageTurnsWhileScrolling
+            )
         } else if publication.conforms(to: .pdf) {
             return try pdfNavigator(for: publication)
         } else {
@@ -54,11 +113,18 @@ import UIKit
         }
     }
 
-    func epubNavigator(for publication: Publication) throws -> EPUBNavigatorViewController {
+    func epubNavigator(
+        for publication: Publication,
+        preferences: EPUBPreferences = .empty,
+        disablePageTurnsWhileScrolling: Bool = false
+    ) throws -> EPUBNavigatorViewController {
         let navigator = try EPUBNavigatorViewController(
             publication: publication,
-            initialLocation: nil,
-            config: EPUBNavigatorViewController.Configuration()
+            initialLocation: preferences.scroll == true ? continuousScrollLocation : nil,
+            config: EPUBNavigatorViewController.Configuration(
+                preferences: preferences,
+                disablePageTurnsWhileScrolling: disablePageTurnsWhileScrolling
+            )
         )
         memoryTracker.track(navigator)
         return navigator

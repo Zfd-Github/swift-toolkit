@@ -54,6 +54,17 @@ export function findNearestInteractiveElement(element) {
 /// the screen.
 export function findFirstVisibleLocator() {
   const element = findElement(document.body);
+  return locatorFromElement(element);
+}
+
+/// Returns the `Locator` object to the first block element intersecting the
+/// given resource-local document rect.
+export function findFirstVisibleLocatorInRect(rect) {
+  const element = findElement(document.body, rect);
+  return locatorFromElement(element);
+}
+
+function locatorFromElement(element) {
   return {
     href: "#",
     type: "application/xhtml+xml",
@@ -66,19 +77,17 @@ export function findFirstVisibleLocator() {
   };
 }
 
-function findElement(rootElement) {
+function findElement(rootElement, visibleRect = null) {
   for (var i = 0; i < rootElement.children.length; i++) {
     const child = rootElement.children[i];
-    if (!shouldIgnoreElement(child) && isElementVisible(child)) {
-      return findElement(child);
+    if (!shouldIgnoreElement(child) && isElementVisible(child, visibleRect)) {
+      return findElement(child, visibleRect);
     }
   }
   return rootElement;
 }
 
-function isElementVisible(element) {
-  if (readium.isFixedLayout) return true;
-
+function isElementVisible(element, visibleRect) {
   if (element === document.body || element === document.documentElement) {
     return true;
   }
@@ -87,6 +96,13 @@ function isElementVisible(element) {
   }
 
   const rect = element.getBoundingClientRect();
+  if (visibleRect) {
+    return (
+      rect.bottom > visibleRect.y &&
+      rect.top < visibleRect.y + visibleRect.height
+    );
+  }
+  if (readium.isFixedLayout) return true;
   if (isScrollModeEnabled()) {
     return rect.bottom > 0 && rect.top < window.innerHeight;
   } else {

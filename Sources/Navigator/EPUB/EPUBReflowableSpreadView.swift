@@ -12,8 +12,15 @@ import WebKit
 
 /// A view rendering a spread of resources with a reflowable layout.
 final class EPUBReflowableSpreadView: EPUBSpreadView {
+    var contentHeightDidChange: ((CGFloat) -> Void)?
+
     private var topConstraint: NSLayoutConstraint!
     private var bottomConstraint: NSLayoutConstraint!
+    private(set) var contentHeight: CGFloat?
+
+    private var usesContinuousOuterScroll: Bool {
+        viewModel.scroll && !viewModel.verticalText
+    }
 
     private static let reflowableScript = loadScript(named: "readium-reflowable")
 
@@ -55,6 +62,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         scrollView.alwaysBounceHorizontal = false
 
         scrollView.isPagingEnabled = !viewModel.scroll
+        updateContinuousScrolling()
 
         webView.translatesAutoresizingMaskIntoConstraints = false
         topConstraint = webView.topAnchor.constraint(equalTo: topAnchor)
@@ -92,6 +100,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
         // Disables paginated mode if scroll is on.
         scrollView.isPagingEnabled = !viewModel.scroll
+        updateContinuousScrolling()
 
         updateContentInset()
     }
@@ -108,6 +117,14 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             topConstraint.constant = contentInset.top
             bottomConstraint.constant = -contentInset.bottom
             scrollView.contentInset = .zero
+        }
+    }
+
+    private func updateContinuousScrolling() {
+        let isContinuous = viewModel.scroll && !viewModel.verticalText
+        scrollView.isScrollEnabled = !isContinuous
+        if isContinuous {
+            scrollView.contentOffset = .zero
         }
     }
 
@@ -156,13 +173,152 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         // 0.2 seconds seems like a good value for it to work on an iPhone 5s.
         try? await Task.sleep(seconds: 0.2)
 
-        let location = pendingLocation
-        await go(to: location.location, animated: location.animated)
+        if usesContinuousOuterScroll {
+            updateContentHeight(await evaluateScript("readium.documentHeight()"))
+            scrollView.contentOffset = .zero
+            didCompleteGoTo()
+        } else {
+            let location = pendingLocation
+            await go(to: location.location, animated: location.animated)
 
-        // The rendering is sometimes very slow. So in case we don't show the first page of the resource, we add
-        // a generous delay before showing the spread again.
-        let delayed = !location.location.isStart
-        try? await Task.sleep(seconds: delayed ? 0.3 : 0)
+            // The rendering is sometimes very slow. So in case we don't show the first page of the resource, we add
+            // a generous delay before showing the spread again.
+            let delayed = !location.location.isStart
+            try? await Task.sleep(seconds: delayed ? 0.3 : 0)
+        }
+    }
+
+    /// Resolves a page location to a resource-local document Y coordinate.
+    func resolveVerticalOffset(for location: PageLocation) async -> CGFloat? {
+        await spreadLoaded()
+
+        switch location {
+        case .start:
+            return 0
+        case .end:
+            return contentHeight
+        case let .locator(locator):
+            return await resolveVerticalOffset(for: locator)
+        }
+    }
+
+    /// Resolves the given Locator to a resource-local document Y coordinate.
+    func resolveVerticalOffset(for locator: Locator) async -> CGFloat? {
+        guard let json = try? locator.jsonString() else {
+            return nil
+        }
+
+        let result = await evaluateScript("readium.resolveVerticalOffset(\(json))")
+        guard
+            case let .success(value) = result,
+            let number = value as? NSNumber
+        else {
+            return nil
+        }
+
+        let offset = CGFloat(number.doubleValue)
+        return offset.isFinite && offset >= 0 ? offset : nil
+    }
+
+    /// Returns the visible progression range for a resource-local document rect.
+    func progression(in visibleFrame: CGRect) -> ClosedRange<Double> {
+        guard
+            let contentHeight,
+            contentHeight > 0,
+            visibleFrame.minY.isFinite,
+            visibleFrame.maxY.isFinite
+        else {
+            return 0 ... 0
+        }
+
+        let first = min(max(Double(visibleFrame.minY / contentHeight), 0), 1)
+        let last = min(max(Double(visibleFrame.maxY / contentHeight), first), 1)
+        return first ... last
+    }
+
+    /// Finds the first element intersecting a resource-local document rect.
+    func findFirstVisibleElementLocator(in rect: CGRect) async -> Locator? {
+        guard
+            rect.origin.x.isFinite,
+            rect.origin.y.isFinite,
+            rect.width.isFinite,
+            rect.height.isFinite,
+            let rectJSON = try? JSONValue.object([
+                "x": .double(Double(rect.origin.x)),
+                "y": .double(Double(rect.origin.y)),
+                "width": .double(Double(rect.width)),
+                "height": .double(Double(rect.height)),
+            ]).jsonString()
+        else {
+            return nil
+        }
+
+        let result = await evaluateScript("readium.findFirstVisibleLocatorInRect(\(rectJSON))")
+        do {
+            guard
+                let json = try JSONValue(result.get()),
+                let locator = try Locator(json: json)
+            else {
+                return nil
+            }
+            let link = spread.first.link
+            return locator.copy(href: link.url(), mediaType: link.mediaType ?? .xhtml)
+        } catch {
+            log(.error, error)
+            return nil
+        }
+    }
+
+    /// Sets the resource-local document viewport used by continuous layout.
+    func setContinuousViewport(_ rect: CGRect?) async {
+        guard isSpreadLoaded, !Task.isCancelled else {
+            return
+        }
+
+        let rectJSON: String
+        if let rect {
+            guard
+                rect.origin.x.isFinite,
+                rect.origin.y.isFinite,
+                rect.width.isFinite,
+                rect.height.isFinite,
+                let json = try? JSONValue.object([
+                    "x": .double(Double(rect.origin.x)),
+                    "y": .double(Double(rect.origin.y)),
+                    "width": .double(Double(rect.width)),
+                    "height": .double(Double(rect.height)),
+                ]).jsonString()
+            else {
+                return
+            }
+            rectJSON = json
+            scrollView.isScrollEnabled = false
+            scrollView.contentOffset = .zero
+        } else {
+            rectJSON = "null"
+        }
+
+        await evaluateScript("readium.setViewportRect(\(rectJSON))")
+    }
+
+    private func updateContentHeight(_ result: Result<Any, Error>) {
+        guard case let .success(value) = result else {
+            return
+        }
+        updateContentHeight(value)
+    }
+
+    private func updateContentHeight(_ value: Any) {
+        guard let number = value as? NSNumber else {
+            return
+        }
+        let height = CGFloat(number.doubleValue)
+        guard height.isFinite, height > 0, height != contentHeight else {
+            return
+        }
+
+        contentHeight = height
+        contentHeightDidChange?(height)
     }
 
     override func go(to direction: EPUBSpreadView.Direction, options: NavigatorGoOptions) async -> Bool {
@@ -227,6 +383,17 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private var pendingLocation: PendingLocation = .init(location: .start, animated: false)
 
     override func go(to location: PageLocation, animated: Bool) async {
+        if usesContinuousOuterScroll {
+            guard isSpreadLoaded else {
+                pendingLocation = PendingLocation(location: location, animated: animated)
+                await waitGoToCompletion()
+                return
+            }
+
+            didCompleteGoTo()
+            return
+        }
+
         guard isSpreadLoaded else {
             // Delays moving to the location until the document is loaded.
             pendingLocation = PendingLocation(location: location, animated: animated)
@@ -248,6 +415,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     private func waitGoToCompletion() async {
+        guard !didReportNavigationFailure else {
+            return
+        }
         await withCheckedContinuation { continuation in
             goToContinuations.append(continuation)
         }
@@ -415,6 +585,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     override func registerJSMessages() {
         super.registerJSMessages()
         registerJSMessage(named: "progressionChanged") { [weak self] in self?.progressionDidChange($0) }
+        registerJSMessage(named: "contentHeightChanged") { [weak self] in self?.updateContentHeight($0) }
     }
 
     // MARK: - WKNavigationDelegate

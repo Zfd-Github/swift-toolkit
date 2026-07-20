@@ -33,6 +33,29 @@ final class MemoryLeakTests: XCTestCase {
             .close(assertMemoryDeallocated: true)
     }
 
+    func testContinuousEPUBNavigatorDeallocatesAfterClosing() {
+        let reader = app.open(.continuousScrollFailedNeighborEPUB, waitUntilReady: true)
+
+        reader.runAction(
+            .toggleLayoutModeWithFailedNeighbor,
+            completionPrefix: "toggleLayoutModeWithFailedNeighbor",
+            timeout: 60
+        )
+
+        let transition = reader.marker(.transitionMarker)
+        XCTAssertTrue(transition.contains("scroll=false"), transition)
+        XCTAssertTrue(transition.contains("oldPaginationReleased=true"), transition)
+        XCTAssertTrue(transition.contains("oldWebViewsReleased=true"), transition)
+        XCTAssertTrue(transition.contains("tokenPreserved=false"), transition)
+        XCTAssertTrue(transition.contains("targetReached=true"), transition)
+        XCTAssertTrue(transition.contains("target=Chapter 03"), transition)
+        XCTAssertTrue(transition.contains("originalReached=true"), transition)
+        XCTAssertTrue(transition.contains("original=Chapter 01"), transition)
+        XCTAssertEqual(reader.marker(.modeMarker), "paged")
+
+        reader.close(assertMemoryDeallocated: true)
+    }
+
     func testPDFNavigatorDeallocatesAfterClosing() {
         app
             .open(.daisyPDF, waitUntilReady: true)
