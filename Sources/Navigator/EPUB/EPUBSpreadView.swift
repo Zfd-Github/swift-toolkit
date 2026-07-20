@@ -14,6 +14,13 @@ protocol EPUBSpreadViewDelegate: AnyObject {
     /// Called when the spread view finished loading.
     func spreadViewDidLoad(_ spreadView: EPUBSpreadView) async
 
+    /// Called when WebKit cannot load the spread's publication resource.
+    func spreadView(
+        _ spreadView: EPUBSpreadView,
+        didFailToLoadResourceAt href: RelativeURL,
+        withError error: ReadError
+    )
+
     /// Called when the user tapped on an external link.
     func spreadView(_ spreadView: EPUBSpreadView, didTapOnExternalURL url: URL)
 
@@ -24,7 +31,7 @@ protocol EPUBSpreadViewDelegate: AnyObject {
     func spreadView(_ spreadView: EPUBSpreadView, didActivateDecoration id: Decoration.Id, inGroup group: DecorationGroup, frame: CGRect?, point: CGPoint?)
 
     /// Called when the text selection changes.
-    func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect)
+    func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange locator: Locator?, frame: CGRect)
 
     /// Called when the pages visible in the spread changed.
     func spreadViewPagesDidChange(_ spreadView: EPUBSpreadView)
@@ -58,8 +65,19 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     weak var activityIndicatorView: UIActivityIndicatorView?
     private var activityIndicatorStopWorkItem: DispatchWorkItem?
 
-    private(set) var isSpreadLoaded = false
+    private enum LoadState {
+        case loading
+        case loaded
+        case terminated
+    }
+
+    private var loadState: LoadState = .loading
+    var isSpreadLoaded: Bool {
+        loadState == .loaded
+    }
+
     private var spreadLoadTask: Task<Void, Never>?
+    private(set) var didReportNavigationFailure = false
 
     required init(
         viewModel: EPUBNavigatorViewModel,
@@ -112,10 +130,12 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// Called when the spread view is removed from the view hierarchy, to
     /// clear pending operations and retain cycles.
     func clear() {
+        loadState = .terminated
         webView.stopLoading()
 
         spreadLoadTask?.cancel()
         spreadLoadTask = nil
+        onSpreadLoadedCallbacks.complete()
 
         // Disable JS messages to break WKUserContentController reference.
         disableJSMessages()
@@ -396,12 +416,26 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// Called by the javascript code when the spread contents is fully loaded.
     /// The JS message `spreadLoaded` needs to be emitted by a subclass script, EPUBSpreadView's scripts don't.
     private func spreadDidLoad(_ body: Any) {
+        guard loadState == .loading else {
+            return
+        }
+
         spreadLoadTask?.cancel()
         spreadLoadTask = Task { @MainActor in
-            isSpreadLoaded = true
+            guard loadState == .loading else {
+                return
+            }
+
+            loadState = .loaded
             applySettings()
             await spreadDidLoad()
+            guard loadState == .loaded, !Task.isCancelled else {
+                return
+            }
             await delegate?.spreadViewDidLoad(self)
+            guard loadState == .loaded, !Task.isCancelled else {
+                return
+            }
             onSpreadLoadedCallbacks.complete()
             showSpread()
         }
@@ -414,7 +448,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
     /// Awaits for the spread to be fully loaded.
     func spreadLoaded() async {
-        if isSpreadLoaded {
+        guard loadState == .loading else {
             return
         }
 
@@ -427,8 +461,20 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
     /// Executes the given `callback` when the spread is fully loaded.
     func whenSpreadLoaded(_ callback: @escaping () -> Void) {
+        switch loadState {
+        case .terminated:
+            callback()
+            return
+        case .loaded:
+            let callback = onSpreadLoadedCallbacks.add(callback)
+            callback()
+            return
+        case .loading:
+            break
+        }
+
         let callback = onSpreadLoadedCallbacks.add(callback)
-        if isSpreadLoaded {
+        if loadState != .loading {
             callback()
         }
     }
@@ -453,8 +499,9 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             let selection = body as? [String: Any],
             let hrefString = selection["href"] as? String,
             let href = AnyURL(string: hrefString),
+            let link = spread.linkWithHREF(href),
             let text = try? Locator.Text(json: JSONValue(selection["text"])),
-            var frame = CGRect(json: selection["rect"])
+            let frame = CGRect(json: selection["rect"])
         else {
             focusedResource = nil
             delegate?.spreadView(self, selectionDidChange: nil, frame: .zero)
@@ -463,8 +510,15 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         }
 
         focusedResource = viewModel.readingOrder.firstIndexWithHREF(href)
-        frame.origin = convertPointToNavigatorSpace(frame.origin)
-        delegate?.spreadView(self, selectionDidChange: text, frame: frame)
+        delegate?.spreadView(
+            self,
+            selectionDidChange: Locator(
+                href: link.url(),
+                mediaType: link.mediaType ?? .xhtml,
+                text: text
+            ),
+            frame: convertRectToNavigatorSpace(frame)
+        )
     }
 
     /// Update webview style to userSettings.
@@ -641,7 +695,15 @@ extension EPUBSpreadView: WKScriptMessageHandler {
 
 extension EPUBSpreadView: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        log(.error, error)
+        reportNavigationFailure(error, in: webView)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        reportNavigationFailure(error, in: webView)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -669,6 +731,33 @@ extension EPUBSpreadView: WKNavigationDelegate {
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         delegate?.spreadViewDidTerminate()
+    }
+
+    private func reportNavigationFailure(_ error: Error, in webView: WKWebView) {
+        log(.error, error)
+
+        let readError = ReadError.wrap(error) ?? .decoding(error)
+        if case .cancelled = readError {
+            return
+        }
+        guard !didReportNavigationFailure else { return }
+        didReportNavigationFailure = true
+
+        clear()
+        setNeedsStopActivityIndicator()
+
+        let errorURL = (error as NSError).userInfo[NSURLErrorFailingURLErrorKey] as? URL
+        let href = errorURL.flatMap { viewModel.publicationBaseURL.relativize($0) }
+            ?? webView.url.flatMap { viewModel.publicationBaseURL.relativize($0) }
+            ?? viewModel.publicationBaseURL.relativize(viewModel.url(to: spread.first.link))
+            ?? spread.first.link.url().relativeURL
+        guard let href else { return }
+
+        delegate?.spreadView(
+            self,
+            didFailToLoadResourceAt: href,
+            withError: readError
+        )
     }
 }
 

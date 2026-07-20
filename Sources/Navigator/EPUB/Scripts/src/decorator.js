@@ -9,7 +9,12 @@ import {
   rectContainsPoint,
   toNativeRect,
 } from "./rect";
-import { log, logErrorMessage, rangeFromLocator } from "./utils";
+import {
+  getViewportRect,
+  log,
+  logErrorMessage,
+  rangeFromLocator,
+} from "./utils";
 
 // Polyfill for iOS 13.3
 import { ResizeObserver as ResizeObserverPolyfill } from "@juggle/resize-observer";
@@ -216,8 +221,17 @@ export function DecorationGroup(groupId, groupName) {
 
     const scrollingElement = document.scrollingElement;
     const { scrollLeft: xOffset, scrollTop: yOffset } = scrollingElement;
-    const viewportWidth = isVertical ? window.innerHeight : window.innerWidth;
-    const viewportHeight = isVertical ? window.innerWidth : window.innerHeight;
+    const viewportRect = getViewportRect();
+    const viewportWidth = viewportRect
+      ? viewportRect.width
+      : isVertical
+      ? window.innerHeight
+      : window.innerWidth;
+    const viewportHeight = viewportRect
+      ? viewportRect.height
+      : isVertical
+      ? window.innerWidth
+      : window.innerHeight;
 
     const columnCount =
       parseInt(

@@ -78,6 +78,54 @@ function appendVirtualColumnIfNeeded() {
 var lastKnownProgressions;
 var ticking = false;
 var viewportWidth = 0;
+var viewportRect = null;
+var documentHeightObserver = null;
+
+/// Returns the resource-local document rect supplied by the native navigator.
+export function getViewportRect() {
+  return viewportRect;
+}
+
+/// Overrides the viewport used for continuous layout and height observation.
+export function setViewportRect(rect) {
+  viewportRect = rect;
+
+  if (!rect) {
+    documentHeightObserver?.disconnect();
+    documentHeightObserver = null;
+    return;
+  }
+
+  if (!documentHeightObserver) {
+    documentHeightObserver = new ResizeObserver(notifyDocumentHeight);
+    if (document.documentElement) {
+      documentHeightObserver.observe(document.documentElement);
+    }
+    if (document.body) {
+      documentHeightObserver.observe(document.body);
+    }
+  }
+  notifyDocumentHeight();
+}
+
+/// Returns the resource's full document height in CSS pixels.
+export function documentHeight() {
+  const rootHeight = document.documentElement?.scrollHeight || 0;
+  const bodyHeight = document.body?.scrollHeight || 0;
+
+  // In continuous mode the root element is at least as tall as the WKWebView
+  // frame. Using it would therefore prevent a resource from shrinking after
+  // reflow, because the frame still contains the previous measured height.
+  const height =
+    viewportRect && document.body
+      ? bodyHeight
+      : Math.max(rootHeight, bodyHeight);
+  return Number.isFinite(height) ? Math.ceil(Math.max(0, height)) : 0;
+}
+
+function notifyDocumentHeight() {
+  webkit.messageHandlers.contentHeightChanged.postMessage(documentHeight());
+}
 
 /**
  * First and last progressions in range [0 - 1].
@@ -212,6 +260,38 @@ export function scrollToLocator(locator, animated) {
     return false;
   }
   return scrollToRange(range, animated);
+}
+
+/// Resolves a Locator to a finite, non-negative resource-local document Y.
+export function resolveVerticalOffset(locator) {
+  const locations = locator.locations || {};
+  let rect = null;
+
+  if (locator.text?.highlight || locations.cssSelector) {
+    rect = rangeFromLocator(locator)?.getBoundingClientRect();
+  }
+
+  if (!rect && locations.fragments) {
+    for (const htmlId of locations.fragments) {
+      const element = document.getElementById(htmlId);
+      if (element) {
+        rect = element.getBoundingClientRect();
+        break;
+      }
+    }
+  }
+
+  if (rect) {
+    const offset = rect.top + window.scrollY;
+    return Number.isFinite(offset) ? Math.max(0, offset) : null;
+  }
+
+  if (Number.isFinite(locations.progression)) {
+    const offset = locations.progression * documentHeight();
+    return Number.isFinite(offset) ? Math.max(0, offset) : null;
+  }
+
+  return null;
 }
 
 function scrollToRange(range, animated) {

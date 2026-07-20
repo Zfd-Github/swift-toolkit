@@ -34,6 +34,7 @@ protocol PageView {
     func go(to location: PageLocation, animated: Bool) async
 }
 
+@MainActor
 protocol PaginationViewDelegate: AnyObject {
     /// Creates the page view for the page at given index.
     func paginationView(_ paginationView: PaginationView, pageViewAtIndex index: Int) -> (UIView & PageView)?
@@ -41,12 +42,61 @@ protocol PaginationViewDelegate: AnyObject {
     /// Called when the page views were updated.
     func paginationViewDidUpdateViews(_ paginationView: PaginationView)
 
+    /// Called when the viewport changed, including within the current page view.
+    func paginationViewDidUpdateViewport(_ paginationView: PaginationView)
+
+    /// Resolves a page location to a resource-local vertical offset.
+    func paginationView(
+        _ paginationView: PaginationView,
+        verticalOffsetFor location: PageLocation,
+        at index: Int
+    ) async throws -> CGFloat?
+
     /// Returns the number of positions (as in `Publication.positionList`) in the page view at given index.
     func paginationView(_ paginationView: PaginationView, positionCountAtIndex index: Int) -> Int
 }
 
+extension PaginationViewDelegate {
+    func paginationViewDidUpdateViewport(_ paginationView: PaginationView) {}
+
+    func paginationView(
+        _ paginationView: PaginationView,
+        verticalOffsetFor location: PageLocation,
+        at index: Int
+    ) async -> CGFloat? {
+        nil
+    }
+}
+
 final class PaginationView: UIView, Loggable {
+    enum Axis: Equatable {
+        case horizontalPaged
+        case verticalContinuous
+    }
+
+    private struct VerticalPageState {
+        var height: CGFloat
+        var isReady: Bool
+    }
+
+    private enum VerticalPageReadyResult {
+        case ready
+        case unavailable
+    }
+
+    private struct VerticalPageReadyWaiter {
+        let id: UUID
+        let continuation: CheckedContinuation<VerticalPageReadyResult, Never>
+    }
+
+    private struct ViewportAnchor {
+        var index: Int
+        var localY: CGFloat
+    }
+
     weak var delegate: PaginationViewDelegate?
+
+    private(set) var axis: Axis
 
     /// Total number of page views to be paginated.
     private(set) var pageCount: Int = 0
@@ -68,6 +118,16 @@ final class PaginationView: UIView, Loggable {
     /// Queue of page index to be loaded next.
     private var loadingIndexQueue: [(index: Int, location: PageLocation)] = []
 
+    private var verticalPageStates: [Int: VerticalPageState] = [:]
+    private var verticalReadyWaiters: [Int: [VerticalPageReadyWaiter]] = [:]
+    private var provisionalVerticalNavigations: [UUID: Int] = [:]
+    private var provisionalOnlyPageIndices: Set<Int> = []
+    private var unavailableVerticalPageIndices: Set<Int> = []
+    private var initialVerticalNavigationTask: Task<Void, Never>?
+    private var loadGeneration = 0
+    private var isUpdatingVerticalLayout = false
+    private var isViewportUpdateScheduled = false
+
     /// Returns whether the page views are loaded.
     var isEmpty: Bool {
         loadedViews.isEmpty
@@ -79,12 +139,12 @@ final class PaginationView: UIView, Loggable {
     }
 
     /// Loaded page views in reading order.
-    private var orderedViews: [UIView & PageView] {
+    var orderedViews: [UIView & PageView] {
         var orderedViews = loadedViews
             .sorted { $0.key < $1.key }
             .map(\.value)
 
-        if readingProgression == .rtl {
+        if axis == .horizontalPaged, readingProgression == .rtl {
             orderedViews.reverse()
         }
 
@@ -92,6 +152,50 @@ final class PaginationView: UIView, Loggable {
     }
 
     private let scrollView = UIScrollView()
+
+    var contentSize: CGSize {
+        scrollView.contentSize
+    }
+
+    /// Insets applied to the outer continuous viewport.
+    var contentInset: UIEdgeInsets {
+        get { scrollView.contentInset }
+        set {
+            guard scrollView.contentInset != newValue else { return }
+            updateVerticalLayout(updatingCurrentIndex: true) {
+                scrollView.contentInset = newValue
+            }
+        }
+    }
+
+    func frameForView(at index: Int) -> CGRect? {
+        guard let view = loadedViews[index] else {
+            return nil
+        }
+
+        if axis == .verticalContinuous {
+            guard verticalReadyRange?.contains(index) == true else {
+                return nil
+            }
+        }
+        return view.frame
+    }
+
+    func visibleFrame(at index: Int) -> CGRect? {
+        guard let frame = frameForView(at: index) else {
+            return nil
+        }
+
+        let intersection = effectiveViewport.intersection(frame)
+        guard !intersection.isNull, intersection.width > 0, intersection.height > 0 else {
+            return nil
+        }
+        return intersection.offsetBy(dx: -frame.minX, dy: -frame.minY)
+    }
+
+    var visibleIndices: [Int] {
+        loadedViews.keys.sorted().filter { visibleFrame(at: $0) != nil }
+    }
 
     /// Set while a transition animation is in progress to prevent
     /// `layoutSubviews` from resetting `contentOffset` and interrupting the
@@ -107,18 +211,20 @@ final class PaginationView: UIView, Loggable {
         frame: CGRect,
         preloadPreviousPositionCount: Int,
         preloadNextPositionCount: Int,
-        isScrollEnabled: Bool
+        isScrollEnabled: Bool,
+        axis: Axis = .horizontalPaged
     ) {
         self.preloadPreviousPositionCount = preloadPreviousPositionCount
         self.preloadNextPositionCount = preloadNextPositionCount
         self.isScrollEnabled = isScrollEnabled
+        self.axis = axis
 
         super.init(frame: frame)
 
         scrollView.delegate = self
         scrollView.frame = bounds
         scrollView.autoresizingMask = [.flexibleHeight, .flexibleWidth]
-        scrollView.isPagingEnabled = true
+        scrollView.isPagingEnabled = axis == .horizontalPaged
         scrollView.bounces = false
         scrollView.showsHorizontalScrollIndicator = false
         scrollView.isScrollEnabled = isScrollEnabled
@@ -140,6 +246,11 @@ final class PaginationView: UIView, Loggable {
     }
 
     override func layoutSubviews() {
+        if axis == .verticalContinuous {
+            layoutVerticalPages()
+            return
+        }
+
         guard !loadedViews.isEmpty else {
             scrollView.contentSize = bounds.size
             return
@@ -157,15 +268,78 @@ final class PaginationView: UIView, Loggable {
         }
     }
 
+    func setVerticalPageHeight(_ height: CGFloat, isReady: Bool, at index: Int) {
+        guard
+            axis == .verticalContinuous,
+            0 ..< pageCount ~= index,
+            loadedViews[index] != nil
+        else {
+            return
+        }
+
+        let previousState = verticalPageStates[index]
+        let resolvedHeight = max(0, height)
+        updateVerticalLayout(
+            transformingAnchor: { anchor in
+                guard
+                    anchor.index == index,
+                    previousState?.isReady == true,
+                    let previousHeight = previousState?.height,
+                    previousHeight > 0
+                else {
+                    return anchor
+                }
+                return ViewportAnchor(
+                    index: anchor.index,
+                    localY: anchor.localY * resolvedHeight / previousHeight
+                )
+            },
+            updatingCurrentIndex: previousState?.isReady == true
+        ) {
+            let wasReady = previousState?.isReady == true
+            verticalPageStates[index] = VerticalPageState(
+                height: resolvedHeight,
+                isReady: isReady || wasReady
+            )
+        }
+
+        if isReady, loadedViews[index] != nil {
+            completeVerticalReadyWaiters(at: index, with: .ready)
+        }
+    }
+
+    func setVerticalPageFailed(at index: Int) {
+        guard axis == .verticalContinuous, 0 ..< pageCount ~= index else {
+            return
+        }
+
+        unavailableVerticalPageIndices.insert(index)
+        updateVerticalLayout {
+            loadedViews.removeValue(forKey: index)?.removeFromSuperview()
+            verticalPageStates.removeValue(forKey: index)
+            loadingIndexQueue.removeAll { $0.index == index }
+        }
+        completeVerticalReadyWaiters(at: index, with: .unavailable)
+    }
+
     override func willMove(toSuperview newSuperview: UIView?) {
         super.willMove(toSuperview: newSuperview)
 
         if newSuperview == nil {
+            initialVerticalNavigationTask?.cancel()
+            initialVerticalNavigationTask = nil
+            cancelPageLoading(clearQueue: true)
+            completeAllVerticalReadyWaiters(with: .unavailable)
+            provisionalVerticalNavigations.removeAll()
+            provisionalOnlyPageIndices.removeAll()
+
             // Remove all spread views to break retain cycles
             for (_, view) in loadedViews {
                 view.removeFromSuperview()
             }
             loadedViews.removeAll()
+            verticalPageStates.removeAll()
+            unavailableVerticalPageIndices.removeAll()
         }
     }
 
@@ -173,9 +347,157 @@ final class PaginationView: UIView, Loggable {
         super.didMoveToWindow()
 
         if window == nil {
-            loadPagesTask.cancel()
+            cancelPageLoading(clearQueue: false)
         } else {
             loadPages()
+        }
+    }
+
+    private var effectiveViewport: CGRect {
+        let inset = scrollView.adjustedContentInset
+        return CGRect(
+            x: scrollView.contentOffset.x + inset.left,
+            y: scrollView.contentOffset.y + inset.top,
+            width: max(0, scrollView.bounds.width - inset.left - inset.right),
+            height: max(0, scrollView.bounds.height - inset.top - inset.bottom)
+        )
+    }
+
+    private var verticalReadyRange: ClosedRange<Int>? {
+        guard
+            loadedViews[currentIndex] != nil,
+            verticalPageStates[currentIndex]?.isReady == true
+        else {
+            return nil
+        }
+
+        var firstIndex = currentIndex
+        while
+            firstIndex > 0,
+            loadedViews[firstIndex - 1] != nil,
+            verticalPageStates[firstIndex - 1]?.isReady == true
+        {
+            firstIndex -= 1
+        }
+
+        var lastIndex = currentIndex
+        while
+            lastIndex + 1 < pageCount,
+            loadedViews[lastIndex + 1] != nil,
+            verticalPageStates[lastIndex + 1]?.isReady == true
+        {
+            lastIndex += 1
+        }
+        return firstIndex ... lastIndex
+    }
+
+    private func layoutVerticalPages() {
+        let size = scrollView.bounds.size
+        let readyRange = verticalReadyRange
+        var y: CGFloat = 0
+
+        for (index, view) in loadedViews.sorted(by: { $0.key < $1.key }) {
+            guard
+                readyRange?.contains(index) == true,
+                let state = verticalPageStates[index]
+            else {
+                view.isHidden = true
+                view.frame = CGRect(origin: .zero, size: size)
+                continue
+            }
+
+            view.isHidden = false
+            view.frame = CGRect(x: 0, y: y, width: size.width, height: state.height)
+            y += state.height
+        }
+
+        scrollView.contentSize = CGSize(width: size.width, height: y)
+        clampVerticalContentOffset()
+    }
+
+    private func updateVerticalLayout(
+        transformingAnchor transformAnchor: ((ViewportAnchor) -> ViewportAnchor)? = nil,
+        updatingCurrentIndex: Bool = false,
+        _ updates: () -> Void
+    ) {
+        guard axis == .verticalContinuous else {
+            updates()
+            return
+        }
+
+        var anchor = viewportAnchor()
+        isUpdatingVerticalLayout = true
+        updates()
+        if let transformAnchor, let currentAnchor = anchor {
+            anchor = transformAnchor(currentAnchor)
+        }
+        layoutVerticalPages()
+        restoreViewportAnchor(anchor)
+        isUpdatingVerticalLayout = false
+        if updatingCurrentIndex {
+            updateCurrentIndexFromVerticalViewport()
+        }
+        scheduleViewportUpdate()
+    }
+
+    private func viewportAnchor() -> ViewportAnchor? {
+        guard let index = visibleIndices.first, let frame = frameForView(at: index) else {
+            return nil
+        }
+        return ViewportAnchor(index: index, localY: effectiveViewport.minY - frame.minY)
+    }
+
+    private func restoreViewportAnchor(_ anchor: ViewportAnchor?) {
+        guard let anchor, let frame = frameForView(at: anchor.index) else {
+            clampVerticalContentOffset()
+            return
+        }
+
+        scrollView.contentOffset.y = frame.minY + anchor.localY - scrollView.adjustedContentInset.top
+        clampVerticalContentOffset()
+    }
+
+    private func clampVerticalContentOffset() {
+        let inset = scrollView.adjustedContentInset
+        let minimumY = -inset.top
+        let maximumY = max(minimumY, scrollView.contentSize.height - scrollView.bounds.height + inset.bottom)
+        scrollView.contentOffset.y = min(maximumY, max(minimumY, scrollView.contentOffset.y))
+    }
+
+    private func scheduleViewportUpdate() {
+        guard !isViewportUpdateScheduled else {
+            return
+        }
+
+        isViewportUpdateScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isViewportUpdateScheduled = false
+            self.delegate?.paginationViewDidUpdateViewport(self)
+        }
+    }
+
+    private func updateCurrentIndexFromVerticalViewport() {
+        guard
+            axis == .verticalContinuous,
+            provisionalVerticalNavigations.isEmpty
+        else {
+            return
+        }
+
+        let viewportCenterY = effectiveViewport.midY
+        let visibleIndices = visibleIndices
+        let centerIndex = visibleIndices.first { index in
+            guard let frame = frameForView(at: index) else { return false }
+            return viewportCenterY >= frame.minY && viewportCenterY < frame.maxY
+        }
+        let nearestIndex = visibleIndices.min(by: { lhs, rhs in
+            let lhsFrame = frameForView(at: lhs) ?? .zero
+            let rhsFrame = frameForView(at: rhs) ?? .zero
+            return abs(lhsFrame.midY - viewportCenterY) < abs(rhsFrame.midY - viewportCenterY)
+        })
+        if let index = centerIndex ?? nearestIndex {
+            setCurrentIndex(index)
         }
     }
 
@@ -197,6 +519,13 @@ final class PaginationView: UIView, Loggable {
         precondition(pageCount >= 1)
         precondition(0 ..< pageCount ~= index)
 
+        cancelPageLoading(clearQueue: true)
+        initialVerticalNavigationTask?.cancel()
+        initialVerticalNavigationTask = nil
+        completeAllVerticalReadyWaiters(with: .unavailable)
+        provisionalVerticalNavigations.removeAll()
+        provisionalOnlyPageIndices.removeAll()
+
         self.pageCount = pageCount
         self.readingProgression = readingProgression
 
@@ -204,9 +533,28 @@ final class PaginationView: UIView, Loggable {
             view.removeFromSuperview()
         }
         loadedViews.removeAll()
-        loadingIndexQueue.removeAll()
+        verticalPageStates.removeAll()
+        unavailableVerticalPageIndices.removeAll()
 
-        setCurrentIndex(index, location: location)
+        if axis == .verticalContinuous {
+            let inset = scrollView.adjustedContentInset
+            scrollView.contentOffset = CGPoint(x: -inset.left, y: -inset.top)
+            scrollView.contentSize = CGSize(width: scrollView.bounds.width, height: 0)
+        }
+
+        if axis == .verticalContinuous {
+            setCurrentIndex(index)
+            initialVerticalNavigationTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                _ = await navigateVertically(
+                    at: index,
+                    location: location,
+                    animated: false
+                )
+            }
+        } else {
+            setCurrentIndex(index, location: location)
+        }
     }
 
     /// Updates the current and pre-loaded views.
@@ -221,20 +569,35 @@ final class PaginationView: UIView, Loggable {
         let movingBackward = (currentIndex - 1 == index)
         let location = location ?? (movingBackward ? .end : .start)
 
-        currentIndex = index
+        updateVerticalLayout {
+            currentIndex = index
 
-        // To make sure that the views the most likely to be visible are loaded first, we first load
-        // the current one, then the next ones and to finish the previous ones.
-        scheduleLoadPage(at: index, location: location)
-        let lastIndex = scheduleLoadPages(from: index, upToPositionCount: preloadNextPositionCount, direction: .forward, location: .start)
-        let firstIndex = scheduleLoadPages(from: index, upToPositionCount: preloadPreviousPositionCount, direction: .backward, location: .end)
+            if axis == .verticalContinuous {
+                loadingIndexQueue.removeAll()
+            }
 
-        for (i, view) in loadedViews {
-            // Flushes the views that are not needed anymore.
-            guard firstIndex ... lastIndex ~= i else {
-                view.removeFromSuperview()
-                loadedViews.removeValue(forKey: i)
-                continue
+            // To make sure that the views the most likely to be visible are loaded first, we first load
+            // the current one, then the next ones and to finish the previous ones.
+            scheduleLoadPage(at: index, location: location)
+            let nextPositionCount = axis == .verticalContinuous
+                ? max(1, preloadNextPositionCount)
+                : preloadNextPositionCount
+            let previousPositionCount = axis == .verticalContinuous
+                ? max(1, preloadPreviousPositionCount)
+                : preloadPreviousPositionCount
+            let lastIndex = scheduleLoadPages(from: index, upToPositionCount: nextPositionCount, direction: .forward, location: .start)
+            let firstIndex = scheduleLoadPages(from: index, upToPositionCount: previousPositionCount, direction: .backward, location: .end)
+
+            for (i, view) in loadedViews {
+                // Flushes the views that are not needed anymore.
+                guard firstIndex ... lastIndex ~= i else {
+                    completeVerticalReadyWaiters(at: i, with: .unavailable)
+                    view.removeFromSuperview()
+                    loadedViews.removeValue(forKey: i)
+                    verticalPageStates.removeValue(forKey: i)
+                    unavailableVerticalPageIndices.remove(i)
+                    continue
+                }
             }
         }
 
@@ -242,15 +605,32 @@ final class PaginationView: UIView, Loggable {
     }
 
     private func loadPages() {
-        loadPagesTask.replace { @MainActor in
-            await loadNextPage()
+        loadGeneration &+= 1
+        let generation = loadGeneration
+        loadPagesTask?.cancel()
+        loadPagesTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await loadNextPage(generation: generation)
+            guard !Task.isCancelled, generation == loadGeneration else { return }
             delegate?.paginationViewDidUpdateViews(self)
         }
     }
 
     private var loadPagesTask: Task<Void, Never>?
 
-    private func loadNextPage() async {
+    private func cancelPageLoading(clearQueue: Bool) {
+        loadGeneration &+= 1
+        loadPagesTask?.cancel()
+        loadPagesTask = nil
+        if clearQueue {
+            loadingIndexQueue.removeAll()
+        }
+    }
+
+    private func loadNextPage(generation: Int) async {
+        guard !Task.isCancelled, generation == loadGeneration else {
+            return
+        }
         guard let (index, location) = loadingIndexQueue.popFirst() else {
             return
         }
@@ -259,17 +639,30 @@ final class PaginationView: UIView, Loggable {
             loadedViews[index] == nil,
             let view = delegate?.paginationView(self, pageViewAtIndex: index)
         {
-            loadedViews[index] = view
-            scrollView.addSubview(view)
-            setNeedsLayout()
+            updateVerticalLayout {
+                unavailableVerticalPageIndices.remove(index)
+                loadedViews[index] = view
+                scrollView.addSubview(view)
+            }
+            if axis == .horizontalPaged {
+                setNeedsLayout()
+            }
         }
 
         guard let view = loadedViews[index] else {
+            unavailableVerticalPageIndices.insert(index)
+            completeVerticalReadyWaiters(at: index, with: .unavailable)
+            await loadNextPage(generation: generation)
             return
         }
 
-        await view.go(to: location, animated: false)
-        await loadNextPage()
+        if axis == .horizontalPaged {
+            await view.go(to: location, animated: false)
+        }
+        guard !Task.isCancelled, generation == loadGeneration else {
+            return
+        }
+        await loadNextPage(generation: generation)
     }
 
     /// Queue views to be loaded until reaching the given number of pre-loaded positions.
@@ -289,9 +682,13 @@ final class PaginationView: UIView, Loggable {
             return sourceIndex
         }
 
+        let positionCost = axis == .verticalContinuous
+            ? max(1, indexPositionCount)
+            : indexPositionCount
+
         return scheduleLoadPages(
             from: index,
-            upToPositionCount: positionCount - indexPositionCount,
+            upToPositionCount: positionCount - positionCost,
             direction: direction,
             location: location
         )
@@ -307,6 +704,7 @@ final class PaginationView: UIView, Loggable {
         }
 
         loadingIndexQueue.removeAll { $0.index == index }
+        unavailableVerticalPageIndices.remove(index)
         loadingIndexQueue.append((index: index, location: location))
         return true
     }
@@ -331,6 +729,16 @@ final class PaginationView: UIView, Loggable {
 
         let shouldAnimate = options.animated && !UIAccessibility.isReduceMotionEnabled
 
+        if axis == .verticalContinuous {
+            initialVerticalNavigationTask?.cancel()
+            initialVerticalNavigationTask = nil
+            return await navigateVertically(
+                at: index,
+                location: location,
+                animated: shouldAnimate
+            )
+        }
+
         if currentIndex == index {
             await scrollToView(at: index, location: location, animated: shouldAnimate)
         } else if abs(currentIndex - index) == 1 {
@@ -339,6 +747,188 @@ final class PaginationView: UIView, Loggable {
             await fadeToView(at: index, location: location, animated: shouldAnimate)
         }
         return true
+    }
+
+    /// Loads a vertical navigation target without changing the visible
+    /// resource. The target becomes current only after it is ready.
+    private func prepareVerticalPage(
+        at index: Int,
+        location: PageLocation
+    ) async -> Bool {
+        if verticalPageStates[index]?.isReady == true, loadedViews[index] != nil {
+            return true
+        }
+
+        guard scheduleLoadPage(at: index, location: location) else {
+            return false
+        }
+        loadPages()
+
+        return await waitUntilVerticalPageIsReady(at: index) == .ready
+            && !Task.isCancelled
+    }
+
+    private func navigateVertically(
+        at index: Int,
+        location: PageLocation,
+        animated: Bool
+    ) async -> Bool {
+        let navigationID = UUID()
+        let isProvisional = index != currentIndex
+        if isProvisional, loadedViews[index] == nil {
+            provisionalOnlyPageIndices.insert(index)
+        }
+        if isProvisional {
+            provisionalVerticalNavigations[navigationID] = index
+        }
+        var didCommit = false
+        defer {
+            if isProvisional {
+                provisionalVerticalNavigations.removeValue(forKey: navigationID)
+                if didCommit {
+                    provisionalOnlyPageIndices.remove(index)
+                } else if
+                    !provisionalVerticalNavigations.values.contains(index),
+                    provisionalOnlyPageIndices.remove(index) != nil
+                {
+                    discardProvisionalVerticalPage(at: index)
+                }
+            }
+        }
+
+        guard
+            await prepareVerticalPage(at: index, location: location),
+            !Task.isCancelled,
+            let targetView = loadedViews[index],
+            verticalPageStates[index]?.isReady == true
+        else {
+            return false
+        }
+
+        let localY: CGFloat?
+        do {
+            localY = try await delegate?.paginationView(
+                self,
+                verticalOffsetFor: location,
+                at: index
+            )
+        } catch {
+            return false
+        }
+        guard
+            !Task.isCancelled,
+            let localY,
+            localY.isFinite,
+            localY >= 0,
+            loadedViews[index] === targetView,
+            verticalPageStates[index]?.isReady == true
+        else {
+            return false
+        }
+
+        if currentIndex != index {
+            setCurrentIndex(index)
+        }
+        guard
+            loadedViews[index] === targetView,
+            let frame = frameForView(at: index)
+        else {
+            return false
+        }
+
+        let maximumLocalY = max(0, frame.height - effectiveViewport.height)
+        let alignedLocalY = min(localY, maximumLocalY)
+        let targetY = frame.minY + alignedLocalY - scrollView.adjustedContentInset.top
+        let updateOffset = {
+            self.scrollView.contentOffset.y = targetY
+            self.clampVerticalContentOffset()
+        }
+        didCommit = true
+
+        if animated {
+            await animate(duration: 0.3, animations: updateOffset)
+        } else {
+            updateOffset()
+        }
+        scheduleViewportUpdate()
+        return true
+    }
+
+    private func discardProvisionalVerticalPage(at index: Int) {
+        guard index != currentIndex else { return }
+
+        updateVerticalLayout {
+            loadedViews.removeValue(forKey: index)?.removeFromSuperview()
+            verticalPageStates.removeValue(forKey: index)
+            unavailableVerticalPageIndices.remove(index)
+            loadingIndexQueue.removeAll { $0.index == index }
+        }
+        completeVerticalReadyWaiters(at: index, with: .unavailable)
+    }
+
+    private func waitUntilVerticalPageIsReady(at index: Int) async -> VerticalPageReadyResult {
+        if verticalPageStates[index]?.isReady == true, loadedViews[index] != nil {
+            return .ready
+        }
+        if unavailableVerticalPageIndices.contains(index) {
+            return .unavailable
+        }
+
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: .unavailable)
+                    return
+                }
+                verticalReadyWaiters[index, default: []].append(
+                    VerticalPageReadyWaiter(id: id, continuation: continuation)
+                )
+            }
+        } onCancel: { [weak self] in
+            Task { @MainActor in
+                self?.completeVerticalReadyWaiter(
+                    at: index,
+                    id: id,
+                    with: .unavailable
+                )
+            }
+        }
+    }
+
+    private func completeVerticalReadyWaiter(
+        at index: Int,
+        id: UUID,
+        with result: VerticalPageReadyResult
+    ) {
+        guard
+            var waiters = verticalReadyWaiters[index],
+            let waiterIndex = waiters.firstIndex(where: { $0.id == id })
+        else {
+            return
+        }
+
+        let waiter = waiters.remove(at: waiterIndex)
+        if waiters.isEmpty {
+            verticalReadyWaiters.removeValue(forKey: index)
+        } else {
+            verticalReadyWaiters[index] = waiters
+        }
+        waiter.continuation.resume(returning: result)
+    }
+
+    private func completeVerticalReadyWaiters(
+        at index: Int,
+        with result: VerticalPageReadyResult
+    ) {
+        let waiters = verticalReadyWaiters.removeValue(forKey: index) ?? []
+        waiters.forEach { $0.continuation.resume(returning: result) }
+    }
+
+    private func completeAllVerticalReadyWaiters(with result: VerticalPageReadyResult) {
+        let waiters = verticalReadyWaiters.values.flatMap { $0 }
+        verticalReadyWaiters.removeAll()
+        waiters.forEach { $0.continuation.resume(returning: result) }
     }
 
     private func slideToView(at index: Int, location: PageLocation, animated: Bool) async {
@@ -447,6 +1037,7 @@ extension PaginationView: UIScrollViewDelegate {
     // https://oleb.net/blog/2014/05/scrollviews-inside-scrollviews/
 
     func scrollViewWillEndDragging(_ scrollView: UIScrollView, withVelocity velocity: CGPoint, targetContentOffset: UnsafeMutablePointer<CGPoint>) {
+        guard axis == .horizontalPaged else { return }
         scrollView.isScrollEnabled = false
     }
 
@@ -461,6 +1052,8 @@ extension PaginationView: UIScrollViewDelegate {
     }
 
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        guard axis == .horizontalPaged else { return }
+
         // A programmatic slide animation sets isScrollEnabled = false and drives the
         // content offset directly. If a delegate callback fires during or just after
         // that window it could call setCurrentIndex with a stale offset, so we bail out.
@@ -474,5 +1067,14 @@ extension PaginationView: UIScrollViewDelegate {
 
         let newIndex = Int(round(currentOffset / scrollView.frame.width))
         setCurrentIndex(newIndex)
+    }
+
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        guard axis == .verticalContinuous, !isUpdatingVerticalLayout else {
+            return
+        }
+
+        scheduleViewportUpdate()
+        updateCurrentIndexFromVerticalViewport()
     }
 }

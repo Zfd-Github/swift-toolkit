@@ -4,6 +4,7 @@
 //  available in the top-level LICENSE file of the project.
 //
 
+import ReadiumNavigator
 import ReadiumShared
 import SwiftUI
 
@@ -21,6 +22,9 @@ struct FixtureList: View {
         List {
             Section {
                 fixture(.childrensLiteratureEPUB)
+                fixture(.continuousScrollEPUB)
+                fixture(.continuousScrollFailedNeighborEPUB)
+                fixture(.continuousScrollFailedCurrentTransitionEPUB)
                 fixture(.daisyPDF)
             }
 
@@ -84,10 +88,32 @@ class FixtureListViewModel: ObservableObject {
         let fileURL = FileURL(url: epubURL)!
 
         let container = Container.shared
-        let publication = try await container.publication(at: fileURL)
-        let navigator = try container.navigator(for: publication)
+        var publication = try await container.publication(at: fileURL)
+        var resourceFailureController: ResourceFailureController?
+        if fixture.hasFailedContinuousNeighbor {
+            publication.manifest.readingOrder[1] = Link(
+                href: "missing-neighbor.xhtml",
+                mediaType: .xhtml
+            )
+        } else if fixture.failsCurrentResourceOnLayoutSwitch {
+            (publication, resourceFailureController) = container
+                .publicationFailingResourcesOnDemand(from: publication)
+        }
+        let preferences = fixture.startsInContinuousScroll
+            ? EPUBPreferences(scroll: true)
+            : .empty
+        let navigator = try container.navigator(
+            for: publication,
+            epubPreferences: preferences,
+            disablePageTurnsWhileScrolling: fixture.startsInContinuousScroll
+        )
 
-        readerViewModel = ReaderViewModel(navigator: navigator)
+        readerViewModel = ReaderViewModel(
+            navigator: navigator,
+            enablesContinuousScrollActions: fixture.enablesContinuousScrollActions,
+            epubPreferences: preferences,
+            resourceFailureController: resourceFailureController
+        )
     }
 }
 

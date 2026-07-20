@@ -247,7 +247,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             case .initializing, .loading, .jumping, .moving:
                 paginationView?.isUserInteractionEnabled = false
             case .idle:
-                paginationView?.isUserInteractionEnabled = true
+                if paginationView !== pendingReplacementPaginationView {
+                    paginationView?.isUserInteractionEnabled = true
+                }
             }
         }
     }
@@ -376,6 +378,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     deinit {
+        viewportPropagationTask?.cancel()
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -426,6 +429,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         paginationView!.frame = view.bounds
         paginationView!.autoresizingMask = [.flexibleHeight, .flexibleWidth]
         view.addSubview(paginationView!)
+        updatePaginationContentInset()
 
         applySettings()
 
@@ -460,6 +464,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     override open func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         viewModel.viewSizeWillChange(view.bounds.size)
+        updatePaginationContentInset()
+    }
+
+    override open func viewSafeAreaInsetsDidChange() {
+        super.viewSafeAreaInsetsDidChange()
+        updatePaginationContentInset()
+    }
+
+    override open func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+        super.traitCollectionDidChange(previousTraitCollection)
+        updatePaginationContentInset()
     }
 
     override open func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
@@ -545,14 +560,43 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     // MARK: - Pagination and spreads
 
+    private struct PendingPaginationTransition {
+        let oldPaginationView: PaginationView
+        let replacementPaginationView: PaginationView
+        let oldSpreads: [EPUBSpread]
+        let previousPreferences: EPUBPreferences
+    }
+
     private var paginationView: PaginationView?
+    private var pendingPaginationTransition: PendingPaginationTransition?
+    private var paginationRollbackPreferences: EPUBPreferences?
+    private var isPaginationPreferenceTransitionActive = false
+    private var queuedPaginationPreferences: EPUBPreferences?
+    private var viewportPropagationTask: Task<Void, Never>?
+
+    private var pendingReplacementPaginationView: PaginationView? {
+        pendingPaginationTransition?.replacementPaginationView
+    }
+
+    private var paginationAxis: PaginationView.Axis {
+        if
+            settings.scroll,
+            !settings.verticalText,
+            publication.metadata.layout == .reflowable
+        {
+            return .verticalContinuous
+        }
+        return .horizontalPaged
+    }
 
     private func makePaginationView(hasPositions: Bool) -> PaginationView {
+        let axis = paginationAxis
         let view = PaginationView(
             frame: .zero,
             preloadPreviousPositionCount: hasPositions ? config.preloadPreviousPositionCount : 0,
             preloadNextPositionCount: hasPositions ? config.preloadNextPositionCount : 0,
-            isScrollEnabled: isPaginationViewScrollingEnabled
+            isScrollEnabled: isPaginationViewScrollingEnabled(for: axis),
+            axis: axis
         )
         view.delegate = self
         view.backgroundColor = .clear
@@ -560,11 +604,37 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func invalidatePaginationView() {
-        guard let paginationView = paginationView else {
+        guard let oldPaginationView = paginationView else {
             return
         }
 
-        paginationView.isScrollEnabled = isPaginationViewScrollingEnabled
+        if oldPaginationView.axis != paginationAxis {
+            viewportPropagationTask?.cancel()
+            viewportPropagationTask = nil
+            oldPaginationView.isUserInteractionEnabled = false
+
+            let replacement = makePaginationView(
+                hasPositions: !positionsByReadingOrder.isEmpty
+            )
+            replacement.frame = oldPaginationView.frame
+            replacement.autoresizingMask = oldPaginationView.autoresizingMask
+            replacement.isUserInteractionEnabled = false
+            view.insertSubview(replacement, aboveSubview: oldPaginationView)
+            paginationView = replacement
+            pendingPaginationTransition = PendingPaginationTransition(
+                oldPaginationView: oldPaginationView,
+                replacementPaginationView: replacement,
+                oldSpreads: spreads,
+                previousPreferences: paginationRollbackPreferences
+                    ?? viewModel.preferences
+            )
+            paginationRollbackPreferences = nil
+            updatePaginationContentInset()
+        }
+
+        if let paginationView {
+            paginationView.isScrollEnabled = isPaginationViewScrollingEnabled(for: paginationView.axis)
+        }
         reloadSpreads()
     }
 
@@ -634,7 +704,66 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             readingProgression: viewModel.readingProgression
         )
 
+        if paginationView !== pendingReplacementPaginationView {
+            on(.loaded)
+        }
+    }
+
+    private func completePendingPaginationTransition(_ paginationView: PaginationView) {
+        guard
+            let transition = pendingPaginationTransition,
+            paginationView === transition.replacementPaginationView
+        else {
+            return
+        }
+
+        pendingPaginationTransition = nil
+        transition.oldPaginationView.removeFromSuperview()
         on(.loaded)
+        finishPaginationPreferenceTransition()
+    }
+
+    private func rollbackPendingPaginationTransition(
+        _ paginationView: PaginationView,
+        failedCurrentIndex index: Int
+    ) {
+        guard
+            let transition = pendingPaginationTransition,
+            paginationView === transition.replacementPaginationView,
+            index == paginationView.currentIndex
+        else {
+            return
+        }
+
+        viewportPropagationTask?.cancel()
+        viewportPropagationTask = nil
+        pendingPaginationTransition = nil
+        self.paginationView = transition.oldPaginationView
+        spreads = transition.oldSpreads
+
+        paginationView.removeFromSuperview()
+        viewModel.restorePreferencesAfterFailedPaginationTransition(
+            transition.previousPreferences
+        )
+        applySettings()
+        on(.loaded)
+        paginationViewDidUpdateViewport(transition.oldPaginationView)
+        delegate?.navigator(self, presentationDidChange: presentation)
+        finishPaginationPreferenceTransition()
+    }
+
+    private func finishPaginationPreferenceTransition() {
+        guard isPaginationPreferenceTransitionActive else {
+            return
+        }
+
+        isPaginationPreferenceTransitionActive = false
+        let preferences = queuedPaginationPreferences
+        queuedPaginationPreferences = nil
+
+        if let preferences, preferences != viewModel.preferences {
+            submitPreferences(preferences)
+        }
     }
 
     private func loadedSpreadViewForHREF<T: URLConvertible>(_ href: T) -> EPUBSpreadView? {
@@ -652,17 +781,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     // MARK: - Navigator
 
-    private var isPaginationViewScrollingEnabled: Bool {
-        !(config.disablePageTurnsWhileScrolling && settings.scroll)
+    private func isPaginationViewScrollingEnabled(for axis: PaginationView.Axis) -> Bool {
+        axis == .verticalContinuous
+            || !(config.disablePageTurnsWhileScrolling && settings.scroll)
     }
 
     public var presentation: VisualNavigatorPresentation {
         VisualNavigatorPresentation(
             readingProgression: settings.readingProgression,
             scroll: settings.scroll,
-            axis: (settings.scroll && !settings.verticalText)
-                ? .vertical
-                : .horizontal
+            axis: paginationAxis == .verticalContinuous ? .vertical : .horizontal
         )
     }
 
@@ -678,7 +806,45 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return (pendingLocator, nil)
         }
 
-        guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
+        guard let paginationView else {
+            return (nil, nil)
+        }
+
+        if paginationView.axis == .verticalContinuous {
+            var progressions: [ReadingOrder.Index: ClosedRange<Double>] = [:]
+
+            for spreadIndex in paginationView.visibleIndices {
+                guard
+                    let spreadView = paginationView.loadedViews[spreadIndex] as? EPUBReflowableSpreadView,
+                    let visibleFrame = paginationView.visibleFrame(at: spreadIndex)
+                else {
+                    continue
+                }
+
+                let progression = spreadView.progression(in: visibleFrame)
+                for readingOrderIndex in spreadView.spread.readingOrderIndices {
+                    progressions[readingOrderIndex] = progression
+                }
+            }
+
+            guard
+                let firstIndex = progressions.keys.min(),
+                let lastIndex = progressions.keys.max()
+            else {
+                return (nil, nil)
+            }
+
+            return await EPUBViewportAndLocationCalculator.compute(
+                readingOrderIndices: firstIndex ... lastIndex,
+                progression: { progressions[$0] ?? 0 ... 0 },
+                readingOrder: readingOrder,
+                positionsByReadingOrder: positionsByReadingOrder,
+                tableOfContentsTitleByHref: tableOfContentsTitleByHref,
+                fallbackLocator: { [publication] in await publication.locate($0) }
+            )
+        }
+
+        guard let spreadView = paginationView.currentView as? EPUBSpreadView else {
             return (nil, nil)
         }
 
@@ -694,7 +860,24 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func firstVisibleElementLocator() async -> Locator? {
-        guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
+        guard let paginationView else {
+            return nil
+        }
+
+        if paginationView.axis == .verticalContinuous {
+            for index in paginationView.visibleIndices {
+                guard
+                    let spreadView = paginationView.loadedViews[index] as? EPUBReflowableSpreadView,
+                    let visibleFrame = paginationView.visibleFrame(at: index)
+                else {
+                    continue
+                }
+                return await spreadView.findFirstVisibleElementLocator(in: visibleFrame)
+            }
+            return nil
+        }
+
+        guard let spreadView = paginationView.currentView as? EPUBSpreadView else {
             return nil
         }
         return await spreadView.findFirstVisibleElementLocator()
@@ -903,7 +1086,19 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func submitPreferences(_ preferences: EPUBPreferences) {
+        guard !isPaginationPreferenceTransitionActive else {
+            queuedPaginationPreferences = preferences
+            return
+        }
+
+        let previousPreferences = viewModel.preferences
         viewModel.submitPreferences(preferences)
+        if let paginationView, paginationView.axis != paginationAxis {
+            isPaginationPreferenceTransitionActive = true
+            paginationRollbackPreferences = previousPreferences
+            paginationView.isUserInteractionEnabled = false
+            _ = on(.load(currentLocation))
+        }
         applySettings()
 
         delegate?.navigator(self, presentationDidChange: presentation)
@@ -921,7 +1116,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         view.backgroundColor = settings.effectiveBackgroundColor.uiColor
-        paginationView?.isScrollEnabled = isPaginationViewScrollingEnabled
+        if let paginationView {
+            paginationView.isScrollEnabled = isPaginationViewScrollingEnabled(for: paginationView.axis)
+        }
+        updatePaginationContentInset()
+    }
+
+    private func updatePaginationContentInset() {
+        guard let paginationView else { return }
+        paginationView.contentInset = paginationView.axis == .verticalContinuous
+            ? resolvedContentInset()
+            : .zero
     }
 
     // MARK: - EPUB-specific extensions
@@ -1004,19 +1209,17 @@ extension EPUBNavigatorViewController: EPUBNavigatorViewModelDelegate {
         }
     }
 
-    func epubNavigatorViewModel(
-        _ viewModel: EPUBNavigatorViewModel,
-        didFailToLoadResourceAt href: RelativeURL,
-        withError error: ReadError
-    ) {
-        DispatchQueue.main.async {
-            self.delegate?.navigator(self, didFailToLoadResourceAt: href, withError: error)
-        }
-    }
 }
 
 extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     func spreadViewContentInset(_ spreadView: EPUBSpreadView) -> UIEdgeInsets {
+        if paginationView?.axis == .verticalContinuous {
+            return .zero
+        }
+        return resolvedContentInset()
+    }
+
+    private func resolvedContentInset() -> UIEdgeInsets {
         if let inset = delegate?.navigatorContentInset(self) {
             return inset
         }
@@ -1042,6 +1245,35 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         }
 
         return insets
+    }
+
+    func spreadView(
+        _ spreadView: EPUBSpreadView,
+        didFailToLoadResourceAt href: RelativeURL,
+        withError error: ReadError
+    ) {
+        guard
+            let paginationView,
+            let index = paginationView.loadedViews.first(where: {
+                $0.value === spreadView
+            })?.key,
+            paginationView.loadedViews[index] === spreadView
+        else {
+            return
+        }
+
+        if paginationView.axis == .verticalContinuous {
+            paginationView.setVerticalPageFailed(at: index)
+        }
+        rollbackPendingPaginationTransition(
+            paginationView,
+            failedCurrentIndex: index
+        )
+        delegate?.navigator(
+            self,
+            didFailToLoadResourceAt: href,
+            withError: error
+        )
     }
 
     func spreadViewDidLoad(_ spreadView: EPUBSpreadView) async {
@@ -1082,6 +1314,31 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         }
 
         await spreadView.evaluateScript("(function() {\n\(script)\n})();")
+
+        guard
+            let paginationView,
+            let index = paginationView.loadedViews.first(where: { $0.value === spreadView })?.key,
+            paginationView.loadedViews[index] === spreadView
+        else {
+            return
+        }
+
+        if paginationView.axis == .verticalContinuous {
+            guard
+                let spreadView = spreadView as? EPUBReflowableSpreadView,
+                let contentHeight = spreadView.contentHeight
+            else {
+                return
+            }
+            paginationView.setVerticalPageHeight(contentHeight, isReady: true, at: index)
+        }
+
+        if
+            paginationView === pendingReplacementPaginationView,
+            index == paginationView.currentIndex
+        {
+            completePendingPaginationTransition(paginationView)
+        }
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: PointerEvent) {
@@ -1202,26 +1459,31 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         }
 
         for callback in callbacks {
-            callback(OnDecorationActivatedEvent(decoration: decoration, group: group, rect: frame, point: point))
+            callback(OnDecorationActivatedEvent(
+                decoration: decoration,
+                group: group,
+                rect: frame.map { view.convert($0, from: spreadView) },
+                point: point.map { view.convert($0, from: spreadView) }
+            ))
         }
     }
 
-    func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect) {
-        guard
-            let locator = currentLocation,
-            let text = text
-        else {
+    func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange locator: Locator?, frame: CGRect) {
+        guard let locator else {
             viewModel.editingActions.selection = nil
             return
         }
         viewModel.editingActions.selection = Selection(
-            locator: locator.copy(text: { $0 = text }),
-            frame: frame
+            locator: locator,
+            frame: view.convert(frame, from: spreadView)
         )
     }
 
     func spreadViewPagesDidChange(_ spreadView: EPUBSpreadView) {
-        if paginationView?.currentView == spreadView {
+        if
+            paginationView?.axis == .verticalContinuous
+                || paginationView?.currentView == spreadView
+        {
             updateCurrentLocation()
         }
     }
@@ -1261,6 +1523,19 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
         )
         spreadView.delegate = self
 
+        if let spreadView = spreadView as? EPUBReflowableSpreadView {
+            spreadView.contentHeightDidChange = { [weak paginationView, weak spreadView] height in
+                guard
+                    let paginationView,
+                    let spreadView,
+                    paginationView.loadedViews[index] === spreadView
+                else {
+                    return
+                }
+                paginationView.setVerticalPageHeight(height, isReady: false, at: index)
+            }
+        }
+
         let userContentController = spreadView.webView.configuration.userContentController
         delegate?.navigator(self, setupUserScripts: userContentController)
 
@@ -1271,7 +1546,55 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
         // Note that you should set the delegate before you load views
         // otherwise, when open the publication, you may miss the first
         // invocation.
+        paginationViewDidUpdateViewport(paginationView)
+    }
+
+    func paginationViewDidUpdateViewport(_ paginationView: PaginationView) {
+        guard paginationView === self.paginationView else { return }
+
+        viewportPropagationTask?.cancel()
+
+        if paginationView.axis == .verticalContinuous {
+            let visibleFrames = Dictionary(uniqueKeysWithValues: paginationView.visibleIndices.compactMap { index in
+                paginationView.visibleFrame(at: index).map { (index, $0) }
+            })
+            let updates: [(EPUBReflowableSpreadView, CGRect?)] = paginationView.loadedViews.compactMap { index, view in
+                guard
+                    let spreadView = view as? EPUBReflowableSpreadView,
+                    spreadView.isSpreadLoaded
+                else {
+                    return nil
+                }
+                return (spreadView, visibleFrames[index])
+            }
+
+            viewportPropagationTask = Task { @MainActor in
+                await withTaskGroup(of: Void.self) { tasks in
+                    for (spreadView, visibleFrame) in updates {
+                        tasks.addTask {
+                            guard !Task.isCancelled else { return }
+                            await spreadView.setContinuousViewport(visibleFrame)
+                        }
+                    }
+                }
+            }
+        }
+
         updateCurrentLocation()
+    }
+
+    func paginationView(
+        _ paginationView: PaginationView,
+        verticalOffsetFor location: PageLocation,
+        at index: Int
+    ) async -> CGFloat? {
+        guard
+            paginationView === self.paginationView,
+            let spreadView = paginationView.loadedViews[index] as? EPUBReflowableSpreadView
+        else {
+            return nil
+        }
+        return await spreadView.resolveVerticalOffset(for: location)
     }
 
     func paginationView(_ paginationView: PaginationView, positionCountAtIndex index: Int) -> Int {

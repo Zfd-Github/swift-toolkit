@@ -40,4 +40,15 @@ extension XCUIElement {
         let expectedValue = on ? "1" : "0"
         return wait(for: \.stringValue, toEqual: expectedValue, timeout: timeout)
     }
+
+    func waitUntil(
+        timeout: TimeInterval,
+        _ predicate: @escaping () -> Bool
+    ) -> Bool {
+        let expectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in predicate() },
+            object: self
+        )
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
 }

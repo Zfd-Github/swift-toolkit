@@ -8,9 +8,11 @@
 
 import "./gestures";
 import "./keyboard";
-import { findFirstVisibleLocator } from "./dom";
+import { findFirstVisibleLocator, findFirstVisibleLocatorInRect } from "./dom";
 import {
+  documentHeight,
   removeProperty,
+  resolveVerticalOffset,
   scrollLeft,
   scrollRight,
   scrollToId,
@@ -18,6 +20,7 @@ import {
   scrollToLocator,
   setProperty,
   setCSSProperties,
+  setViewportRect,
 } from "./utils";
 import { getDecorations, registerTemplates } from "./decorator";
 
@@ -32,6 +35,9 @@ global.readium = {
   setCSSProperties: setCSSProperties,
   setProperty: setProperty,
   removeProperty: removeProperty,
+  setViewportRect: setViewportRect,
+  documentHeight: documentHeight,
+  resolveVerticalOffset: resolveVerticalOffset,
 
   // decoration
   registerDecorationTemplates: registerTemplates,
@@ -39,4 +45,5 @@ global.readium = {
 
   // DOM
   findFirstVisibleLocator: findFirstVisibleLocator,
+  findFirstVisibleLocatorInRect: findFirstVisibleLocatorInRect,
 };

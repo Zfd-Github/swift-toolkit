@@ -18,6 +18,12 @@ open class InputObservableViewController: UIViewController, InputObservable {
         becomeFirstResponder()
     }
 
+    override open func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+
+        _ = resignFirstResponder()
+    }
+
     // MARK: - InputObservable
 
     @discardableResult

@@ -6,12 +6,29 @@
 
 import Foundation
 
-struct PublicationFixture {
+struct PublicationFixture: Equatable {
     let filename: String
     let description: String
+    var hasFailedContinuousNeighbor = false
+    var failsCurrentResourceOnLayoutSwitch = false
 
     var accessibilityIdentifier: String {
-        "publication://\(filename)"
+        let variant = if hasFailedContinuousNeighbor {
+            "?failed-neighbor"
+        } else if failsCurrentResourceOnLayoutSwitch {
+            "?failed-current-on-layout-switch"
+        } else {
+            ""
+        }
+        return "publication://\(filename)\(variant)"
+    }
+
+    var startsInContinuousScroll: Bool {
+        self == .continuousScrollEPUB || self == .continuousScrollFailedNeighborEPUB
+    }
+
+    var enablesContinuousScrollActions: Bool {
+        startsInContinuousScroll || failsCurrentResourceOnLayoutSwitch
     }
 
     static let childrensLiteratureEPUB: PublicationFixture = .init(
@@ -22,5 +39,22 @@ struct PublicationFixture {
     static let daisyPDF: PublicationFixture = .init(
         filename: "daisy.pdf",
         description: "Basic PDF document."
+    )
+
+    static let continuousScrollEPUB: PublicationFixture = .init(
+        filename: "continuous-scroll.epub",
+        description: "Fifty-resource reflowable EPUB for continuous scrolling."
+    )
+
+    static let continuousScrollFailedNeighborEPUB: PublicationFixture = .init(
+        filename: "continuous-scroll.epub",
+        description: "Continuous EPUB with a missing preloaded neighbor.",
+        hasFailedContinuousNeighbor: true
+    )
+
+    static let continuousScrollFailedCurrentTransitionEPUB: PublicationFixture = .init(
+        filename: "continuous-scroll.epub",
+        description: "Paged EPUB whose current resource fails during a continuous-mode transition.",
+        failsCurrentResourceOnLayoutSwitch: true
     )
 }

@@ -28,6 +28,7 @@ class ReaderViewController: UIViewController {
         addChild(navigator)
         navigator.view.frame = view.bounds
         navigator.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        navigator.view.accessibilityIdentifier = AccessibilityID.readerViewport.rawValue
         view.addSubview(navigator.view)
         navigator.didMove(toParent: self)
     }

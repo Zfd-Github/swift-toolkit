@@ -11,7 +11,6 @@ import UIKit
 protocol EPUBNavigatorViewModelDelegate: AnyObject {
     func epubNavigatorViewModel(_ viewModel: EPUBNavigatorViewModel, runScript script: String, in scope: EPUBScriptScope)
     func epubNavigatorViewModelInvalidatePaginationView(_ viewModel: EPUBNavigatorViewModel)
-    func epubNavigatorViewModel(_ viewModel: EPUBNavigatorViewModel, didFailToLoadResourceAt href: RelativeURL, withError error: ReadError)
 }
 
 enum EPUBScriptScope {
@@ -202,14 +201,23 @@ enum EPUBScriptScope {
     private(set) var settings: EPUBSettings
 
     /// Last submitted preferences.
-    private var preferences: EPUBPreferences
+    private(set) var preferences: EPUBPreferences
 
     func submitPreferences(_ preferences: EPUBPreferences) {
         self.preferences = preferences
         applyPreferences()
     }
 
-    private func applyPreferences() {
+    /// Restores the preferences rendered by a pagination view kept alive
+    /// during an unsuccessful axis transition.
+    func restorePreferencesAfterFailedPaginationTransition(
+        _ preferences: EPUBPreferences
+    ) {
+        self.preferences = preferences
+        applyPreferences(invalidatingPagination: false)
+    }
+
+    private func applyPreferences(invalidatingPagination: Bool = true) {
         let oldSettings = settings
         let newSettings = EPUBSettings(
             preferences: preferences,
@@ -218,7 +226,7 @@ enum EPUBScriptScope {
         )
 
         settings = newSettings
-        updateSpread()
+        updateSpread(invalidatingPagination: invalidatingPagination)
 
         let needsInvalidation: Bool =
             oldSettings.readingProgression != newSettings.readingProgression
@@ -233,7 +241,7 @@ enum EPUBScriptScope {
         // the resources will be reloaded anyway.
         updateCSS(with: settings, commitNow: !needsInvalidation)
 
-        if needsInvalidation {
+        if needsInvalidation, invalidatingPagination {
             setNeedsInvalidatePagination()
         }
     }
@@ -283,7 +291,7 @@ enum EPUBScriptScope {
         updateSpread()
     }
 
-    private func updateSpread() {
+    private func updateSpread(invalidatingPagination: Bool = true) {
         let size = viewSize ?? .zero
         let isLandscape = size.width > size.height
         let oldEnabled = spreadEnabled
@@ -297,7 +305,7 @@ enum EPUBScriptScope {
             spreadEnabled = isLandscape
         }
 
-        if oldEnabled != spreadEnabled {
+        if oldEnabled != spreadEnabled, invalidatingPagination {
             setNeedsInvalidatePagination()
         }
     }
