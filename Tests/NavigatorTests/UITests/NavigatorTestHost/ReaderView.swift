@@ -750,26 +750,39 @@ enum ReaderTestAction: String {
         case .captureMetrics:
             let result = await navigator.evaluateJavaScript("""
                 (() => {
-                    const element = document.getElementById('reflow-marker');
+                    const element = document.getElementById('reflow-marker')
+                        ?? document.getElementById('chapter-1-end');
                     if (!element) return null;
                     const rect = element.getBoundingClientRect();
-                    return { y: rect.top + window.scrollY, height: rect.height };
+                    return {
+                        y: rect.top + window.scrollY,
+                        height: rect.height,
+                        bottom: rect.bottom + window.scrollY,
+                        documentHeight: readium.documentHeight(),
+                        bodyHeight: document.body.scrollHeight,
+                    };
                 })()
                 """)
             guard
                 case let .success(value) = result,
                 let metrics = value as? [String: Any],
                 let y = (metrics["y"] as? NSNumber)?.doubleValue,
-                let height = (metrics["height"] as? NSNumber)?.doubleValue
+                let height = (metrics["height"] as? NSNumber)?.doubleValue,
+                let bottom = (metrics["bottom"] as? NSNumber)?.doubleValue,
+                let documentHeight = (metrics["documentHeight"] as? NSNumber)?.doubleValue,
+                let bodyHeight = (metrics["bodyHeight"] as? NSNumber)?.doubleValue
             else {
                 fail(action, generation: generation, reason: "missing-metrics")
                 return
             }
             metricsMarker = String(
-                format: "y=%.3f|h=%.3f",
+                format: "y=%.3f|h=%.3f|bottom=%.3f|documentHeight=%.3f|bodyHeight=%.3f",
                 locale: Locale(identifier: "en_US_POSIX"),
                 y,
-                height
+                height,
+                bottom,
+                documentHeight,
+                bodyHeight
             )
             complete(action, generation: generation)
 

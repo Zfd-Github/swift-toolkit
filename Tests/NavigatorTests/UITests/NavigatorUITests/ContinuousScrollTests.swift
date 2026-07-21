@@ -88,6 +88,27 @@ final class ContinuousScrollTests: XCTestCase {
         reader.close(assertMemoryDeallocated: true)
     }
 
+    func testContinuousResourceBoundaryIncludesFinalLine() throws {
+        let reader = app.open(.continuousScrollEPUB, waitUntilReady: true)
+
+        reader.runAction(.jumpFirstResourceEnd, completionPrefix: "jumpFirstResourceEnd")
+        reader.runAction(.captureMetrics, completionPrefix: "captureMetrics")
+        let metrics = metricsValues(from: reader.marker(.metricsMarker))
+
+        XCTAssertGreaterThan(
+            try XCTUnwrap(metrics["bottom"]),
+            try XCTUnwrap(metrics["bodyHeight"]),
+            "Fixture must preserve the collapsed-margin boundary case: \(metrics)"
+        )
+        XCTAssertLessThanOrEqual(
+            try XCTUnwrap(metrics["bottom"]),
+            try XCTUnwrap(metrics["documentHeight"]),
+            "Final line must fit inside the measured resource height: \(metrics)"
+        )
+
+        reader.close(assertMemoryDeallocated: true)
+    }
+
     func testContinuousViewportAndModeInputs() throws {
         let reader = app.open(.continuousScrollEPUB, waitUntilReady: true)
         let viewport = reader.viewport
@@ -103,6 +124,7 @@ final class ContinuousScrollTests: XCTestCase {
                 && chapterEnd.frame.maxX > chapterStart.frame.minX
                 && chapterStart.frame.maxX > chapterEnd.frame.minX
         })
+        XCTAssertLessThanOrEqual(chapterEnd.frame.maxY, chapterStart.frame.minY)
 
         reader.runAction(.captureCurrentLocation, completionPrefix: "captureCurrentLocation")
         XCTAssertTrue(reader.marker(.currentLocationMarker).contains("chapter-01.xhtml"))
@@ -341,16 +363,19 @@ final class ContinuousScrollTests: XCTestCase {
     }
 
     private func metrics(from marker: String) throws -> (y: Double, height: Double) {
-        let pairs: [(String, Double)] = marker.split(separator: "|").compactMap { component in
-            let parts = component.split(separator: "=", maxSplits: 1)
-            guard parts.count == 2, let value = Double(parts[1]) else { return nil }
-            return (String(parts[0]), value)
-        }
-        let values = Dictionary(uniqueKeysWithValues: pairs)
+        let values = metricsValues(from: marker)
         return (
             y: try XCTUnwrap(values["y"]),
             height: try XCTUnwrap(values["h"])
         )
+    }
+
+    private func metricsValues(from marker: String) -> [String: Double] {
+        Dictionary(uniqueKeysWithValues: marker.split(separator: "|").compactMap { component in
+            let parts = component.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2, let value = Double(parts[1]) else { return nil }
+            return (String(parts[0]), value)
+        })
     }
 
     private func viewportMetrics(from marker: String) throws -> (
