@@ -112,13 +112,16 @@ export function setViewportRect(rect) {
 export function documentHeight() {
   const rootHeight = document.documentElement?.scrollHeight || 0;
   const bodyHeight = document.body?.scrollHeight || 0;
+  const bodyBottom = document.body
+    ? document.body.getBoundingClientRect().bottom + window.scrollY
+    : 0;
 
   // In continuous mode the root element is at least as tall as the WKWebView
   // frame. Using it would therefore prevent a resource from shrinking after
   // reflow, because the frame still contains the previous measured height.
   const height =
     viewportRect && document.body
-      ? bodyHeight
+      ? Math.max(bodyHeight, bodyBottom)
       : Math.max(rootHeight, bodyHeight);
   return Number.isFinite(height) ? Math.ceil(Math.max(0, height)) : 0;
 }
