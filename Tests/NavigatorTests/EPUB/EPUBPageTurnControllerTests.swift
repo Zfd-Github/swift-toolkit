@@ -113,33 +113,30 @@ struct EPUBPageTurnControllerTests {
 
     @Test("none pan commits at the exact distance or velocity threshold")
     func nonePanThresholds() {
+        let session = PageTurnSession(direction: .left, readingProgression: .ltr)
         #expect(!EPUBPageTurnInteraction.shouldCommit(
             translationX: 21.9,
             viewportWidth: 100,
             velocityX: 0,
-            direction: .left,
-            readingProgression: .ltr
+            session: session
         ))
         #expect(EPUBPageTurnInteraction.shouldCommit(
             translationX: 22,
             viewportWidth: 100,
             velocityX: 0,
-            direction: .left,
-            readingProgression: .ltr
+            session: session
         ))
         #expect(!EPUBPageTurnInteraction.shouldCommit(
             translationX: 0,
             viewportWidth: 100,
             velocityX: 649,
-            direction: .left,
-            readingProgression: .ltr
+            session: session
         ))
         #expect(EPUBPageTurnInteraction.shouldCommit(
             translationX: 0,
             viewportWidth: 100,
             velocityX: 650,
-            direction: .left,
-            readingProgression: .ltr
+            session: session
         ))
     }
 
@@ -153,14 +150,44 @@ struct EPUBPageTurnControllerTests {
         ]
 
         for (readingProgression, direction, reverseSign) in cases {
+            let session = PageTurnSession(
+                direction: direction,
+                readingProgression: readingProgression
+            )
             #expect(!EPUBPageTurnInteraction.shouldCommit(
                 translationX: reverseSign * 22,
                 viewportWidth: 100,
                 velocityX: reverseSign * 650,
-                direction: direction,
-                readingProgression: readingProgression
+                session: session
             ))
         }
+    }
+
+    @Test("none session keeps its begin reading progression while the setting changes")
+    func noneSessionSnapshotsReadingProgression() throws {
+        let controller = EPUBPageTurnController(refreshCurrentLocation: {})
+        var readingProgression = ReadiumNavigator.ReadingProgression.ltr
+        let session = try #require(controller.begin(
+            to: .right,
+            readingProgression: readingProgression
+        ))
+
+        readingProgression = .rtl
+        let progress = try #require(controller.track(
+            session,
+            translationX: -22,
+            viewportWidth: 100
+        ))
+
+        #expect(readingProgression == .rtl)
+        #expect(session.readingProgression == .ltr)
+        #expect(abs(progress - 0.22) < 0.0001)
+        #expect(EPUBPageTurnInteraction.shouldCommit(
+            translationX: -22,
+            viewportWidth: 100,
+            velocityX: -650,
+            session: session
+        ))
     }
 
     @Test("none changed handler tracks without moving the mounted pagination or spread")
@@ -199,32 +226,35 @@ struct EPUBPageTurnControllerTests {
         let outerScrollView = try #require(
             paginationView.subviews.compactMap { $0 as? UIScrollView }.first
         )
-        let nonePan = try #require(
-            navigator.view.gestureRecognizers?.compactMap { $0 as? UIPanGestureRecognizer }.first
-        )
 
         #expect(outerScrollView.panGestureRecognizer.isEnabled)
         #expect(spreadView.scrollView.panGestureRecognizer.isEnabled)
-        #expect(!nonePan.isEnabled)
+        #expect(rootPanRecognizers(in: navigator).isEmpty)
 
         navigator.pageTurnStyle = .none
         #expect(!outerScrollView.panGestureRecognizer.isEnabled)
         #expect(!spreadView.scrollView.panGestureRecognizer.isEnabled)
-        #expect(nonePan.isEnabled)
+        let nonePans = rootPanRecognizers(in: navigator)
+        #expect(nonePans.count == 1)
+        let nonePan = try #require(nonePans.first)
 
         navigator.pageTurnStyle = .simulation
         #expect(!outerScrollView.panGestureRecognizer.isEnabled)
         #expect(!spreadView.scrollView.panGestureRecognizer.isEnabled)
-        #expect(!nonePan.isEnabled)
+        #expect(rootPanRecognizers(in: navigator).isEmpty)
+        #expect(nonePan.view == nil)
+
+        navigator.pageTurnStyle = .cover
+        #expect(rootPanRecognizers(in: navigator).isEmpty)
 
         navigator.pageTurnStyle = .push
         #expect(outerScrollView.panGestureRecognizer.isEnabled)
         #expect(spreadView.scrollView.panGestureRecognizer.isEnabled)
-        #expect(!nonePan.isEnabled)
+        #expect(rootPanRecognizers(in: navigator).isEmpty)
     }
 
-    @Test("mounted zoom and style or axis changes release none sessions safely")
-    func mountedZoomAndSessionReconfiguration() async throws {
+    @Test("mounted zoom and style changes release none sessions safely")
+    func mountedZoomAndStyleReconfiguration() async throws {
         let fixedNavigator = try await makeMountedNavigator(
             layout: .fixed,
             pageTurnStyle: .none
@@ -249,23 +279,33 @@ struct EPUBPageTurnControllerTests {
         navigator.pageTurnStyle = .none
         #expect(navigator.beginNonePan(to: .right))
         navigator.handleNonePan(state: .cancelled, translationX: 0, velocityX: 0)
+    }
 
+    @Test("submitPreferences replaces the current pagination and releases the none session")
+    func mountedAxisReplacementReleasesNoneSession() async throws {
+        let navigator = try await makeMountedNavigator(
+            layout: .reflowable,
+            pageTurnStyle: .none
+        )
         #expect(navigator.beginNonePan(to: .right))
-        let horizontalPagination = try #require(currentPaginationView(in: navigator))
-        let continuousPagination = PaginationView(
-            frame: navigator.view.bounds,
-            preloadPreviousPositionCount: 0,
-            preloadNextPositionCount: 0,
-            isScrollEnabled: true,
-            axis: .verticalContinuous
+        navigator.submitPreferences(EPUBPreferences(scroll: true))
+
+        #expect(await waitUntil {
+            self.currentPaginationView(in: navigator)?.axis == .verticalContinuous
+        })
+        let replacement = try #require(currentPaginationView(in: navigator))
+        #expect(replacement.axis == .verticalContinuous)
+        #expect(rootPanRecognizers(in: navigator).isEmpty)
+
+        let spreadView = try #require(replacement.currentView as? EPUBSpreadView)
+        navigator.spreadView(
+            spreadView,
+            didFailToLoadResourceAt: try #require(RelativeURL(path: "chapter.xhtml")),
+            withError: .decoding("Expected test rollback")
         )
-        navigator.view.addSubview(continuousPagination)
-        navigator.updatePageTurnInteractionMode(for: continuousPagination)
-        let nonePan = try #require(
-            navigator.view.gestureRecognizers?.compactMap { $0 as? UIPanGestureRecognizer }.first
-        )
-        #expect(!nonePan.isEnabled)
-        navigator.updatePageTurnInteractionMode(for: horizontalPagination)
+
+        #expect(currentPaginationView(in: navigator)?.axis == .horizontalPaged)
+        #expect(rootPanRecognizers(in: navigator).count == 1)
         #expect(navigator.beginNonePan(to: .left))
         navigator.handleNonePan(state: .cancelled, translationX: 0, velocityX: 0)
     }
@@ -517,10 +557,10 @@ struct EPUBPageTurnControllerTests {
     @Test("a second page turn is rejected until the active session finishes")
     func concurrentTurnIsRejected() {
         let controller = EPUBPageTurnController(refreshCurrentLocation: {})
-        let session = controller.begin(to: .right)
+        let session = controller.begin(to: .right, readingProgression: .ltr)
 
         #expect(session != nil)
-        #expect(controller.begin(to: .left) == nil)
+        #expect(controller.begin(to: .left, readingProgression: .ltr) == nil)
         #expect(session.map(controller.finish) == true)
         #expect(controller.isIdle)
     }
@@ -552,7 +592,7 @@ struct EPUBPageTurnControllerTests {
     func trackingRestoreWakesMultipleWaiters() async throws {
         let restoreGate = Gate()
         let controller = EPUBPageTurnController(refreshCurrentLocation: {})
-        let session = try #require(controller.begin(to: .right))
+        let session = try #require(controller.begin(to: .right, readingProgression: .ltr))
         var restoreCount = 0
         var settledCount = 0
 
@@ -586,7 +626,7 @@ struct EPUBPageTurnControllerTests {
     func settleRestoreCannotRaceCommit() async throws {
         let restoreGate = Gate()
         let controller = EPUBPageTurnController(refreshCurrentLocation: {})
-        let session = try #require(controller.begin(to: .right))
+        let session = try #require(controller.begin(to: .right, readingProgression: .ltr))
         var restoreStarted = false
         var commitStarted = false
 
@@ -617,7 +657,7 @@ struct EPUBPageTurnControllerTests {
         let handoffGate = Gate()
         let publishGate = Gate()
         let controller = EPUBPageTurnController(refreshCurrentLocation: {})
-        let session = try #require(controller.begin(to: .right))
+        let session = try #require(controller.begin(to: .right, readingProgression: .ltr))
         var didStart = false
         var didHandoff = false
         var publishCount = 0
@@ -663,7 +703,7 @@ struct EPUBPageTurnControllerTests {
         let controller = EPUBPageTurnController {
             idleRefreshCount += 1
         }
-        let session = try #require(controller.begin(to: .left))
+        let session = try #require(controller.begin(to: .left, readingProgression: .ltr))
 
         let result = await controller.commit(session) {
             defer { _ = controller.finish(session) }
@@ -706,7 +746,7 @@ struct EPUBPageTurnControllerTests {
         let controller = EPUBPageTurnController {
             await navigator.awaitCurrentLocationRefresh(request: requestRefresh)
         }
-        let session = try #require(controller.begin(to: .right))
+        let session = try #require(controller.begin(to: .right, readingProgression: .ltr))
 
         let moved = await controller.commit(session) {
             defer { _ = controller.finish(session) }
@@ -782,6 +822,12 @@ struct EPUBPageTurnControllerTests {
         in navigator: EPUBNavigatorViewController
     ) -> PaginationView? {
         navigator.view.subviews.compactMap { $0 as? PaginationView }.last
+    }
+
+    private func rootPanRecognizers(
+        in navigator: EPUBNavigatorViewController
+    ) -> [UIPanGestureRecognizer] {
+        navigator.view.gestureRecognizers?.compactMap { $0 as? UIPanGestureRecognizer } ?? []
     }
 
     private func makeLoadedNavigator() async throws -> (EPUBNavigatorViewController, Delegate) {

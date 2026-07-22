@@ -438,7 +438,6 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         paginationView!.frame = view.bounds
         paginationView!.autoresizingMask = [.flexibleHeight, .flexibleWidth]
         view.addSubview(paginationView!)
-        view.addGestureRecognizer(nonePanGestureRecognizer)
         updatePageTurnInteractionMode()
         updatePaginationContentInset()
 
@@ -571,7 +570,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         to direction: EPUBSpreadView.Direction
     ) -> PageTurnSession? {
         guard on(.move(direction)) else { return nil }
-        guard let session = pageTurnController.begin(to: direction) else {
+        guard let session = pageTurnController.begin(
+            to: direction,
+            readingProgression: viewModel.readingProgression
+        ) else {
             on(.moved)
             return nil
         }
@@ -980,10 +982,6 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private func updatePageTurnInteractionMode() {
         guard let paginationView else { return }
-        updatePageTurnInteractionMode(for: paginationView)
-    }
-
-    func updatePageTurnInteractionMode(for paginationView: PaginationView) {
         let policy = pageTurnInteractionPolicy(for: paginationView.axis)
         if !policy.usesNonePan, let session = nonePanSession {
             nonePanSession = nil
@@ -993,7 +991,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         for view in paginationView.loadedViews.values {
             (view as? EPUBSpreadView)?.allowsNativeHorizontalPaging = policy.allowsNativeHorizontalPaging
         }
-        nonePanGestureRecognizer.isEnabled = policy.usesNonePan
+        if policy.usesNonePan {
+            if nonePanGestureRecognizer.view == nil {
+                view.addGestureRecognizer(nonePanGestureRecognizer)
+            }
+        } else if nonePanGestureRecognizer.view != nil {
+            view.removeGestureRecognizer(nonePanGestureRecognizer)
+        }
     }
 
     @objc private func handleNonePan(_ gestureRecognizer: UIPanGestureRecognizer) {
@@ -1031,8 +1035,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             _ = pageTurnController.track(
                 session,
                 translationX: translationX,
-                viewportWidth: view.bounds.width,
-                readingProgression: viewModel.readingProgression
+                viewportWidth: view.bounds.width
             )
 
         case .ended:
@@ -1040,8 +1043,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 translationX: translationX,
                 viewportWidth: view.bounds.width,
                 velocityX: velocityX,
-                direction: session.direction,
-                readingProgression: viewModel.readingProgression
+                session: session
             )
             nonePanSession = nil
             if shouldCommit {

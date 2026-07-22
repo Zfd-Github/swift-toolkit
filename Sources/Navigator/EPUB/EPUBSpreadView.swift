@@ -65,9 +65,9 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
     private var lastClick: ClickEvent?
 
-    private var interactivePointerTracker = EPUBInteractivePointerTracker()
+    private var activeInteractivePointerIDs: Set<Int> = []
     var hasActiveInteractivePointer: Bool {
-        interactivePointerTracker.hasActivePointer
+        !activeInteractivePointerIDs.isEmpty
     }
 
     /// If YES, the content will be faded in once loaded.
@@ -295,11 +295,14 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             return
         }
 
-        interactivePointerTracker.receive(
-            pointerID: pointerID,
-            phase: phase,
-            hasInteractiveElement: (json["interactiveElement"] as? String) != nil
-        )
+        switch phase {
+        case .down where (json["interactiveElement"] as? String) != nil:
+            activeInteractivePointerIDs.insert(pointerID)
+        case .up, .cancel:
+            activeInteractivePointerIDs.remove(pointerID)
+        case .down, .move:
+            break
+        }
     }
 
     /// Parses the target element JSON produced by `extractTargetElement()` in
