@@ -309,6 +309,46 @@ struct EPUBPageTurnControllerTests {
         #expect(rootPanRecognizers(in: navigator).isEmpty)
     }
 
+    @Test("none reapplies native pan policy after current and preloaded WebViews finish navigation")
+    func noneReappliesNativePanPolicyAfterWebNavigation() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(pageTurnStyle: .push)
+        let paginationView = try #require(currentPaginationView(in: navigator))
+
+        navigator.pageTurnStyle = .none
+        let currentSpread = try #require(paginationView.currentView as? EPUBSpreadView)
+        let preloadedSpread = try #require(
+            navigator.paginationView(paginationView, pageViewAtIndex: 1) as? EPUBSpreadView
+        )
+        let spreadViews = [currentSpread, preloadedSpread]
+
+        for spreadView in spreadViews {
+            spreadView.scrollView.panGestureRecognizer.isEnabled = true
+
+            spreadView.webView(spreadView.webView, didFinish: nil)
+
+            #expect(!spreadView.scrollView.panGestureRecognizer.isEnabled)
+        }
+    }
+
+    @Test("fixed WebView navigation reapplies none pan policy without blocking zoomed content pan")
+    func fixedReappliesNativePanPolicyAfterWebNavigation() async throws {
+        let navigator = try await makeMountedNavigator(layout: .fixed, pageTurnStyle: .none)
+        let paginationView = try #require(currentPaginationView(in: navigator))
+        let spreadView = try #require(paginationView.currentView as? EPUBFixedSpreadView)
+        spreadView.scrollView.minimumZoomScale = 1
+        spreadView.scrollView.maximumZoomScale = 3
+
+        spreadView.scrollView.zoomScale = 1
+        spreadView.scrollView.panGestureRecognizer.isEnabled = true
+        spreadView.webView(spreadView.webView, didFinish: nil)
+        #expect(!spreadView.scrollView.panGestureRecognizer.isEnabled)
+
+        spreadView.scrollView.zoomScale = 2
+        spreadView.scrollView.panGestureRecognizer.isEnabled = false
+        spreadView.webView(spreadView.webView, didFinish: nil)
+        #expect(spreadView.scrollView.panGestureRecognizer.isEnabled)
+    }
+
     @Test("accessibility notifications downgrade and restore the user's page turn style")
     func accessibilityNotificationsReconfigureMountedNavigator() async throws {
         let notificationCenter = NotificationCenter()
