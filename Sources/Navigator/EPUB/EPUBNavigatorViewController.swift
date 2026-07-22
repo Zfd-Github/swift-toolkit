@@ -51,6 +51,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         /// Provides default fallback values and ranges for the user settings.
         public var defaults: EPUBDefaults
 
+        /// Page turn animation used for horizontally paginated publications.
+        public var pageTurnStyle: EPUBPageTurnStyle
+
         /// Editing actions which will be displayed in the default text selection menu.
         ///
         /// The default set of editing actions is `EditingAction.defaultActions`.
@@ -99,6 +102,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         public init(
             preferences: EPUBPreferences = .empty,
             defaults: EPUBDefaults = EPUBDefaults(),
+            pageTurnStyle: EPUBPageTurnStyle = .push,
             editingActions: [EditingAction] = EditingAction.defaultActions,
             disablePageTurnsWhileScrolling: Bool = false,
             contentInset: [UIUserInterfaceSizeClass: EPUBContentInsets] = [
@@ -114,6 +118,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         ) {
             self.preferences = preferences
             self.defaults = defaults
+            self.pageTurnStyle = pageTurnStyle
             self.editingActions = editingActions
             self.disablePageTurnsWhileScrolling = disablePageTurnsWhileScrolling
             self.contentInset = contentInset
@@ -256,6 +261,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private let readingOrder: [Link]
     public private(set) var currentLocation: Locator?
+    public var pageTurnStyle: EPUBPageTurnStyle
     private let loadPositionsByReadingOrder: () async -> ReadResult<[[Locator]]>
     private var positionsByReadingOrder: [[Locator]] = []
 
@@ -334,6 +340,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     ) {
         self.viewModel = viewModel
         currentLocation = initialLocation
+        pageTurnStyle = viewModel.config.pageTurnStyle
         self.readingOrder = readingOrder
         loadPositionsByReadingOrder = positionsByReadingOrder
 
@@ -524,10 +531,100 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return fulfill(linkList: toc)
     }
 
-    /// Goes to the next or previous page in the given scroll direction.
-    private func go(to direction: EPUBSpreadView.Direction, options: NavigatorGoOptions) async -> Bool {
+    private lazy var pageTurnController = EPUBPageTurnController(
+        refreshCurrentLocation: { [weak self] in
+            guard let self else { return }
+            await self.awaitCurrentLocationRefresh()
+        }
+    )
+
+    private func effectivePageTurnStyle(
+        userStyle: EPUBPageTurnStyle,
+        isReduceMotionEnabled: Bool,
+        isVoiceOverRunning: Bool
+    ) -> EPUBPageTurnStyle {
+        EPUBPageTurnStyle.effective(
+            userStyle: userStyle,
+            isReduceMotionEnabled: isReduceMotionEnabled,
+            isVoiceOverRunning: isVoiceOverRunning
+        )
+    }
+
+    private func beginPageTurn(
+        to direction: EPUBSpreadView.Direction
+    ) -> PageTurnSession? {
+        guard on(.move(direction)) else { return nil }
+        guard let session = pageTurnController.begin(to: direction) else {
+            on(.moved)
+            return nil
+        }
+        return session
+    }
+
+    private func performPageTurn(
+        to direction: EPUBSpreadView.Direction,
+        options: NavigatorGoOptions
+    ) async -> Bool {
+        guard let paginationView else { return false }
+
+        if
+            let spreadView = paginationView.currentView as? EPUBSpreadView,
+            await spreadView.go(to: direction, options: options)
+        {
+            return true
+        }
+
+        let isRTL = (viewModel.readingProgression == .rtl)
+        let delta = isRTL ? -1 : 1
+        switch direction {
+        case .left:
+            let location: PageLocation = isRTL ? .start : .end
+            return await paginationView.goToIndex(
+                currentSpreadIndex - delta,
+                location: location,
+                options: options
+            )
+        case .right:
+            let location: PageLocation = isRTL ? .end : .start
+            return await paginationView.goToIndex(
+                currentSpreadIndex + delta,
+                location: location,
+                options: options
+            )
+        }
+    }
+
+    private func finishPageTurn(_ session: PageTurnSession) {
+        guard pageTurnController.finish(session) else { return }
+        on(.moved)
+    }
+
+    private func runPageTurn(
+        to direction: EPUBSpreadView.Direction,
+        options: NavigatorGoOptions
+    ) async -> Bool {
+        guard let session = beginPageTurn(to: direction) else { return false }
+        guard !Task.isCancelled else {
+            finishPageTurn(session)
+            return false
+        }
+
+        return await pageTurnController.commit(session) { [self] in
+            defer { finishPageTurn(session) }
+            let moved = await performPageTurn(to: direction, options: options)
+            if moved {
+                await publishCurrentLocation()
+            }
+            return moved
+        }
+    }
+
+    private func goUsingExistingPath(
+        to direction: EPUBSpreadView.Direction,
+        options: NavigatorGoOptions
+    ) async -> Bool {
         guard
-            let paginationView = paginationView,
+            let paginationView,
             on(.move(direction))
         else {
             return false
@@ -556,6 +653,40 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
         on(.moved)
         return moved
+    }
+
+    /// Goes to the next or previous page in the given scroll direction.
+    private func go(
+        to direction: EPUBSpreadView.Direction,
+        options: NavigatorGoOptions
+    ) async -> Bool {
+        var routedOptions = options
+        if UIAccessibility.isReduceMotionEnabled
+            || UIAccessibility.isVoiceOverRunning
+        {
+            routedOptions.animated = false
+        }
+
+        guard paginationView?.axis == .horizontalPaged else {
+            return await goUsingExistingPath(
+                to: direction,
+                options: routedOptions
+            )
+        }
+
+        let style = effectivePageTurnStyle(
+            userStyle: pageTurnStyle,
+            isReduceMotionEnabled: UIAccessibility.isReduceMotionEnabled,
+            isVoiceOverRunning: UIAccessibility.isVoiceOverRunning
+        )
+        switch style {
+        case .push:
+            return await runPageTurn(to: direction, options: routedOptions)
+        case .none, .simulation:
+            return await runPageTurn(to: direction, options: .none)
+        case .cover:
+            return await runPageTurn(to: direction, options: .none)
+        }
     }
 
     // MARK: - Pagination and spreads
@@ -887,24 +1018,49 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Used to avoid sending twice the same location.
     private var notifiedCurrentLocation: Locator?
 
+    private func publishCurrentLocation() async {
+        let (location, newViewport) = await computeCurrentLocationAndViewport()
+        viewport = newViewport
+
+        guard let location else {
+            log(.error, "Failed to compute the current location")
+            return
+        }
+
+        currentLocation = location
+        guard location != notifiedCurrentLocation else { return }
+        notifiedCurrentLocation = location
+        delegate?.navigator(self, locationDidChange: location)
+    }
+
+    private var currentLocationRefreshWaiters: [CheckedContinuation<Void, Never>] = []
+    private var isCurrentLocationRefreshRunning = false
+
     private lazy var updateCurrentLocation = execute(
         // If we're not in an `idle` state, we postpone the notification.
         when: { [weak self] in self?.state == .idle },
         pollingInterval: 0.1
     ) { [weak self] in
-        guard let self = self else {
-            return
+        guard let self else { return }
+        guard !isCurrentLocationRefreshRunning else { return }
+        isCurrentLocationRefreshRunning = true
+        await publishCurrentLocation()
+        isCurrentLocationRefreshRunning = false
+        let waiters = currentLocationRefreshWaiters
+        currentLocationRefreshWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    private func awaitCurrentLocationRefresh() async {
+        await withCheckedContinuation { continuation in
+            currentLocationRefreshWaiters.append(continuation)
+            updateCurrentLocation()
         }
+    }
 
-        (currentLocation, viewport) = await computeCurrentLocationAndViewport()
-
-        if
-            let delegate = delegate,
-            let location = currentLocation,
-            location != notifiedCurrentLocation
-        {
-            notifiedCurrentLocation = location
-            delegate.navigator(self, locationDidChange: location)
+    public func settlePageTurn() async {
+        await pageTurnController.settle { [weak self] session in
+            self?.finishPageTurn(session)
         }
     }
 
