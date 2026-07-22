@@ -238,6 +238,42 @@ struct EPUBPageTurnControllerTests {
         navigator.handleNonePan(state: .cancelled, translationX: 0, velocityX: 0)
     }
 
+    @Test("none should-begin judgment has no navigation side effects")
+    func nonePanShouldBeginIsSideEffectFree() async throws {
+        let navigator = try await makeMountedNavigator(pageTurnStyle: .none)
+        let paginationView = try #require(currentPaginationView(in: navigator))
+
+        #expect(paginationView.isUserInteractionEnabled)
+        #expect(navigator.shouldBeginNonePan())
+        #expect(paginationView.isUserInteractionEnabled)
+        #expect(navigator.beginNonePan(to: .right))
+
+        navigator.handleNonePan(state: .cancelled, translationX: 0, velocityX: 0)
+    }
+
+    @Test("none pan begins only after recognition and permits a second swipe")
+    func nonePanPermitsConsecutiveSwipes() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(pageTurnStyle: .none)
+
+        navigator.handleNonePan(state: .began, translationX: 0, velocityX: -700)
+        navigator.handleNonePan(state: .ended, translationX: -100, velocityX: -700)
+
+        #expect(await waitUntil {
+            currentPaginationView(in: navigator)?.currentIndex == 1
+        })
+        await navigator.settlePageTurn()
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-2.xhtml"))
+
+        navigator.handleNonePan(state: .began, translationX: 0, velocityX: 700)
+        navigator.handleNonePan(state: .ended, translationX: 100, velocityX: 700)
+
+        #expect(await waitUntil {
+            currentPaginationView(in: navigator)?.currentIndex == 0
+        })
+        await navigator.settlePageTurn()
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-1.xhtml"))
+    }
+
     @Test("mounted navigator reconfigures outer, spread, and none recognizers for runtime styles")
     func mountedRuntimeInteractionPolicy() async throws {
         let navigator = try await makeMountedNavigator(pageTurnStyle: .push)
