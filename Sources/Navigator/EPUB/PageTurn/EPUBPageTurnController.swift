@@ -208,9 +208,9 @@ final class EPUBPageTurnController {
 
     func invalidatePreCommitSession() -> PageTurnSession? {
         switch state {
-        case let .tracking(session, _), let .restoring(session):
+        case let .tracking(session, _):
             return finish(session) ? session : nil
-        case .idle, .committing:
+        case .idle, .restoring, .committing:
             return nil
         }
     }
