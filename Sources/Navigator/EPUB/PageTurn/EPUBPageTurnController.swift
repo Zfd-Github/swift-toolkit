@@ -132,7 +132,6 @@ final class EPUBPageTurnController {
     }
 
     private var state: State = .idle
-    private var restoreTask: Task<Void, Never>?
     private var idleWaiters: [CheckedContinuation<Void, Never>] = []
     private let refreshCurrentLocation: () async -> Void
 
@@ -201,7 +200,6 @@ final class EPUBPageTurnController {
         guard state.session?.id == session.id else { return false }
 
         state = .idle
-        restoreTask = nil
         let waiters = idleWaiters
         idleWaiters.removeAll()
         waiters.forEach { $0.resume() }
@@ -216,10 +214,8 @@ final class EPUBPageTurnController {
             break
         case let .tracking(session, _):
             state = .restoring(session)
-            if restoreTask == nil {
-                restoreTask = Task { @MainActor in
-                    await restore(session)
-                }
+            Task { @MainActor in
+                await restore(session)
             }
             await waitUntilIdle()
         case .restoring, .committing:
