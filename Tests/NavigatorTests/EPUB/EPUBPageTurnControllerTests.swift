@@ -59,6 +59,145 @@ struct EPUBPageTurnControllerTests {
         }
     }
 
+    @Test("none pan maps horizontal swipes in LTR and RTL")
+    func nonePanDirection() {
+        #expect(EPUBPageTurnInteraction.direction(
+            for: CGPoint(x: -1, y: 0),
+            readingProgression: .ltr
+        ) == .right)
+        #expect(EPUBPageTurnInteraction.direction(
+            for: CGPoint(x: 1, y: 0),
+            readingProgression: .ltr
+        ) == .left)
+        #expect(EPUBPageTurnInteraction.direction(
+            for: CGPoint(x: -1, y: 0),
+            readingProgression: .rtl
+        ) == .left)
+        #expect(EPUBPageTurnInteraction.direction(
+            for: CGPoint(x: 1, y: 0),
+            readingProgression: .rtl
+        ) == .right)
+        #expect(EPUBPageTurnInteraction.direction(
+            for: CGPoint(x: 10, y: 11),
+            readingProgression: .ltr
+        ) == nil)
+    }
+
+    @Test("interactive content keeps none pan blocked for its pointer lifetime")
+    func interactivePointerPolicy() {
+        var isActive = EPUBPageTurnInteraction.interactivePointerIsActive(
+            current: false,
+            phase: .down,
+            hasInteractiveElement: true
+        )
+        #expect(isActive)
+
+        isActive = EPUBPageTurnInteraction.interactivePointerIsActive(
+            current: isActive,
+            phase: .move,
+            hasInteractiveElement: false
+        )
+        #expect(isActive)
+
+        isActive = EPUBPageTurnInteraction.interactivePointerIsActive(
+            current: isActive,
+            phase: .up,
+            hasInteractiveElement: true
+        )
+        #expect(!isActive)
+    }
+
+    @Test("none pan commits at the exact distance or velocity threshold")
+    func nonePanThresholds() {
+        #expect(!EPUBPageTurnInteraction.shouldCommit(
+            translationX: 21.9,
+            viewportWidth: 100,
+            velocityX: 0
+        ))
+        #expect(EPUBPageTurnInteraction.shouldCommit(
+            translationX: 22,
+            viewportWidth: 100,
+            velocityX: 0
+        ))
+        #expect(!EPUBPageTurnInteraction.shouldCommit(
+            translationX: 0,
+            viewportWidth: 100,
+            velocityX: 649
+        ))
+        #expect(EPUBPageTurnInteraction.shouldCommit(
+            translationX: 0,
+            viewportWidth: 100,
+            velocityX: 650
+        ))
+    }
+
+    @Test("none tracking records progress without moving the live view")
+    func nonePanTrackingDoesNotMoveView() throws {
+        let controller = EPUBPageTurnController(refreshCurrentLocation: {})
+        let session = try #require(controller.begin(to: .right))
+        let view = UIView(frame: CGRect(x: 10, y: 20, width: 100, height: 200))
+        view.transform = CGAffineTransform(scaleX: 0.9, y: 0.9)
+        let frame = view.frame
+        let transform = view.transform
+
+        let progress = try #require(
+            controller.track(session, translationX: 21.9, viewportWidth: 100)
+        )
+        #expect(abs(progress - 0.219) < 0.0001)
+
+        #expect(view.frame == frame)
+        #expect(view.transform == transform)
+        #expect(controller.finish(session))
+    }
+
+    @Test("native horizontal pan is enabled only for effective push")
+    func nativePanPolicy() {
+        let expected: [(EPUBPageTurnStyle, Bool, Bool)] = [
+            (.push, true, false),
+            (.none, false, true),
+            (.cover, false, false),
+            (.simulation, false, false),
+        ]
+
+        for (style, allowsNativePaging, usesNonePan) in expected {
+            let policy = EPUBPageTurnInteraction.policy(
+                axis: .horizontalPaged,
+                style: style
+            )
+            #expect(policy.allowsNativeHorizontalPaging == allowsNativePaging)
+            #expect(policy.usesNonePan == usesNonePan)
+        }
+
+        let continuous = EPUBPageTurnInteraction.policy(
+            axis: .verticalContinuous,
+            style: .none
+        )
+        #expect(continuous.allowsNativeHorizontalPaging)
+        #expect(!continuous.usesNonePan)
+    }
+
+    @Test("fixed zoom preserves content pan and blocks page turns until minimum zoom")
+    func fixedZoomPolicy() {
+        #expect(EPUBFixedSpreadView.allowsContentPan(
+            allowsNativeHorizontalPaging: false,
+            zoomScale: 2,
+            minimumZoomScale: 1
+        ))
+        #expect(!EPUBFixedSpreadView.allowsPageTurn(
+            zoomScale: 2,
+            minimumZoomScale: 1
+        ))
+        #expect(!EPUBFixedSpreadView.allowsContentPan(
+            allowsNativeHorizontalPaging: false,
+            zoomScale: 1,
+            minimumZoomScale: 1
+        ))
+        #expect(EPUBFixedSpreadView.allowsPageTurn(
+            zoomScale: 1,
+            minimumZoomScale: 1
+        ))
+    }
+
     @Test("production router exhaustively routes horizontal styles and bypasses continuous pagination")
     func productionRouter() async throws {
         let navigator = try makeNavigator()
