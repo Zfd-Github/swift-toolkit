@@ -35,6 +35,18 @@ protocol PageView {
 }
 
 @MainActor
+final class PaginationPageTurnSnapshotExposureContext {
+    fileprivate let originalOffset: CGPoint
+    fileprivate let cover: UIView
+    fileprivate var isRestored = false
+
+    fileprivate init(originalOffset: CGPoint, cover: UIView) {
+        self.originalOffset = originalOffset
+        self.cover = cover
+    }
+}
+
+@MainActor
 protocol PaginationViewDelegate: AnyObject {
     /// Creates the page view for the page at given index.
     func paginationView(_ paginationView: PaginationView, pageViewAtIndex index: Int) -> (UIView & PageView)?
@@ -136,6 +148,89 @@ final class PaginationView: UIView, Loggable {
     /// Return the currently presented page view from the Views array.
     var currentView: (UIView & PageView)? {
         loadedViews[currentIndex]
+    }
+
+    func readyAdjacentView(at index: Int) -> (UIView & PageView)? {
+        guard
+            axis == .horizontalPaged,
+            abs(index - currentIndex) == 1,
+            0 ..< pageCount ~= index
+        else {
+            return nil
+        }
+        return loadedViews[index]
+    }
+
+    func stillContainsReadyView(
+        _ view: UIView & PageView,
+        at index: Int,
+        currentIndex expectedCurrentIndex: Int
+    ) -> Bool {
+        axis == .horizontalPaged
+            && currentIndex == expectedCurrentIndex
+            && loadedViews[index] === view
+    }
+
+    func exposeReadyViewForPageTurnSnapshot(
+        at index: Int
+    ) async -> PaginationPageTurnSnapshotExposureContext? {
+        guard
+            !isAnimatingContentOffset,
+            let targetView = readyAdjacentView(at: index)
+        else {
+            return nil
+        }
+        let sourceIndex = currentIndex
+
+        layoutIfNeeded()
+        guard
+            !bounds.isEmpty,
+            !scrollView.bounds.isEmpty,
+            let cover = snapshotView(afterScreenUpdates: false)
+        else {
+            return nil
+        }
+
+        cover.frame = bounds
+        cover.isUserInteractionEnabled = false
+        addSubview(cover)
+        let context = PaginationPageTurnSnapshotExposureContext(
+            originalOffset: scrollView.contentOffset,
+            cover: cover
+        )
+
+        isAnimatingContentOffset = true
+        scrollView.isScrollEnabled = false
+        scrollView.contentOffset = CGPoint(
+            x: xOffsetForIndex(index),
+            y: context.originalOffset.y
+        )
+        await PageTurnAnimationFrameWaiter.wait()
+        await PageTurnAnimationFrameWaiter.wait()
+
+        guard
+            currentIndex == sourceIndex,
+            loadedViews[index] === targetView,
+            visibleFrame(at: index) != nil
+        else {
+            await restorePageTurnSnapshotExposure(context)
+            return nil
+        }
+        return context
+    }
+
+    func restorePageTurnSnapshotExposure(
+        _ context: PaginationPageTurnSnapshotExposureContext
+    ) async {
+        guard !context.isRestored else { return }
+        context.isRestored = true
+
+        scrollView.contentOffset = context.originalOffset
+        await PageTurnAnimationFrameWaiter.wait()
+        await PageTurnAnimationFrameWaiter.wait()
+        context.cover.removeFromSuperview()
+        isAnimatingContentOffset = false
+        restoreScrollInteraction()
     }
 
     /// Loaded page views in reading order.

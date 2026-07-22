@@ -11,6 +11,15 @@ import SwiftSoup
 import UIKit
 import WebKit
 
+func pageTurnSnapshotsRequireInvalidationForPagesDidChange(
+    _ spreadView: UIView,
+    in paginationView: PaginationView?
+) -> Bool {
+    guard let paginationView else { return true }
+    return paginationView.axis == .verticalContinuous
+        || paginationView.currentView === spreadView
+}
+
 @MainActor public protocol EPUBNavigatorDelegate: VisualNavigatorDelegate, SelectableNavigatorDelegate,
     ViewportObservingNavigatorDelegate
 {
@@ -261,8 +270,18 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private let readingOrder: [Link]
     public private(set) var currentLocation: Locator?
+    private var storedPageTurnStyle: EPUBPageTurnStyle
     public var pageTurnStyle: EPUBPageTurnStyle {
-        didSet { updatePageTurnInteractionMode() }
+        get { storedPageTurnStyle }
+        set {
+            guard storedPageTurnStyle != newValue || !snapshotProvider.isIdle else { return }
+            snapshotProvider.invalidate()
+            snapshotProvider.deferPageTurnStyle { [weak self] in
+                guard let self else { return }
+                self.storedPageTurnStyle = newValue
+                self.updatePageTurnInteractionMode()
+            }
+        }
     }
     private let loadPositionsByReadingOrder: () async -> ReadResult<[[Locator]]>
     private var positionsByReadingOrder: [[Locator]] = []
@@ -383,7 +402,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         self.notificationCenter = notificationCenter
         self.accessibilityStatusProvider = accessibilityStatusProvider
         currentLocation = initialLocation
-        pageTurnStyle = viewModel.config.pageTurnStyle
+        storedPageTurnStyle = viewModel.config.pageTurnStyle
         self.readingOrder = readingOrder
         loadPositionsByReadingOrder = positionsByReadingOrder
 
@@ -443,6 +462,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     deinit {
+        coverPrewarmTask?.cancel()
         viewportPropagationTask?.cancel()
         accessibilityObserverTokens.forEach(notificationCenter.removeObserver)
         notificationCenter.removeObserver(self)
@@ -464,6 +484,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     @objc private func willResignActive() {
         isActive = false
+        cancelCoverPageTurn()
+        snapshotProvider.invalidate()
     }
 
     @objc private func didBecomeActive() {
@@ -473,7 +495,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // We may need to refresh the spreads in this situation. Unfortunately,
         // the `viewWillTransition(to:with:)` API is called before we receive
         // the `didBecomeActive` notification, so we cannot rely on it here.
-        viewModel.viewSizeWillChange(view.bounds.size)
+        deferViewSizeChangeUntilSnapshotRestored(view.bounds.size)
 
         if needsReloadSpreadsOnActive {
             needsReloadSpreadsOnActive = false
@@ -500,6 +522,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
         applySettings()
 
+        snapshotProvider.invalidate()
         _reloadSpreads()
 
         onInitializedCallbacks.complete()
@@ -530,7 +553,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     override open func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        viewModel.viewSizeWillChange(view.bounds.size)
+        deferViewSizeChangeUntilSnapshotRestored(view.bounds.size)
         updatePaginationContentInset()
     }
 
@@ -541,15 +564,25 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     override open func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
         super.traitCollectionDidChange(previousTraitCollection)
+        cancelCoverPageTurn()
+        snapshotProvider.invalidate()
         updatePaginationContentInset()
+        prewarmCoverSnapshots()
     }
 
     override open func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
         super.viewWillTransition(to: size, with: coordinator)
 
         if isActive {
-            viewModel.viewSizeWillChange(size)
+            cancelCoverPageTurn()
+            deferViewSizeChangeUntilSnapshotRestored(size)
         }
+    }
+
+    override open func didReceiveMemoryWarning() {
+        super.didReceiveMemoryWarning()
+        cancelCoverPageTurn()
+        snapshotProvider.invalidate()
     }
 
     @discardableResult
@@ -598,6 +631,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
     )
 
+    let snapshotProvider = EPUBPageTurnSnapshotProvider()
+
     private lazy var nonePanGestureRecognizer: UIPanGestureRecognizer = {
         let gestureRecognizer = UIPanGestureRecognizer(
             target: self,
@@ -609,7 +644,21 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return gestureRecognizer
     }()
 
+    private lazy var coverPanGestureRecognizer: UIPanGestureRecognizer = {
+        let gestureRecognizer = UIPanGestureRecognizer(
+            target: self,
+            action: #selector(handleCoverPan(_:))
+        )
+        gestureRecognizer.maximumNumberOfTouches = 1
+        gestureRecognizer.cancelsTouchesInView = false
+        gestureRecognizer.delegate = self
+        return gestureRecognizer
+    }()
+
     private var nonePanSession: PageTurnSession?
+    private var coverPanSession: PageTurnSession?
+    private var coverAnimator: EPUBCoverPageTurnAnimator?
+    private var coverPrewarmTask: Task<Void, Never>?
 
     private func effectivePageTurnStyle(
         userStyle: EPUBPageTurnStyle,
@@ -705,6 +754,111 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return await commitPageTurn(session, options: options)
     }
 
+    private func turnProgrammatically(
+        to direction: EPUBSpreadView.Direction
+    ) async -> Bool {
+        guard let session = beginPageTurn(to: direction) else { return false }
+        guard !Task.isCancelled else {
+            finishPageTurn(session)
+            return false
+        }
+
+        let snapshots = await captureCoverSnapshotPair(to: direction)
+        if Task.isCancelled {
+            if pageTurnController.isTracking(session) {
+                finishPageTurn(session)
+            }
+            return false
+        }
+        guard let snapshots else {
+            return await commitPageTurn(session, options: .none)
+        }
+        guard pageTurnController.isTracking(session) else { return false }
+
+        let animator = EPUBCoverPageTurnAnimator(
+            hostView: view,
+            currentImage: snapshots.current,
+            targetImage: snapshots.target,
+            isForward: session.isForward,
+            physicalCompletionDirection: session.physicalCompletionDirection
+        )
+        coverPanSession = session
+        coverAnimator = animator
+        return await commitCoverPageTurn(
+            session,
+            animator: animator,
+            progress: 0
+        )
+    }
+
+    private func commitCoverPageTurn(
+        _ session: PageTurnSession,
+        animator: EPUBCoverPageTurnAnimator,
+        progress: CGFloat
+    ) async -> Bool {
+        let remaining = 1 - min(max(progress, 0), 1)
+        return await pageTurnController.turnProgrammatically(
+            session,
+            animate: {
+                await animator.animate(to: 1, duration: 0.32 * remaining)
+            },
+            performPageTurn: { [self] in
+                await performPageTurn(session, options: .none)
+            },
+            publishCurrentLocation: { [self] in
+                await PageTurnAnimationFrameWaiter.wait()
+                await PageTurnAnimationFrameWaiter.wait()
+                await publishCurrentLocation()
+            },
+            finish: { [self] in
+                cleanupCoverPageTurn(session)
+                finishPageTurn(session)
+                prewarmCoverSnapshots()
+            }
+        )
+    }
+
+    private func restoreCoverPageTurn(_ session: PageTurnSession) async {
+        let animator = coverAnimator
+        _ = await pageTurnController.restoreCover(
+            session,
+            rebound: { _ in
+                await animator?.animate(to: 0, duration: 0.18)
+            },
+            cleanup: { [self] in
+                cleanupCoverPageTurn(session)
+            },
+            finish: { [self] session in
+                finishPageTurn(session)
+                prewarmCoverSnapshots()
+            }
+        )
+    }
+
+    private func cancelCoverPageTurn() {
+        if let session = coverPanSession {
+            Task { [weak self] in
+                await self?.restoreCoverPageTurn(session)
+            }
+            return
+        }
+        guard
+            let paginationView,
+            pageTurnInteractionPolicy(for: paginationView.axis).usesCoverPan,
+            pageTurnController.invalidatePreCommitSession() != nil
+        else {
+            return
+        }
+        on(.moved)
+    }
+
+    private func cleanupCoverPageTurn(_ session: PageTurnSession) {
+        guard coverPanSession?.id == session.id else { return }
+        coverPanSession = nil
+        coverAnimator?.remove()
+        coverAnimator = nil
+    }
+
     private func goUsingExistingPath(
         to direction: EPUBSpreadView.Direction,
         options: NavigatorGoOptions
@@ -746,7 +900,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         to direction: EPUBSpreadView.Direction,
         options: NavigatorGoOptions
     ) async -> Bool {
+        await snapshotProvider.settle()
         let accessibilityStatus = accessibilityStatusProvider()
+        let isCover = paginationView?.axis == .horizontalPaged
+            && effectivePageTurnStyle(
+                userStyle: pageTurnStyle,
+                isReduceMotionEnabled: accessibilityStatus.isReduceMotionEnabled,
+                isVoiceOverRunning: accessibilityStatus.isVoiceOverRunning
+            ) == .cover
+        if !isCover {
+            snapshotProvider.invalidate()
+        }
         return await routePageTurn(
             to: direction,
             options: options,
@@ -758,6 +922,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             },
             usingPageTurn: { [self] direction, options in
                 await runPageTurn(to: direction, options: options)
+            },
+            usingCover: { [self] direction in
+                await turnProgrammatically(to: direction)
             }
         )
     }
@@ -769,7 +936,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         isReduceMotionEnabled: Bool,
         isVoiceOverRunning: Bool,
         usingExistingPath: (EPUBSpreadView.Direction, NavigatorGoOptions) async -> Bool,
-        usingPageTurn: (EPUBSpreadView.Direction, NavigatorGoOptions) async -> Bool
+        usingPageTurn: (EPUBSpreadView.Direction, NavigatorGoOptions) async -> Bool,
+        usingCover: (EPUBSpreadView.Direction) async -> Bool
     ) async -> Bool {
         var routedOptions = options
         if isReduceMotionEnabled || isVoiceOverRunning {
@@ -791,7 +959,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         case .none, .simulation:
             return await usingPageTurn(direction, .none)
         case .cover:
-            return await usingPageTurn(direction, .none)
+            return await usingCover(direction)
         }
     }
 
@@ -810,6 +978,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private var isPaginationPreferenceTransitionActive = false
     private var queuedPaginationPreferences: EPUBPreferences?
     private var viewportPropagationTask: Task<Void, Never>?
+    private var pendingSnapshotViewSize: CGSize?
+    private var needsSnapshotPaginationInvalidation = false
+    private var needsSnapshotReload = false
+    private var pendingSnapshotPaginationCompletion: PaginationView?
+    private var pendingSnapshotPaginationRollback: (paginationView: PaginationView, index: Int)?
+    private var isDrainingSnapshotMutations = false
 
     private var pendingReplacementPaginationView: PaginationView? {
         pendingPaginationTransition?.replacementPaginationView
@@ -843,6 +1017,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func invalidatePaginationView() {
+        snapshotProvider.invalidate()
+        needsSnapshotPaginationInvalidation = true
+        scheduleSnapshotMutationDrain()
+    }
+
+    private func invalidatePaginationViewAfterSnapshotCapture() {
         guard let oldPaginationView = paginationView else {
             return
         }
@@ -875,7 +1055,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             paginationView.isScrollEnabled = isPaginationViewScrollingEnabled(for: paginationView.axis)
             updatePageTurnInteractionMode()
         }
-        reloadSpreads()
+        reloadSpreadsAfterSnapshotCapture()
     }
 
     private var spreads: [EPUBSpread] = []
@@ -888,6 +1068,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private var needsReloadSpreadsOnActive = false
 
     private func reloadSpreads() {
+        snapshotProvider.invalidate()
+        needsSnapshotReload = true
+        scheduleSnapshotMutationDrain()
+    }
+
+    private func reloadSpreadsAfterSnapshotCapture() {
         guard
             state != .initializing,
             isViewLoaded
@@ -957,6 +1143,19 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return
         }
 
+        snapshotProvider.invalidate()
+        pendingSnapshotPaginationCompletion = paginationView
+        scheduleSnapshotMutationDrain()
+    }
+
+    private func completePendingPaginationTransitionAfterSnapshotCapture(_ paginationView: PaginationView) {
+        guard
+            let transition = pendingPaginationTransition,
+            paginationView === transition.replacementPaginationView
+        else {
+            return
+        }
+
         pendingPaginationTransition = nil
         transition.oldPaginationView.removeFromSuperview()
         on(.loaded)
@@ -964,6 +1163,24 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func rollbackPendingPaginationTransition(
+        _ paginationView: PaginationView,
+        failedCurrentIndex index: Int
+    ) {
+        guard
+            let transition = pendingPaginationTransition,
+            paginationView === transition.replacementPaginationView,
+            index == paginationView.currentIndex
+        else {
+            return
+        }
+
+        snapshotProvider.invalidate()
+        pendingSnapshotPaginationCompletion = nil
+        pendingSnapshotPaginationRollback = (paginationView, index)
+        scheduleSnapshotMutationDrain()
+    }
+
+    private func rollbackPendingPaginationTransitionAfterSnapshotCapture(
         _ paginationView: PaginationView,
         failedCurrentIndex index: Int
     ) {
@@ -990,6 +1207,72 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         paginationViewDidUpdateViewport(transition.oldPaginationView)
         delegate?.navigator(self, presentationDidChange: presentation)
         finishPaginationPreferenceTransition()
+    }
+
+    private var hasPendingSnapshotMutations: Bool {
+        pendingSnapshotViewSize != nil
+            || needsSnapshotPaginationInvalidation
+            || needsSnapshotReload
+            || pendingSnapshotPaginationCompletion != nil
+            || pendingSnapshotPaginationRollback != nil
+    }
+
+    private func deferViewSizeChangeUntilSnapshotRestored(_ size: CGSize) {
+        snapshotProvider.invalidate()
+        pendingSnapshotViewSize = size
+        scheduleSnapshotMutationDrain()
+        prewarmCoverSnapshots()
+    }
+
+    private func scheduleSnapshotMutationDrain() {
+        guard !isDrainingSnapshotMutations else { return }
+        snapshotProvider.deferReload { [weak self] in
+            self?.drainSnapshotMutations()
+        }
+    }
+
+    private func drainSnapshotMutations() {
+        guard !isDrainingSnapshotMutations else { return }
+        isDrainingSnapshotMutations = true
+        defer { isDrainingSnapshotMutations = false }
+
+        while hasPendingSnapshotMutations {
+            let viewSize = pendingSnapshotViewSize
+            let completion = pendingSnapshotPaginationCompletion
+            let rollback = pendingSnapshotPaginationRollback
+            var shouldInvalidatePagination = needsSnapshotPaginationInvalidation
+            var shouldReload = needsSnapshotReload
+
+            pendingSnapshotViewSize = nil
+            pendingSnapshotPaginationCompletion = nil
+            pendingSnapshotPaginationRollback = nil
+            needsSnapshotPaginationInvalidation = false
+            needsSnapshotReload = false
+
+            if let viewSize {
+                viewModel.viewSizeWillChange(viewSize)
+            }
+            if let rollback {
+                rollbackPendingPaginationTransitionAfterSnapshotCapture(
+                    rollback.paginationView,
+                    failedCurrentIndex: rollback.index
+                )
+            } else if let completion {
+                completePendingPaginationTransitionAfterSnapshotCapture(completion)
+            }
+
+            viewModel.flushPendingPaginationInvalidation()
+            shouldInvalidatePagination = shouldInvalidatePagination || needsSnapshotPaginationInvalidation
+            shouldReload = shouldReload || needsSnapshotReload
+            needsSnapshotPaginationInvalidation = false
+            needsSnapshotReload = false
+
+            if shouldInvalidatePagination {
+                invalidatePaginationViewAfterSnapshotCapture()
+            } else if shouldReload {
+                reloadSpreadsAfterSnapshotCapture()
+            }
+        }
     }
 
     private func finishPaginationPreferenceTransition() {
@@ -1019,6 +1302,353 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             .first { $0.spread.contains(index: index) }
     }
 
+    func captureAdjacentPageSnapshotForTesting(
+        to direction: EPUBSpreadView.Direction
+    ) async throws -> UIImage? {
+        guard
+            snapshotProvider.isInputEnabled,
+            currentSelection == nil,
+            let currentSpread = paginationView?.currentView as? EPUBSpreadView,
+            !currentSpread.hasActiveMedia
+        else {
+            return nil
+        }
+
+        let left = pageTurnSnapshotTarget(to: .left)
+        let right = pageTurnSnapshotTarget(to: .right)
+        snapshotProvider.retainSnapshots(
+            previous: left?.identity,
+            current: currentPageTurnSnapshotIdentity(),
+            next: right?.identity
+        )
+        let target: PageTurnSnapshotTarget?
+        switch direction {
+        case .left:
+            target = left
+        case .right:
+            target = right
+        }
+        guard let target else { return nil }
+
+        return try await capturePageTurnSnapshot(target)
+    }
+
+    private func capturePageTurnSnapshot(
+        _ target: PageTurnSnapshotTarget
+    ) async throws -> UIImage? {
+        var spreadContext: EPUBPageTurnSnapshotCaptureContext?
+        var paginationContext: PaginationPageTurnSnapshotExposureContext?
+        return try await snapshotProvider.capture(
+            target: target.identity,
+            sourceIdentity: { [weak self] in
+                guard
+                    let self,
+                    self.pageTurnSnapshotTargetIsStillReady(target)
+                else {
+                    return nil
+                }
+                return target.identity
+            },
+            isBlocked: { [weak self, weak spread = target.spread] in
+                guard let self, let spread else { return true }
+                return self.currentSelection != nil
+                    || spread.hasActiveMedia
+                    || ((self.paginationView?.currentView as? EPUBSpreadView)?.hasActiveMedia ?? false)
+            },
+            capture: { [pagination = target.pagination, spread = target.spread] in
+                guard
+                    let captureContext = spread.beginPageTurnSnapshotCapture(at: target.offset)
+                else {
+                    throw PageTurnSnapshotError.unavailable
+                }
+                spreadContext = captureContext
+                if target.index != target.currentIndex {
+                    guard let context = await pagination.exposeReadyViewForPageTurnSnapshot(
+                        at: target.index
+                    ) else {
+                        throw PageTurnSnapshotError.unavailable
+                    }
+                    paginationContext = context
+                }
+                return try await spread.capturePageTurnSnapshot()
+            },
+            restore: { [pagination = target.pagination, spread = target.spread] in
+                if let spreadContext {
+                    await spread.restorePageTurnSnapshotCapture(spreadContext)
+                }
+                if let paginationContext {
+                    await pagination.restorePageTurnSnapshotExposure(paginationContext)
+                }
+            }
+        )
+    }
+
+    var currentSpreadHasActiveMediaForTesting: Bool {
+        (paginationView?.currentView as? EPUBSpreadView)?.hasActiveMedia ?? false
+    }
+
+    func beginCoverPageTurnForTesting(
+        to direction: EPUBSpreadView.Direction
+    ) -> Bool {
+        guard
+            coverPanSession == nil,
+            let session = beginPageTurn(to: direction)
+        else {
+            return false
+        }
+        coverPanSession = session
+        coverAnimator = EPUBCoverPageTurnAnimator(
+            hostView: view,
+            currentImage: UIImage(),
+            targetImage: UIImage(),
+            isForward: session.isForward,
+            physicalCompletionDirection: session.physicalCompletionDirection
+        )
+        return true
+    }
+
+    func beginCoverSnapshotCaptureForTesting(
+        to direction: EPUBSpreadView.Direction
+    ) -> Bool {
+        beginPageTurn(to: direction) != nil
+    }
+
+    var isPageTurnIdleForTesting: Bool {
+        pageTurnController.isIdle
+            && coverPanSession == nil
+            && coverAnimator == nil
+    }
+
+    func canBeginCoverPanForTesting(
+        to direction: EPUBSpreadView.Direction
+    ) -> Bool {
+        shouldBeginCoverPan(to: direction)
+    }
+
+    var isPageTurnSnapshotInputEnabledForTesting: Bool {
+        snapshotProvider.isInputEnabled
+    }
+
+    func hasCachedCoverSnapshotPairForTesting(
+        to direction: EPUBSpreadView.Direction
+    ) -> Bool {
+        cachedCoverSnapshotPair(to: direction) != nil
+    }
+
+    private struct PageTurnSnapshotTarget {
+        let pagination: PaginationView
+        let spread: EPUBSpreadView
+        let index: Int
+        let currentIndex: Int
+        let resourceIndex: Int
+        let pageIndex: Int
+        let offset: CGPoint
+
+        var identity: EPUBPageTurnSnapshotTargetIdentity {
+            EPUBPageTurnSnapshotTargetIdentity(
+                pagination: pagination,
+                spread: spread,
+                resourceIndex: resourceIndex,
+                pageIndex: pageIndex
+            )
+        }
+    }
+
+    private enum PageTurnSnapshotError: Error {
+        case unavailable
+    }
+
+    private func currentPageTurnSnapshotIdentity() -> EPUBPageTurnSnapshotTargetIdentity? {
+        currentPageTurnSnapshotTarget()?.identity
+    }
+
+    private func currentPageTurnSnapshotTarget() -> PageTurnSnapshotTarget? {
+        guard
+            let paginationView,
+            paginationView.axis == .horizontalPaged,
+            let spread = paginationView.currentView as? EPUBSpreadView,
+            spread.isSpreadLoaded,
+            !spread.isTerminated,
+            !spread.webView.bounds.isEmpty
+        else {
+            return nil
+        }
+        let offset = spread.scrollView.contentOffset
+        return PageTurnSnapshotTarget(
+            pagination: paginationView,
+            spread: spread,
+            index: paginationView.currentIndex,
+            currentIndex: paginationView.currentIndex,
+            resourceIndex: spread.spread.first.index,
+            pageIndex: spread.pageTurnSnapshotPageIndex(at: offset),
+            offset: offset
+        )
+    }
+
+    private func pageTurnSnapshotTarget(
+        to direction: EPUBSpreadView.Direction
+    ) -> PageTurnSnapshotTarget? {
+        guard
+            let paginationView,
+            paginationView.axis == .horizontalPaged,
+            let currentSpread = paginationView.currentView as? EPUBSpreadView,
+            currentSpread.isSpreadLoaded,
+            !currentSpread.isTerminated,
+            !currentSpread.webView.bounds.isEmpty
+        else {
+            return nil
+        }
+
+        if let offset = currentSpread.adjacentPageTurnSnapshotOffset(to: direction) {
+            return PageTurnSnapshotTarget(
+                pagination: paginationView,
+                spread: currentSpread,
+                index: paginationView.currentIndex,
+                currentIndex: paginationView.currentIndex,
+                resourceIndex: currentSpread.spread.first.index,
+                pageIndex: currentSpread.pageTurnSnapshotPageIndex(at: offset),
+                offset: offset
+            )
+        }
+
+        let targetIndex: Int
+        switch (viewModel.readingProgression, direction) {
+        case (.ltr, .left), (.rtl, .right):
+            targetIndex = paginationView.currentIndex - 1
+        case (.ltr, .right), (.rtl, .left):
+            targetIndex = paginationView.currentIndex + 1
+        }
+        guard
+            let spread = paginationView.readyAdjacentView(at: targetIndex) as? EPUBSpreadView,
+            spread.isSpreadLoaded,
+            !spread.isTerminated,
+            !spread.webView.bounds.isEmpty
+        else {
+            return nil
+        }
+        let offset = spread.scrollView.contentOffset
+        return PageTurnSnapshotTarget(
+            pagination: paginationView,
+            spread: spread,
+            index: targetIndex,
+            currentIndex: paginationView.currentIndex,
+            resourceIndex: spread.spread.first.index,
+            pageIndex: spread.pageTurnSnapshotPageIndex(at: offset),
+            offset: offset
+        )
+    }
+
+    private func pageTurnSnapshotTargetIsStillReady(
+        _ target: PageTurnSnapshotTarget
+    ) -> Bool {
+        paginationView === target.pagination
+            && target.pagination.stillContainsReadyView(
+                target.spread,
+                at: target.index,
+                currentIndex: target.currentIndex
+            )
+            && target.spread.isSpreadLoaded
+            && !target.spread.isTerminated
+    }
+
+    private struct CoverSnapshotPair {
+        let current: UIImage
+        let target: UIImage
+    }
+
+    private func cachedCoverSnapshotPair(
+        to direction: EPUBSpreadView.Direction
+    ) -> CoverSnapshotPair? {
+        guard
+            let current = currentPageTurnSnapshotTarget(),
+            let target = pageTurnSnapshotTarget(to: direction),
+            currentSelection == nil,
+            !current.spread.hasActiveMedia,
+            !target.spread.hasActiveMedia,
+            let currentImage = snapshotProvider.cachedSnapshot(for: current.identity),
+            let targetImage = snapshotProvider.cachedSnapshot(for: target.identity)
+        else {
+            return nil
+        }
+        return CoverSnapshotPair(current: currentImage, target: targetImage)
+    }
+
+    private func captureCoverSnapshotPair(
+        to direction: EPUBSpreadView.Direction
+    ) async -> CoverSnapshotPair? {
+        let left = pageTurnSnapshotTarget(to: .left)
+        let current = currentPageTurnSnapshotTarget()
+        let right = pageTurnSnapshotTarget(to: .right)
+        snapshotProvider.retainSnapshots(
+            previous: left?.identity,
+            current: current?.identity,
+            next: right?.identity
+        )
+        guard
+            let current,
+            let target = direction == .left ? left : right
+        else {
+            return nil
+        }
+        do {
+            guard
+                let currentImage = try await capturePageTurnSnapshot(current),
+                let targetImage = try await capturePageTurnSnapshot(target)
+            else {
+                return nil
+            }
+            return CoverSnapshotPair(current: currentImage, target: targetImage)
+        } catch {
+            log(.warning, DebugError("Failed to capture cover page turn snapshots.", cause: error))
+            return nil
+        }
+    }
+
+    private func prewarmCoverSnapshots() {
+        coverPrewarmTask?.cancel()
+        let revision = snapshotProvider.revision
+        coverPrewarmTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.snapshotProvider.waitUntilIdle()
+            guard
+                !Task.isCancelled,
+                self.snapshotProvider.revision == revision,
+                self.isActive,
+                let paginationView = self.paginationView,
+                paginationView.axis == .horizontalPaged,
+                self.pageTurnInteractionPolicy(for: paginationView.axis).usesCoverPan,
+                self.state == .idle,
+                self.pageTurnController.isIdle,
+                self.snapshotProvider.isInputEnabled,
+                self.currentSelection == nil,
+                let currentSpread = paginationView.currentView as? EPUBSpreadView,
+                !currentSpread.hasActiveMedia,
+                !currentSpread.hasActiveInteractivePointer,
+                currentSpread.allowsPageTurn
+            else {
+                return
+            }
+            let current = self.currentPageTurnSnapshotTarget()
+            let left = self.pageTurnSnapshotTarget(to: .left)
+            let right = self.pageTurnSnapshotTarget(to: .right)
+            let targets = [current, left, right].compactMap { $0 }
+            self.snapshotProvider.retainSnapshots(
+                previous: left?.identity,
+                current: current?.identity,
+                next: right?.identity
+            )
+            for target in targets {
+                guard
+                    !Task.isCancelled,
+                    self.snapshotProvider.revision == revision
+                else {
+                    return
+                }
+                _ = try? await self.capturePageTurnSnapshot(target)
+            }
+        }
+    }
+
     // MARK: - Navigator
 
     private func isPaginationViewScrollingEnabled(for axis: PaginationView.Axis) -> Bool {
@@ -1039,7 +1669,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func accessibilityStatusDidChange() {
-        if let session = pageTurnController.invalidatePreCommitSession() {
+        if coverPanSession != nil {
+            cancelCoverPageTurn()
+        } else if let session = pageTurnController.invalidatePreCommitSession() {
             if nonePanSession?.id == session.id {
                 nonePanSession = nil
             }
@@ -1055,6 +1687,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             nonePanSession = nil
             finishPageTurn(session)
         }
+        if !policy.usesCoverPan, coverPanSession != nil {
+            cancelCoverPageTurn()
+        }
         paginationView.allowsNativeHorizontalPaging = policy.allowsNativeHorizontalPaging
         for view in paginationView.loadedViews.values {
             (view as? EPUBSpreadView)?.allowsNativeHorizontalPaging = policy.allowsNativeHorizontalPaging
@@ -1066,10 +1701,29 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         } else if nonePanGestureRecognizer.view != nil {
             view.removeGestureRecognizer(nonePanGestureRecognizer)
         }
+        if policy.usesCoverPan {
+            if coverPanGestureRecognizer.view == nil {
+                view.addGestureRecognizer(coverPanGestureRecognizer)
+            }
+            prewarmCoverSnapshots()
+        } else {
+            coverPrewarmTask?.cancel()
+            if coverPanGestureRecognizer.view != nil {
+                view.removeGestureRecognizer(coverPanGestureRecognizer)
+            }
+        }
     }
 
     @objc private func handleNonePan(_ gestureRecognizer: UIPanGestureRecognizer) {
         handleNonePan(
+            state: gestureRecognizer.state,
+            translationX: gestureRecognizer.translation(in: view).x,
+            velocityX: gestureRecognizer.velocity(in: view).x
+        )
+    }
+
+    @objc private func handleCoverPan(_ gestureRecognizer: UIPanGestureRecognizer) {
+        handleCoverPan(
             state: gestureRecognizer.state,
             translationX: gestureRecognizer.translation(in: view).x,
             velocityX: gestureRecognizer.velocity(in: view).x
@@ -1084,7 +1738,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             nonePanSession == nil,
             state == .idle,
             pageTurnController.isIdle,
+            snapshotProvider.isInputEnabled,
             currentSelection == nil,
+            !((paginationView.currentView as? EPUBSpreadView)?.hasActiveMedia ?? false),
             !((paginationView.currentView as? EPUBSpreadView)?.hasActiveInteractivePointer ?? false),
             (paginationView.currentView as? EPUBSpreadView)?.allowsPageTurn != false
         else {
@@ -1103,6 +1759,49 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         nonePanSession = session
+        return true
+    }
+
+    private func shouldBeginCoverPan(
+        to direction: EPUBSpreadView.Direction
+    ) -> Bool {
+        guard
+            let paginationView,
+            paginationView.axis == .horizontalPaged,
+            pageTurnInteractionPolicy(for: paginationView.axis).usesCoverPan,
+            coverPanSession == nil,
+            state == .idle,
+            pageTurnController.isIdle,
+            snapshotProvider.isInputEnabled,
+            currentSelection == nil,
+            !((paginationView.currentView as? EPUBSpreadView)?.hasActiveMedia ?? false),
+            !((paginationView.currentView as? EPUBSpreadView)?.hasActiveInteractivePointer ?? false),
+            (paginationView.currentView as? EPUBSpreadView)?.allowsPageTurn != false,
+            cachedCoverSnapshotPair(to: direction) != nil
+        else {
+            return false
+        }
+        return true
+    }
+
+    private func beginCoverPan(
+        to direction: EPUBSpreadView.Direction
+    ) -> Bool {
+        guard
+            shouldBeginCoverPan(to: direction),
+            let snapshots = cachedCoverSnapshotPair(to: direction),
+            let session = beginPageTurn(to: direction)
+        else {
+            return false
+        }
+        coverPanSession = session
+        coverAnimator = EPUBCoverPageTurnAnimator(
+            hostView: view,
+            currentImage: snapshots.current,
+            targetImage: snapshots.target,
+            isForward: session.isForward,
+            physicalCompletionDirection: session.physicalCompletionDirection
+        )
         return true
     }
 
@@ -1154,6 +1853,71 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             guard let session = nonePanSession else { return }
             nonePanSession = nil
             finishPageTurn(session)
+
+        default:
+            break
+        }
+    }
+
+    private func handleCoverPan(
+        state: UIGestureRecognizer.State,
+        translationX: CGFloat,
+        velocityX: CGFloat
+    ) {
+        switch state {
+        case .began:
+            guard let direction = EPUBPageTurnInteraction.coverDirection(
+                for: CGPoint(x: velocityX, y: 0)
+            ) else {
+                return
+            }
+            _ = beginCoverPan(to: direction)
+
+        case .changed:
+            guard
+                let session = coverPanSession,
+                let progress = pageTurnController.trackCover(
+                    session,
+                    translationX: translationX,
+                    viewportWidth: view.bounds.width
+                )
+            else {
+                return
+            }
+            coverAnimator?.render(progress: progress)
+
+        case .ended:
+            guard
+                let session = coverPanSession,
+                let animator = coverAnimator
+            else {
+                return
+            }
+            let progress = EPUBPageTurnInteraction.coverProgress(
+                translationX: translationX,
+                viewportWidth: view.bounds.width,
+                session: session
+            )
+            if EPUBPageTurnInteraction.coverShouldCommit(
+                translationX: translationX,
+                viewportWidth: view.bounds.width,
+                velocityX: velocityX,
+                session: session
+            ) {
+                Task { [weak self] in
+                    guard let self else { return }
+                    _ = await self.commitCoverPageTurn(
+                        session,
+                        animator: animator,
+                        progress: progress
+                    )
+                }
+            } else {
+                cancelCoverPageTurn()
+            }
+
+        case .cancelled, .failed:
+            cancelCoverPageTurn()
 
         default:
             break
@@ -1322,12 +2086,27 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func settlePageTurn() async {
-        await pageTurnController.settle { [weak self] session in
-            self?.finishPageTurn(session)
-        }
+        let animator = coverAnimator
+        await pageTurnController.settleCover(
+            settleSnapshots: { [snapshotProvider] in
+                await snapshotProvider.settle()
+            },
+            rebound: { _ in
+                await animator?.animate(to: 0, duration: 0.18)
+            },
+            cleanup: { [weak self] in
+                guard let session = self?.coverPanSession else { return }
+                self?.cleanupCoverPageTurn(session)
+            },
+            finish: { [weak self] session in
+                self?.finishPageTurn(session)
+            }
+        )
     }
 
     public func go(to locator: Locator, options: NavigatorGoOptions) async -> Bool {
+        await snapshotProvider.settle()
+        snapshotProvider.invalidate()
         let locator = publication.normalizeLocator(locator)
 
         guard
@@ -1343,6 +2122,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         on(.jumped)
         if success {
             delegate?.navigator(self, didJumpTo: locator)
+            prewarmCoverSnapshots()
         }
         return success
     }
@@ -1505,6 +2285,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func submitPreferences(_ preferences: EPUBPreferences) {
+        snapshotProvider.invalidate()
+        guard snapshotProvider.isIdle else {
+            snapshotProvider.deferPreferences { [weak self] in
+                self?.submitPreferencesAfterSnapshotCapture(preferences)
+            }
+            return
+        }
+        submitPreferencesAfterSnapshotCapture(preferences)
+    }
+
+    private func submitPreferencesAfterSnapshotCapture(_ preferences: EPUBPreferences) {
         guard !isPaginationPreferenceTransitionActive else {
             queuedPaginationPreferences = preferences
             return
@@ -1521,6 +2312,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         applySettings()
 
         delegate?.navigator(self, presentationDidChange: presentation)
+        viewModel.flushPendingPaginationInvalidation()
     }
 
     public func editor(of preferences: EPUBPreferences) -> EPUBPreferencesEditor {
@@ -1759,6 +2551,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         {
             completePendingPaginationTransition(paginationView)
         }
+        prewarmCoverSnapshots()
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: PointerEvent) {
@@ -1891,6 +2684,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange locator: Locator?, frame: CGRect) {
         guard let locator else {
             viewModel.editingActions.selection = nil
+            prewarmCoverSnapshots()
             return
         }
         viewModel.editingActions.selection = Selection(
@@ -1900,11 +2694,27 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     }
 
     func spreadViewPagesDidChange(_ spreadView: EPUBSpreadView) {
-        if
-            paginationView?.axis == .verticalContinuous
-                || paginationView?.currentView == spreadView
-        {
+        if pageTurnSnapshotsRequireInvalidationForPagesDidChange(
+            spreadView,
+            in: paginationView
+        ) {
+            snapshotProvider.invalidate()
             updateCurrentLocation()
+            prewarmCoverSnapshots()
+        }
+    }
+
+    func spreadViewScaleDidChange(_ spreadView: EPUBSpreadView) {
+        snapshotProvider.invalidate()
+        prewarmCoverSnapshots()
+    }
+
+    func spreadViewActiveMediaDidChange(_ spreadView: EPUBSpreadView) {
+        snapshotProvider.invalidate()
+        if spreadView.hasActiveMedia {
+            cancelCoverPageTurn()
+        } else if currentSelection == nil {
+            prewarmCoverSnapshots()
         }
     }
 
@@ -1936,17 +2746,25 @@ extension EPUBNavigatorViewController: UIGestureRecognizerDelegate {
         _ gestureRecognizer: UIGestureRecognizer
     ) -> Bool {
         guard
-            gestureRecognizer === nonePanGestureRecognizer,
-            let panGestureRecognizer = gestureRecognizer as? UIPanGestureRecognizer,
-            EPUBPageTurnInteraction.direction(
-                for: panGestureRecognizer.velocity(in: view),
-                readingProgression: viewModel.readingProgression
-            ) != nil
+            let panGestureRecognizer = gestureRecognizer as? UIPanGestureRecognizer
         else {
             return false
         }
-
-        return shouldBeginNonePan()
+        if gestureRecognizer === nonePanGestureRecognizer {
+            return EPUBPageTurnInteraction.direction(
+                for: panGestureRecognizer.velocity(in: view),
+                readingProgression: viewModel.readingProgression
+            ) != nil && shouldBeginNonePan()
+        }
+        if gestureRecognizer === coverPanGestureRecognizer {
+            guard let direction = EPUBPageTurnInteraction.coverDirection(
+                for: panGestureRecognizer.velocity(in: view)
+            ) else {
+                return false
+            }
+            return shouldBeginCoverPan(to: direction)
+        }
+        return false
     }
 }
 
@@ -1983,10 +2801,12 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
     }
 
     func paginationViewDidUpdateViews(_ paginationView: PaginationView) {
+        snapshotProvider.invalidate()
         // Note that you should set the delegate before you load views
         // otherwise, when open the publication, you may miss the first
         // invocation.
         paginationViewDidUpdateViewport(paginationView)
+        prewarmCoverSnapshots()
     }
 
     func paginationViewDidUpdateViewport(_ paginationView: PaginationView) {

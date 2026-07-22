@@ -52,6 +52,19 @@ enum AccessibilityID: String {
     case pageTurnBeginMarker
     case pageTurnTapMarker
     case pageTurnLinkMarker
+    case snapshotProbeMarker
+    case captureSnapshotProbe
+    case captureSnapshotSelectionProbe
+    case captureSnapshotMediaProbe
+    case coverProbeMarker
+    case activeMediaMarker
+    case prepareCoverProbe
+    case captureCoverProbe
+    case awaitCoverForwardReady
+    case awaitCoverBackwardReady
+    case prepareCoverCrossResource
+    case startCoverMediaProbe
+    case stopCoverMediaProbe
 }
 
 extension View {

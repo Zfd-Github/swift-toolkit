@@ -24,6 +24,34 @@ private final class LifecycleTestSpreadView: EPUBSpreadView {
             baseURL: nil
         )
     }
+
+    func loadSameURLMediaDocuments() {
+        webView.loadHTMLString(
+            """
+            <!doctype html>
+            <html><body>
+            <iframe id="first" srcdoc="<audio id='media'></audio><script>
+            globalThis.setActive = active => {
+                const media = document.getElementById('media');
+                Object.defineProperty(media, 'paused', { configurable: true, get: () => !active });
+                Object.defineProperty(media, 'ended', { configurable: true, get: () => false });
+                media.dispatchEvent(new Event(active ? 'play' : 'pause'));
+            };
+            </script>"></iframe>
+            <iframe id="second" srcdoc="<audio id='media'></audio><script>
+            globalThis.setActive = active => {
+                const media = document.getElementById('media');
+                Object.defineProperty(media, 'paused', { configurable: true, get: () => !active });
+                Object.defineProperty(media, 'ended', { configurable: true, get: () => false });
+                media.dispatchEvent(new Event(active ? 'play' : 'pause'));
+            };
+            </script>"></iframe>
+            <script>window.webkit.messageHandlers.spreadLoaded.postMessage({});</script>
+            </body></html>
+            """,
+            baseURL: nil
+        )
+    }
 }
 
 @MainActor
@@ -125,6 +153,31 @@ struct EPUBSpreadViewLifecycleTests {
         #expect(completionCount == 1)
     }
 
+    @Test("active media tracks same-URL frames independently")
+    func activeMediaTracksSameURLFramesIndependently() async {
+        let spread = makeSpreadView()
+        let container = UIView()
+        container.addSubview(spread)
+        spread.loadSameURLMediaDocuments()
+
+        #expect(await waitUntilAsync {
+            await spread.evaluateScript(
+                "typeof document.getElementById('first')?.contentWindow.setActive === 'function'"
+            ).booleanValue == true
+        })
+
+        _ = await spread.evaluateScript("document.getElementById('first').contentWindow.setActive(true)")
+        #expect(await waitUntil { spread.hasActiveMedia })
+
+        _ = await spread.evaluateScript("document.getElementById('second').contentWindow.setActive(true)")
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        _ = await spread.evaluateScript("document.getElementById('first').contentWindow.setActive(false)")
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        #expect(spread.hasActiveMedia)
+        spread.clear()
+    }
+
     private func makeSpreadView() -> LifecycleTestSpreadView {
         let link = Link(href: "chapter.xhtml", mediaType: .xhtml)
         let readingOrder = [link]
@@ -163,11 +216,32 @@ struct EPUBSpreadViewLifecycleTests {
         return condition()
     }
 
+    private func waitUntilAsync(
+        _ condition: @escaping @MainActor () async -> Bool
+    ) async -> Bool {
+        for _ in 0 ..< 500 {
+            if await condition() {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return await condition()
+    }
+
     private func nextMainRunLoop() async {
         await withCheckedContinuation { continuation in
             DispatchQueue.main.async {
                 continuation.resume()
             }
         }
+    }
+}
+
+private extension Result where Success == Any, Failure == Error {
+    var booleanValue: Bool? {
+        guard case let .success(value) = self else {
+            return nil
+        }
+        return value as? Bool
     }
 }

@@ -4,7 +4,8 @@
 //  available in the top-level LICENSE file of the project.
 //
 
-import ReadiumNavigator
+@testable import ReadiumNavigator
+import CoreImage
 import ReadiumShared
 import SwiftUI
 import WebKit
@@ -19,16 +20,14 @@ private final class WeakObjectBox<Object: AnyObject> {
 
 @MainActor
 private final class PageTurnGestureObserver: NSObject {
-    private let onBegin: () -> Void
+    private let onStateChange: (UIGestureRecognizer) -> Void
 
-    init(onBegin: @escaping () -> Void) {
-        self.onBegin = onBegin
+    init(onStateChange: @escaping (UIGestureRecognizer) -> Void) {
+        self.onStateChange = onStateChange
     }
 
     @objc func gestureStateDidChange(_ gestureRecognizer: UIGestureRecognizer) {
-        if gestureRecognizer.state == .began {
-            onBegin()
-        }
+        onStateChange(gestureRecognizer)
     }
 }
 
@@ -51,6 +50,12 @@ struct ReaderView: View {
                             .accessibilityIdentifier(.stressTestCompleted)
                         Text(viewModel.actionMarker)
                             .accessibilityIdentifier(.actionMarker)
+                        Text(viewModel.snapshotProbeMarker)
+                            .accessibilityIdentifier(.snapshotProbeMarker)
+                        Text(viewModel.coverProbeMarker)
+                            .accessibilityIdentifier(.coverProbeMarker)
+                        Text(viewModel.activeMediaMarker)
+                            .accessibilityIdentifier(.activeMediaMarker)
                         Text(viewModel.currentLocationMarker)
                             .accessibilityIdentifier(.currentLocationMarker)
                         Text(viewModel.locationRevisionMarker)
@@ -136,10 +141,65 @@ struct ReaderView: View {
                             }
                             .accessibilityIdentifier(.testActions)
                         } else {
-                            Button("Run Stress Test") {
-                                viewModel.runNavigationStressTest()
+                            HStack {
+                                Button("Run Stress Test") {
+                                    viewModel.runNavigationStressTest()
+                                }
+                                .accessibilityIdentifier(.runStressTest)
+                                Menu("Snapshot Probe") {
+                                    testAction(
+                                        "Capture Snapshot Probe",
+                                        .captureSnapshotProbe,
+                                        id: .captureSnapshotProbe
+                                    )
+                                    testAction(
+                                        "Capture Selection Snapshot Probe",
+                                        .captureSnapshotSelectionProbe,
+                                        id: .captureSnapshotSelectionProbe
+                                    )
+                                    testAction(
+                                        "Capture Media Snapshot Probe",
+                                        .captureSnapshotMediaProbe,
+                                        id: .captureSnapshotMediaProbe
+                                    )
+                                    testAction(
+                                        "Prepare Cover Probe",
+                                        .prepareCoverProbe,
+                                        id: .prepareCoverProbe
+                                    )
+                                    testAction(
+                                        "Capture Cover Probe",
+                                        .captureCoverProbe,
+                                        id: .captureCoverProbe
+                                    )
+                                    testAction(
+                                        "Await Forward Cover Ready",
+                                        .awaitCoverForwardReady,
+                                        id: .awaitCoverForwardReady
+                                    )
+                                    testAction(
+                                        "Await Backward Cover Ready",
+                                        .awaitCoverBackwardReady,
+                                        id: .awaitCoverBackwardReady
+                                    )
+                                    testAction(
+                                        "Prepare Cross-resource Cover Probe",
+                                        .prepareCoverCrossResource,
+                                        id: .prepareCoverCrossResource
+                                    )
+                                    testAction(
+                                        "Start Cover Media Probe",
+                                        .startCoverMediaProbe,
+                                        id: .startCoverMediaProbe
+                                    )
+                                    testAction(
+                                        "Stop Cover Media Probe",
+                                        .stopCoverMediaProbe,
+                                        id: .stopCoverMediaProbe
+                                    )
+                                }
+                                .accessibilityIdentifier(.testActions)
                             }
-                            .accessibilityIdentifier(.runStressTest)
                         }
                     }
                 }
@@ -179,6 +239,16 @@ enum ReaderTestAction: String {
     case captureViewportMetrics
     case captureTitle
     case captureSelection
+    case captureSnapshotProbe
+    case captureSnapshotSelectionProbe
+    case captureSnapshotMediaProbe
+    case prepareCoverProbe
+    case captureCoverProbe
+    case awaitCoverForwardReady
+    case awaitCoverBackwardReady
+    case prepareCoverCrossResource
+    case startCoverMediaProbe
+    case stopCoverMediaProbe
 }
 
 @MainActor final class ReaderViewModel: ObservableObject, Identifiable {
@@ -205,11 +275,15 @@ enum ReaderTestAction: String {
     @Published var pageTurnBeginMarker = "count=0"
     @Published var pageTurnTapMarker = "count=0"
     @Published var pageTurnLinkMarker = "count=0"
+    @Published var snapshotProbeMarker = "unavailable"
+    @Published var coverProbeMarker = "unavailable"
+    @Published var activeMediaMarker = "sample=0|active=false"
 
     private var epubPreferences: EPUBPreferences
     private var directionalNavigationAdapter: DirectionalNavigationAdapter?
     private var pageTurnGestureObserver: PageTurnGestureObserver?
     private var selectionEvidenceTask: Task<Void, Never>?
+    private var activeMediaEvidenceTask: Task<Void, Never>?
     private var pageTurnBeginCount = 0
     private var pageTurnTapCount = 0
     private var pageTurnLinkCount = 0
@@ -219,15 +293,23 @@ enum ReaderTestAction: String {
     private var locationRevision = 0
     private var latestLocator: Locator?
     private var locationWaiter: LocationWaiter?
+    private let snapshotProbeCIContext = CIContext(options: [.cacheIntermediates: false])
     private let resourceFailureController: ResourceFailureController?
     private var resourceFailureRevision = 0
     private var lastFailedResourceHREF: RelativeURL?
+    private var coverEvidenceLocationRevision = 0
+    private var coverOverlaySampleCount = 0
+    private var coverLocationDuringOverlayCount = 0
+    private var didTrackCover = false
+    private var didProgressCover = false
+    private var activeMediaEvidenceRevision = 0
 
     init(
         navigator: VisualNavigator & UIViewController,
         enablesContinuousScrollActions: Bool = false,
         epubPreferences: EPUBPreferences = .empty,
-        resourceFailureController: ResourceFailureController? = nil
+        resourceFailureController: ResourceFailureController? = nil,
+        pageTurnStyle: EPUBPageTurnStyle = .none
     ) {
         self.navigator = navigator
         self.enablesContinuousScrollActions = enablesContinuousScrollActions
@@ -238,7 +320,7 @@ enum ReaderTestAction: String {
         if let epubNavigator = navigator as? EPUBNavigatorViewController {
             epubNavigator.delegate = self
             if !enablesContinuousScrollActions {
-                epubNavigator.pageTurnStyle = .none
+                epubNavigator.pageTurnStyle = pageTurnStyle
             }
         } else if let pdfNavigator = navigator as? PDFNavigatorViewController {
             pdfNavigator.delegate = self
@@ -258,6 +340,7 @@ enum ReaderTestAction: String {
     deinit {
         actionTask?.cancel()
         selectionEvidenceTask?.cancel()
+        activeMediaEvidenceTask?.cancel()
     }
 
     func runNavigationStressTest() {
@@ -870,7 +953,712 @@ enum ReaderTestAction: String {
                 frame.height
             )
             complete(action, generation: generation)
+
+        case .captureSnapshotProbe:
+            await captureSnapshotProbe(
+                in: navigator,
+                action: action,
+                generation: generation
+            )
+
+        case .captureSnapshotSelectionProbe:
+            await captureSnapshotSelectionProbe(
+                in: navigator,
+                action: action,
+                generation: generation
+            )
+
+        case .captureSnapshotMediaProbe:
+            await captureSnapshotMediaProbe(
+                in: navigator,
+                action: action,
+                generation: generation
+            )
+
+        case .prepareCoverProbe:
+            await prepareCoverProbe(
+                in: navigator,
+                action: action,
+                generation: generation,
+                progression: 0,
+                expectedMarker: "PAGE-A"
+            )
+
+        case .prepareCoverCrossResource:
+            await prepareCoverProbe(
+                in: navigator,
+                action: action,
+                generation: generation,
+                progression: 1,
+                expectedMarker: "PAGE-E"
+            )
+
+        case .captureCoverProbe:
+            await captureCoverProbe(
+                in: navigator,
+                action: action,
+                generation: generation
+            )
+
+        case .awaitCoverForwardReady:
+            await awaitCoverReady(
+                in: navigator,
+                action: action,
+                generation: generation,
+                isForward: true
+            )
+
+        case .awaitCoverBackwardReady:
+            await awaitCoverReady(
+                in: navigator,
+                action: action,
+                generation: generation,
+                isForward: false
+            )
+
+        case .startCoverMediaProbe:
+            guard let webView = await currentMountedWebView(in: navigator) else {
+                fail(action, generation: generation, reason: "media-not-playing")
+                return
+            }
+            guard isCurrentAction(generation) else { return }
+            guard await waitForActiveMedia(in: navigator, webView: webView) else {
+                fail(action, generation: generation, reason: "media-not-playing")
+                return
+            }
+            guard isCurrentAction(generation) else { return }
+            monitorActiveMediaEvidence(in: navigator)
+            resetCoverEvidence()
+            complete(action, generation: generation)
+
+        case .stopCoverMediaProbe:
+            if let webView = await currentMountedWebView(in: navigator) {
+                guard isCurrentAction(generation) else { return }
+                _ = try? await webView.evaluateJavaScript(
+                    "document.getElementById('probe-video')?.pause()"
+                )
+                guard isCurrentAction(generation) else { return }
+            }
+            let deadline = ProcessInfo.processInfo.systemUptime + 5
+            while isCurrentAction(generation),
+                  navigator.currentSpreadHasActiveMediaForTesting,
+                  ProcessInfo.processInfo.systemUptime < deadline
+            {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            guard isCurrentAction(generation) else { return }
+            guard !navigator.currentSpreadHasActiveMediaForTesting else {
+                fail(action, generation: generation, reason: "media-still-playing")
+                return
+            }
+            activeMediaEvidenceTask?.cancel()
+            updateActiveMediaMarker(false)
+            complete(action, generation: generation)
         }
+    }
+
+    private func prepareCoverProbe(
+        in navigator: EPUBNavigatorViewController,
+        action: ReaderTestAction,
+        generation: Int,
+        progression: Double,
+        expectedMarker: String
+    ) async {
+        guard isCurrentAction(generation) else { return }
+        if navigator.pageTurnStyle != .cover {
+            navigator.pageTurnStyle = .cover
+        }
+        navigator.clearSelection()
+        if let webView = await currentMountedWebView(in: navigator) {
+            guard isCurrentAction(generation) else { return }
+            _ = try? await webView.evaluateJavaScript(
+                "document.getElementById('probe-video')?.pause()"
+            )
+            guard isCurrentAction(generation) else { return }
+        }
+        let currentMarker = await snapshotProbeState(in: navigator)?.visibleMarker
+        guard isCurrentAction(generation) else { return }
+        let isAlreadyPositioned = currentMarker == expectedMarker
+        let isPositioned = if isAlreadyPositioned {
+            true
+        } else {
+            await moveSnapshotProbe(
+                navigator,
+                resourceIndex: 0,
+                progression: progression,
+                expectedMarker: expectedMarker
+            )
+        }
+        guard isCurrentAction(generation) else { return }
+        guard isPositioned else {
+            fail(action, generation: generation, reason: "positioning-failed")
+            return
+        }
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        guard isCurrentAction(generation) else { return }
+        resetCoverEvidence()
+        complete(action, generation: generation)
+    }
+
+    private func awaitCoverReady(
+        in navigator: EPUBNavigatorViewController,
+        action: ReaderTestAction,
+        generation: Int,
+        isForward: Bool
+    ) async {
+        let isRTL = navigator.presentation.readingProgression == .rtl
+        let direction: EPUBSpreadView.Direction = switch (isForward, isRTL) {
+        case (true, false), (false, true): .right
+        case (false, false), (true, true): .left
+        }
+        let deadline = ProcessInfo.processInfo.systemUptime + 10
+        while
+            isCurrentAction(generation),
+            !navigator.canBeginCoverPanForTesting(to: direction),
+            ProcessInfo.processInfo.systemUptime < deadline
+        {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        guard isCurrentAction(generation) else { return }
+        guard navigator.canBeginCoverPanForTesting(to: direction) else {
+            let input = navigator.isPageTurnSnapshotInputEnabledForTesting
+            let cached = navigator.hasCachedCoverSnapshotPairForTesting(to: direction)
+            fail(
+                action,
+                generation: generation,
+                reason: "cover-pan-not-ready-input-\(input)-cached-\(cached)"
+            )
+            return
+        }
+        complete(action, generation: generation)
+    }
+
+    private func captureCoverProbe(
+        in navigator: EPUBNavigatorViewController,
+        action: ReaderTestAction,
+        generation: Int
+    ) async {
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
+        while
+            isCurrentAction(generation),
+            (!navigator.isPageTurnIdleForTesting || !coverOverlayViews(in: navigator).isEmpty),
+            ProcessInfo.processInfo.systemUptime < deadline
+        {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        guard isCurrentAction(generation) else { return }
+        guard
+            navigator.isPageTurnIdleForTesting,
+            coverOverlayViews(in: navigator).isEmpty
+        else {
+            fail(action, generation: generation, reason: "page-turn-not-settled")
+            return
+        }
+        let visibleMarker = await snapshotProbeState(in: navigator)?.visibleMarker
+        guard isCurrentAction(generation) else { return }
+        guard let visibleMarker else {
+            fail(action, generation: generation, reason: "missing-visible-marker")
+            return
+        }
+        let overlayCount = coverOverlayViews(in: navigator).count
+        coverProbeMarker = [
+            "visible=\(visibleMarker)",
+            "overlayCount=\(overlayCount)",
+            "overlaySamples=\(coverOverlaySampleCount)",
+            "began=\(pageTurnBeginCount)",
+            "tracked=\(didTrackCover)",
+            "progressed=\(didProgressCover)",
+            "locationDelta=\(locationRevision - coverEvidenceLocationRevision)",
+            "locationDuringOverlay=\(coverLocationDuringOverlayCount)",
+        ].joined(separator: "|")
+        resetCoverEvidence()
+        complete(action, generation: generation)
+    }
+
+    private func resetCoverEvidence() {
+        coverEvidenceLocationRevision = locationRevision
+        coverOverlaySampleCount = 0
+        coverLocationDuringOverlayCount = 0
+        didTrackCover = false
+        didProgressCover = false
+    }
+
+    private func monitorActiveMediaEvidence(
+        in navigator: EPUBNavigatorViewController
+    ) {
+        activeMediaEvidenceTask?.cancel()
+        updateActiveMediaMarker(navigator.currentSpreadHasActiveMediaForTesting)
+        activeMediaEvidenceTask = Task { [weak self, weak navigator] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                guard !Task.isCancelled, let self, let navigator else { return }
+                self.updateActiveMediaMarker(navigator.currentSpreadHasActiveMediaForTesting)
+            }
+        }
+    }
+
+    private func updateActiveMediaMarker(_ isActive: Bool) {
+        activeMediaEvidenceRevision += 1
+        activeMediaMarker = "sample=\(activeMediaEvidenceRevision)|active=\(isActive)"
+    }
+
+    private func coverOverlayViews(
+        in navigator: EPUBNavigatorViewController
+    ) -> [UIImageView] {
+        navigator.view.subviews.compactMap { $0 as? UIImageView }
+            .filter { !$0.isUserInteractionEnabled && $0.accessibilityElementsHidden }
+    }
+
+    private func captureSnapshotProbe(
+        in navigator: EPUBNavigatorViewController,
+        action: ReaderTestAction,
+        generation: Int
+    ) async {
+        guard
+            await moveSnapshotProbe(
+                navigator,
+                resourceIndex: 0,
+                progression: 0.5,
+                expectedMarker: "PAGE-C"
+            ),
+            let currentState = await snapshotProbeState(in: navigator),
+            let currentImage = await currentSnapshot(in: navigator),
+            markerColor(in: currentImage) == "#008A00"
+        else {
+            fail(action, generation: generation, reason: "missing-current-page-c")
+            return
+        }
+
+        let isRTL = navigator.presentation.readingProgression == .rtl
+        let sameLeft = isRTL
+            ? SnapshotExpectation(direction: .left, color: "#8A00B8")
+            : SnapshotExpectation(direction: .left, color: "#0057D9")
+        let sameRight = isRTL
+            ? SnapshotExpectation(direction: .right, color: "#0057D9")
+            : SnapshotExpectation(direction: .right, color: "#8A00B8")
+
+        guard
+            await runSnapshotSeries(
+                count: 50,
+                expectation: sameLeft,
+                baseline: currentState,
+                navigator: navigator
+            ) != nil,
+            await runSnapshotSeries(
+                count: 50,
+                expectation: sameRight,
+                baseline: currentState,
+                navigator: navigator
+            ) != nil,
+            await moveSnapshotProbe(
+                navigator,
+                resourceIndex: 1,
+                progression: nil,
+                expectedMarker: "RESOURCE-2"
+            ),
+            let crossState = await snapshotProbeState(in: navigator),
+            let crossCurrentImage = await currentSnapshot(in: navigator),
+            markerColor(in: crossCurrentImage) == "#006B6B"
+        else {
+            fail(action, generation: generation, reason: "same-resource-series")
+            return
+        }
+
+        let crossLeft = isRTL
+            ? SnapshotExpectation(direction: .left, color: "#5A3A00")
+            : SnapshotExpectation(direction: .left, color: "#B34B00")
+        let crossRight = isRTL
+            ? SnapshotExpectation(direction: .right, color: "#B34B00")
+            : SnapshotExpectation(direction: .right, color: "#5A3A00")
+
+        guard
+            await runSnapshotSeries(
+                count: 50,
+                expectation: crossLeft,
+                baseline: crossState,
+                navigator: navigator
+            ) != nil,
+            let crossRightImage = await runSnapshotSeries(
+                count: 50,
+                expectation: crossRight,
+                baseline: crossState,
+                navigator: navigator
+            )
+        else {
+            fail(
+                action,
+                generation: generation,
+                reason: "cross-resource-series|\(snapshotProbeMarker)"
+            )
+            return
+        }
+
+        // Readium CSS intentionally clears publisher marker backgrounds in dark theme.
+        let darkThemePixelColor = "#000000"
+        epubPreferences.theme = .dark
+        navigator.submitPreferences(epubPreferences)
+        let isThemeReady = await waitForSnapshotProbeMarker("RESOURCE-2", theme: .dark, in: navigator)
+        let themeBaseline = await snapshotProbeState(in: navigator)
+        let themeImage = await adjacentSnapshot(crossRight.direction, in: navigator)
+        let isThemeIdentityNew = themeImage.map { $0 !== crossRightImage } ?? false
+        let themeColor = themeImage.flatMap(markerColor(in:))
+        let isThemeStateSame = if let themeBaseline {
+            await snapshotState(themeBaseline, remainsEqualIn: navigator)
+        } else {
+            false
+        }
+        guard
+            isThemeReady,
+            themeBaseline != nil,
+            themeImage != nil,
+            isThemeIdentityNew,
+            themeColor == darkThemePixelColor,
+            isThemeStateSame
+        else {
+            fail(
+                action,
+                generation: generation,
+                reason: "theme-cache-not-invalidated|ready=\(isThemeReady)|baseline=\(themeBaseline != nil)|image=\(themeImage != nil)|identity=\(isThemeIdentityNew)|expected=\(darkThemePixelColor)|actual=\(themeColor ?? "nil")|state=\(isThemeStateSame)"
+            )
+            return
+        }
+
+        epubPreferences.fontSize = 1.25
+        navigator.submitPreferences(epubPreferences)
+        let isLayoutReady = await waitForSnapshotProbeMarker(
+            "RESOURCE-2",
+            theme: .dark,
+            fontSize: 1.25,
+            in: navigator
+        )
+        let layoutBaseline = await snapshotProbeState(in: navigator)
+        let layoutImage = await adjacentSnapshot(crossRight.direction, in: navigator)
+        let isLayoutIdentityNew = if let layoutImage, let themeImage {
+            layoutImage !== themeImage
+        } else {
+            false
+        }
+        let layoutColor = layoutImage.flatMap(markerColor(in:))
+        let isLayoutStateSame = if let layoutBaseline {
+            await snapshotState(layoutBaseline, remainsEqualIn: navigator)
+        } else {
+            false
+        }
+        guard
+            isLayoutReady,
+            layoutBaseline != nil,
+            layoutImage != nil,
+            isLayoutIdentityNew,
+            layoutColor == darkThemePixelColor,
+            isLayoutStateSame
+        else {
+            fail(
+                action,
+                generation: generation,
+                reason: "layout-cache-not-invalidated|ready=\(isLayoutReady)|baseline=\(layoutBaseline != nil)|image=\(layoutImage != nil)|identity=\(isLayoutIdentityNew)|expected=\(darkThemePixelColor)|actual=\(layoutColor ?? "nil")|state=\(isLayoutStateSame)"
+            )
+            return
+        }
+
+        snapshotProbeMarker = [
+            "normal=true",
+            "direction=\(isRTL ? "rtl" : "ltr")",
+            "sameLeft=50,color=\(sameLeft.color)|sameRight=50,color=\(sameRight.color)|crossLeft=50,color=\(crossLeft.color)|crossRight=50,color=\(crossRight.color)",
+            "themeMiss=true|layoutMiss=true",
+        ].joined(separator: "|")
+        complete(action, generation: generation)
+    }
+
+    private func captureSnapshotSelectionProbe(
+        in navigator: EPUBNavigatorViewController,
+        action: ReaderTestAction,
+        generation: Int
+    ) async {
+        guard
+            let webView = await currentMountedWebView(in: navigator),
+            let before = await snapshotProbeState(in: navigator),
+            before.visibleMarker == "PAGE-A",
+            let visibleSelectableText = await visibleProbeText(".selectable", in: webView),
+            navigator.currentSelection != nil,
+            let selectedBefore = await javaScriptString("window.getSelection()?.toString() ?? ''", in: webView),
+            !selectedBefore.isEmpty,
+            visibleSelectableText.contains(selectedBefore),
+            await javaScriptBool("!document.getElementById('probe-video')?.paused", in: webView) == false
+        else {
+            fail(action, generation: generation, reason: "selection-precondition")
+            return
+        }
+
+        let image = await adjacentSnapshot(.right, in: navigator)
+        let selectedAfter = await javaScriptString("window.getSelection()?.toString() ?? ''", in: webView)
+        let stateIsSame = await snapshotState(before, remainsEqualIn: navigator)
+        let nativeSelectionRemainedPresent = navigator.currentSelection != nil
+        _ = try? await webView.evaluateJavaScript("window.getSelection()?.removeAllRanges()")
+
+        guard
+            image == nil,
+            selectedAfter == selectedBefore,
+            nativeSelectionRemainedPresent,
+            stateIsSame
+        else {
+            fail(action, generation: generation, reason: "selection-mutated")
+            return
+        }
+        snapshotProbeMarker = "selection=true|selectionBeforeNonEmpty=true|selectionNil=true|selectionSame=true|offsetSame=true|progressionSame=true|textSame=true|locationDelta=0"
+        complete(action, generation: generation)
+    }
+
+    private func captureSnapshotMediaProbe(
+        in navigator: EPUBNavigatorViewController,
+        action: ReaderTestAction,
+        generation: Int
+    ) async {
+        guard
+            let webView = await currentMountedWebView(in: navigator),
+            await waitForActiveMedia(in: navigator, webView: webView),
+            let before = await snapshotProbeState(in: navigator),
+            navigator.currentSelection == nil,
+            await javaScriptString("window.getSelection()?.toString() ?? ''", in: webView)?.isEmpty == true
+        else {
+            fail(action, generation: generation, reason: "media-not-playing")
+            return
+        }
+
+        let image = await adjacentSnapshot(.right, in: navigator)
+        let mediaAfter = await javaScriptBool(
+            "(() => { const video = document.getElementById('probe-video'); return !!video && !video.paused && !video.ended; })()",
+            in: webView
+        )
+        let stateIsSame = await snapshotState(before, remainsEqualIn: navigator)
+        _ = try? await webView.evaluateJavaScript("document.getElementById('probe-video')?.pause()")
+
+        guard image == nil, mediaAfter == true, stateIsSame else {
+            fail(action, generation: generation, reason: "media-mutated")
+            return
+        }
+        snapshotProbeMarker = "media=true|mediaBefore=true|mediaNil=true|mediaSame=true|offsetSame=true|progressionSame=true|textSame=true|locationDelta=0"
+        complete(action, generation: generation)
+    }
+
+    private func waitForActiveMedia(
+        in navigator: EPUBNavigatorViewController,
+        webView: WKWebView
+    ) async -> Bool {
+        let deadline = ProcessInfo.processInfo.systemUptime + 15
+        while !Task.isCancelled, ProcessInfo.processInfo.systemUptime < deadline {
+            let isPlaying = await javaScriptBool(
+                "(() => { const video = document.getElementById('probe-video'); return !!video && !video.paused && !video.ended && video.readyState >= 2; })()",
+                in: webView
+            ) == true
+            if isPlaying, navigator.currentSpreadHasActiveMediaForTesting {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return false
+    }
+
+    private func runSnapshotSeries(
+        count: Int,
+        expectation: SnapshotExpectation,
+        baseline: SnapshotProbeState,
+        navigator: EPUBNavigatorViewController
+    ) async -> UIImage? {
+        var lastImage: UIImage?
+        for iteration in 0 ..< count {
+            guard let image = await adjacentSnapshot(expectation.direction, in: navigator) else {
+                snapshotProbeMarker = "seriesFailure=\(expectation.direction)|iteration=\(iteration + 1)|image=nil"
+                return nil
+            }
+            let actualColor = markerColor(in: image) ?? "nil"
+            guard actualColor == expectation.color else {
+                snapshotProbeMarker = "seriesFailure=\(expectation.direction)|iteration=\(iteration + 1)|expected=\(expectation.color)|actual=\(actualColor)"
+                return nil
+            }
+            guard let state = await snapshotProbeState(in: navigator) else {
+                snapshotProbeMarker = "seriesFailure=\(expectation.direction)|iteration=\(iteration + 1)|state=nil"
+                return nil
+            }
+            guard
+                hypot(state.offset.x - baseline.offset.x, state.offset.y - baseline.offset.y) <= 0.5,
+                state.progression == baseline.progression,
+                state.visibleMarker == baseline.visibleMarker,
+                state.visibleText == baseline.visibleText,
+                state.locationRevision == baseline.locationRevision
+            else {
+                snapshotProbeMarker = "seriesFailure=\(expectation.direction)|iteration=\(iteration + 1)|offset=\(state.offset)|progression=\(state.progression)|marker=\(state.visibleMarker)|location=\(state.locationRevision)"
+                return nil
+            }
+            lastImage = image
+        }
+        return lastImage
+    }
+
+    private func adjacentSnapshot(
+        _ direction: EPUBSpreadView.Direction,
+        in navigator: EPUBNavigatorViewController
+    ) async -> UIImage? {
+        try? await navigator.captureAdjacentPageSnapshotForTesting(to: direction)
+    }
+
+    private func moveSnapshotProbe(
+        _ navigator: EPUBNavigatorViewController,
+        resourceIndex: Int,
+        progression: Double?,
+        expectedMarker: String
+    ) async -> Bool {
+        guard let link = readingOrderLink(at: resourceIndex) else { return false }
+        let locator = Locator(
+            href: link.url(),
+            mediaType: link.mediaType ?? .xhtml,
+            locations: .init(progression: progression)
+        )
+        guard await navigate(to: locator, predicate: { $0.href.isEquivalentTo(link.url()) }) != nil else {
+            return false
+        }
+        return await waitForSnapshotProbeMarker(expectedMarker, in: navigator)
+    }
+
+    private func waitForSnapshotProbeMarker(
+        _ marker: String,
+        theme: Theme? = nil,
+        fontSize: Double? = nil,
+        in navigator: EPUBNavigatorViewController
+    ) async -> Bool {
+        let deadline = ProcessInfo.processInfo.systemUptime + 10
+        while !Task.isCancelled, ProcessInfo.processInfo.systemUptime < deadline {
+            if await snapshotProbeState(in: navigator)?.visibleMarker == marker,
+               theme.map({ navigator.settings.theme == $0 }) ?? true,
+               fontSize.map({ navigator.settings.fontSize == $0 }) ?? true
+            {
+                return true
+            }
+            await Task.yield()
+        }
+        return false
+    }
+
+    private func snapshotProbeState(
+        in navigator: EPUBNavigatorViewController
+    ) async -> SnapshotProbeState? {
+        guard
+            let webView = await currentMountedWebView(in: navigator),
+            let visibleMarker = await visibleProbeText(".marker", in: webView),
+            let visibleText = await visibleProbeText(".probe-page", in: webView),
+            let progression = navigator.currentLocation?.locations.progression
+        else {
+            return nil
+        }
+        return SnapshotProbeState(
+            offset: webView.scrollView.contentOffset,
+            progression: progression,
+            visibleMarker: visibleMarker,
+            visibleText: visibleText,
+            locationRevision: locationRevision
+        )
+    }
+
+    private func snapshotState(
+        _ baseline: SnapshotProbeState,
+        remainsEqualIn navigator: EPUBNavigatorViewController
+    ) async -> Bool {
+        guard let state = await snapshotProbeState(in: navigator) else { return false }
+        return hypot(state.offset.x - baseline.offset.x, state.offset.y - baseline.offset.y) <= 0.5
+            && state.progression == baseline.progression
+            && state.visibleMarker == baseline.visibleMarker
+            && state.visibleText == baseline.visibleText
+            && state.locationRevision == baseline.locationRevision
+    }
+
+    private func currentMountedWebView(
+        in navigator: EPUBNavigatorViewController
+    ) async -> WKWebView? {
+        navigator.view.layoutIfNeeded()
+        let candidates = allWebViews(in: navigator.view)
+            .filter { webView in
+                guard
+                    webView.window != nil,
+                    !webView.isHidden,
+                    webView.alpha > 0,
+                    !webView.bounds.isEmpty
+                else {
+                    return false
+                }
+                let frame = webView.convert(webView.bounds, to: navigator.view)
+                return frame.intersection(navigator.view.bounds).width > 1
+                    && frame.intersection(navigator.view.bounds).height > 1
+            }
+            .sorted { first, second in
+                let firstArea = first.convert(first.bounds, to: navigator.view)
+                    .intersection(navigator.view.bounds).area
+                let secondArea = second.convert(second.bounds, to: navigator.view)
+                    .intersection(navigator.view.bounds).area
+                return firstArea > secondArea
+            }
+
+        for webView in candidates {
+            if await visibleProbeText(".marker", in: webView)?.isEmpty == false {
+                return webView
+            }
+        }
+        return nil
+    }
+
+    private func visibleProbeText(_ selector: String, in webView: WKWebView) async -> String? {
+        await javaScriptString(
+            """
+            (() => {
+                const x = window.innerWidth / 2, y = window.innerHeight / 2;
+                const hit = document.elementFromPoint(x, y);
+                const rank = ({ element, rect }) =>
+                    (hit && (element === hit || element.contains(hit) || hit.contains(element)) ? 0 : 1e12)
+                    + (rect.left <= x && x <= rect.right && rect.top <= y && y <= rect.bottom ? 0 : 1e9)
+                    + ((rect.left + rect.right) / 2 - x) ** 2 + ((rect.top + rect.bottom) / 2 - y) ** 2;
+                return Array.from(document.querySelectorAll('\(selector)'))
+                    .map(element => ({ element, rect: element.getBoundingClientRect() }))
+                    .filter(({ rect }) => rect.width > 0 && rect.height > 0 && rect.right > 0 && rect.left < window.innerWidth
+                        && rect.bottom > 0 && rect.top < window.innerHeight)
+                    .sort((first, second) => rank(first) - rank(second))[0]?.element.textContent?.trim() ?? '';
+            })()
+            """,
+            in: webView
+        )
+    }
+
+    private func currentSnapshot(in navigator: EPUBNavigatorViewController) async -> UIImage? {
+        guard let webView = await currentMountedWebView(in: navigator) else { return nil }
+        let configuration = WKSnapshotConfiguration()
+        configuration.rect = CGRect(origin: .zero, size: webView.bounds.size)
+        return try? await webView.takeSnapshot(configuration: configuration)
+    }
+
+    private func javaScriptString(_ script: String, in webView: WKWebView) async -> String? {
+        try? await webView.evaluateJavaScript(script) as? String
+    }
+
+    private func javaScriptBool(_ script: String, in webView: WKWebView) async -> Bool? {
+        try? await webView.evaluateJavaScript(script) as? Bool
+    }
+
+    private func markerColor(in image: UIImage) -> String? {
+        guard let ciImage = CIImage(image: image) else { return nil }
+        let scaleX = ciImage.extent.width / image.size.width
+        let scaleY = ciImage.extent.height / image.size.height
+        var pixel = [UInt8](repeating: 0, count: 4)
+        snapshotProbeCIContext.render(
+            ciImage,
+            toBitmap: &pixel,
+            rowBytes: 4,
+            bounds: CGRect(
+                x: 50 * scaleX,
+                y: ciImage.extent.height - 20 * scaleY,
+                width: 1,
+                height: 1
+            ),
+            format: .RGBA8,
+            colorSpace: CGColorSpace(name: CGColorSpace.sRGB)
+        )
+        return String(format: "#%02X%02X%02X", pixel[0], pixel[1], pixel[2])
     }
 
     private func installPageTurnGestureEvidenceIfNeeded(
@@ -886,10 +1674,22 @@ enum ReaderTestAction: String {
             return
         }
 
-        let observer = PageTurnGestureObserver { [weak self] in
+        let observer = PageTurnGestureObserver { [weak self, weak navigator] gestureRecognizer in
+            guard let navigator else { return }
             guard let self else { return }
-            pageTurnBeginCount += 1
-            pageTurnBeginMarker = "count=\(pageTurnBeginCount)"
+            if gestureRecognizer.state == .began {
+                pageTurnBeginCount += 1
+                pageTurnBeginMarker = "count=\(pageTurnBeginCount)"
+            } else if gestureRecognizer.state == .changed {
+                let overlays = coverOverlayViews(in: navigator)
+                guard overlays.count == 2 else { return }
+                didTrackCover = true
+                coverOverlaySampleCount += 1
+                didProgressCover = didProgressCover || overlays.contains { imageView in
+                    let translation = abs(imageView.transform.tx)
+                    return translation > 1 && translation < navigator.view.bounds.width - 1
+                }
+            }
         }
         gestureRecognizer.addTarget(
             observer,
@@ -1149,11 +1949,17 @@ enum ReaderTestAction: String {
         )
     }
 
+    private func isCurrentAction(_ generation: Int) -> Bool {
+        !Task.isCancelled && generation == actionGeneration
+    }
+
     private func complete(_ action: ReaderTestAction, generation: Int) {
+        guard isCurrentAction(generation) else { return }
         actionMarker = "done:\(action.rawValue):\(generation)"
     }
 
     private func fail(_ action: ReaderTestAction, generation: Int, reason: String) {
+        guard isCurrentAction(generation) else { return }
         actionMarker = "failed:\(action.rawValue):\(generation):\(reason)"
     }
 
@@ -1182,6 +1988,20 @@ enum ReaderTestAction: String {
     }
 }
 
+private struct SnapshotProbeState {
+    let offset: CGPoint
+    let progression: Double
+    let visibleMarker: String
+    let visibleText: String
+    let locationRevision: Int
+}
+
+private typealias SnapshotExpectation = (direction: EPUBSpreadView.Direction, color: String)
+
+private extension CGRect {
+    var area: CGFloat { width * height }
+}
+
 // MARK: - NavigatorDelegate
 
 extension ReaderViewModel: NavigatorDelegate {
@@ -1197,6 +2017,13 @@ extension ReaderViewModel: NavigatorDelegate {
     }
 
     func navigator(_ navigator: Navigator, locationDidChange locator: Locator) {
+        if
+            let epubNavigator = navigator as? EPUBNavigatorViewController,
+            coverOverlayViews(in: epubNavigator).count == 2
+        {
+            coverOverlaySampleCount += 1
+            coverLocationDuringOverlayCount += 1
+        }
         locationRevision += 1
         latestLocator = locator
         currentLocationMarker = describe(locator)

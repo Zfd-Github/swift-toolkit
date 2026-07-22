@@ -36,6 +36,12 @@ protocol EPUBSpreadViewDelegate: AnyObject {
     /// Called when the pages visible in the spread changed.
     func spreadViewPagesDidChange(_ spreadView: EPUBSpreadView)
 
+    /// Called when the rendered page scale changed.
+    func spreadViewScaleDidChange(_ spreadView: EPUBSpreadView)
+
+    /// Called when the spread starts or stops playing media.
+    func spreadViewActiveMediaDidChange(_ spreadView: EPUBSpreadView)
+
     /// Called when the spread view needs to present a view controller.
     func spreadView(_ spreadView: EPUBSpreadView, present viewController: UIViewController)
 
@@ -70,6 +76,10 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         !activeInteractivePointerIDs.isEmpty
     }
 
+    private var activeMediaDocuments: Set<String> = []
+    private(set) var hasActiveMedia = false
+    private(set) var isCapturingPageTurnSnapshot = false
+
     /// If YES, the content will be faded in once loaded.
     let animatedLoad: Bool
 
@@ -85,6 +95,10 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     private var loadState: LoadState = .loading
     var isSpreadLoaded: Bool {
         loadState == .loaded
+    }
+
+    var isTerminated: Bool {
+        loadState == .terminated
     }
 
     private var spreadLoadTask: Task<Void, Never>?
@@ -122,6 +136,12 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         addSubview(webView)
         setupWebView()
 
+        webView.configuration.userContentController.addUserScript(WKUserScript(
+            source: Self.activeMediaScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        ))
+
         for script in scripts {
             webView.configuration.userContentController.addUserScript(script)
         }
@@ -142,6 +162,8 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// clear pending operations and retain cycles.
     func clear() {
         loadState = .terminated
+        activeMediaDocuments.removeAll()
+        hasActiveMedia = false
         webView.stopLoading()
 
         spreadLoadTask?.cancel()
@@ -150,6 +172,19 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
         // Disable JS messages to break WKUserContentController reference.
         disableJSMessages()
+    }
+
+    func updateActiveMediaState(document: String, isActive: Bool) {
+        let wasActive = hasActiveMedia
+        if isActive {
+            activeMediaDocuments.insert(document)
+        } else {
+            activeMediaDocuments.remove(document)
+        }
+        hasActiveMedia = !activeMediaDocuments.isEmpty
+        if hasActiveMedia != wasActive {
+            delegate?.spreadViewActiveMediaDidChange(self)
+        }
     }
 
     func setupWebView() {
@@ -613,6 +648,69 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         }
     }
 
+    func adjacentPageTurnSnapshotOffset(to direction: Direction) -> CGPoint? {
+        nil
+    }
+
+    func pageTurnSnapshotPageIndex(at offset: CGPoint) -> Int {
+        0
+    }
+
+    func beginPageTurnSnapshotCapture(
+        at targetOffset: CGPoint
+    ) -> EPUBPageTurnSnapshotCaptureContext? {
+        guard
+            isSpreadLoaded,
+            !isTerminated,
+            !bounds.isEmpty,
+            !webView.bounds.isEmpty,
+            let cover = snapshotView(afterScreenUpdates: false)
+        else {
+            return nil
+        }
+
+        cover.frame = bounds
+        cover.isUserInteractionEnabled = false
+        addSubview(cover)
+        let context = EPUBPageTurnSnapshotCaptureContext(
+            originalOffset: scrollView.contentOffset,
+            cover: cover,
+            restoreSuppressedState: beginPageTurnSnapshotSuppression()
+        )
+        isCapturingPageTurnSnapshot = true
+        scrollView.setContentOffset(targetOffset, animated: false)
+        return context
+    }
+
+    func capturePageTurnSnapshot() async throws -> UIImage {
+        await waitForTwoPageTurnAnimationFrames()
+        try Task.checkCancellation()
+        let configuration = WKSnapshotConfiguration()
+        configuration.rect = CGRect(origin: .zero, size: webView.bounds.size)
+        let image = try await webView.takeSnapshot(configuration: configuration)
+        try Task.checkCancellation()
+        return image
+    }
+
+    func restorePageTurnSnapshotCapture(
+        _ context: EPUBPageTurnSnapshotCaptureContext
+    ) async {
+        scrollView.setContentOffset(context.originalOffset, animated: false)
+        await waitForTwoPageTurnAnimationFrames()
+        context.restoreSuppressedState()
+        isCapturingPageTurnSnapshot = false
+        context.cover.removeFromSuperview()
+    }
+
+    func beginPageTurnSnapshotSuppression() -> () -> Void {
+        {}
+    }
+
+    private func waitForTwoPageTurnAnimationFrames() async {
+        await PageTurnAnimationFrameWaiter.wait()
+        await PageTurnAnimationFrameWaiter.wait()
+    }
+
     // MARK: - JS Messages
 
     private var JSMessages: [String: (Any) -> Void] = [:]
@@ -642,6 +740,17 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         registerJSMessage(named: "selectionChanged") { [weak self] in self?.selectionDidChange($0) }
         registerJSMessage(named: "decorationActivated") { [weak self] in self?.decorationDidActivate($0) }
         registerJSMessage(named: "keyEventReceived") { [weak self] in self?.didReceiveKeyEvent($0) }
+        registerJSMessage(named: "activeMediaChanged") { [weak self] body in
+            guard
+                let self,
+                let body = body as? [String: Any],
+                let document = body["document"] as? String,
+                let isActive = body["active"] as? Bool
+            else {
+                return
+            }
+            self.updateActiveMediaState(document: document, isActive: isActive)
+        }
     }
 
     /// Add the message handlers for incoming javascript events.
@@ -676,6 +785,30 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
         delegate?.spreadView(self, didReceive: keyEvent)
     }
+
+    private static let activeMediaScript = """
+        (() => {
+            const documentToken = globalThis.crypto?.randomUUID?.()
+                ?? `${Date.now()}-${performance.now()}-${Math.random()}`;
+            const report = () => {
+                const active = Array.from(document.querySelectorAll('audio,video'))
+                    .some(media => !media.paused && !media.ended);
+                window.webkit.messageHandlers.activeMediaChanged.postMessage({
+                    document: documentToken,
+                    active: active
+                });
+            };
+            for (const event of ['play', 'pause', 'ended', 'emptied']) {
+                document.addEventListener(event, report, true);
+            }
+            window.addEventListener('pagehide', () => {
+                window.webkit.messageHandlers.activeMediaChanged.postMessage({
+                    document: documentToken,
+                    active: false
+                });
+            });
+        })();
+        """
 
     // MARK: - Decorator
 
@@ -821,6 +954,54 @@ extension EPUBSpreadView: UIGestureRecognizerDelegate {
         // Prevents the tap event from being triggered by the fallback tap
         // gesture recognizer when it is also recognized by the web view.
         true
+    }
+}
+
+final class EPUBPageTurnSnapshotCaptureContext {
+    let originalOffset: CGPoint
+    let cover: UIView
+    let restoreSuppressedState: () -> Void
+
+    init(
+        originalOffset: CGPoint,
+        cover: UIView,
+        restoreSuppressedState: @escaping () -> Void
+    ) {
+        self.originalOffset = originalOffset
+        self.cover = cover
+        self.restoreSuppressedState = restoreSuppressedState
+    }
+}
+
+@MainActor
+final class PageTurnAnimationFrameWaiter: NSObject {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var displayLink: CADisplayLink?
+
+    static func wait() async {
+        await withCheckedContinuation { continuation in
+            _ = PageTurnAnimationFrameWaiter(continuation)
+        }
+    }
+
+    private init(_ continuation: CheckedContinuation<Void, Never>) {
+        self.continuation = continuation
+        super.init()
+        let displayLink = CADisplayLink(target: self, selector: #selector(frameDidDisplay))
+        self.displayLink = displayLink
+        displayLink.add(to: .main, forMode: .common)
+    }
+
+    @objc private func frameDidDisplay() {
+        finish()
+    }
+
+    private func finish() {
+        guard continuation != nil else { return }
+        displayLink?.invalidate()
+        displayLink = nil
+        continuation?.resume()
+        continuation = nil
     }
 }
 
