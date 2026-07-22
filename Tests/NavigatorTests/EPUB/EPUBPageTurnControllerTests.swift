@@ -273,6 +273,117 @@ struct EPUBPageTurnControllerTests {
         #expect(rootPanRecognizers(in: navigator).isEmpty)
     }
 
+    @Test("accessibility notifications downgrade and restore the user's page turn style")
+    func accessibilityNotificationsReconfigureMountedNavigator() async throws {
+        let notificationCenter = NotificationCenter()
+        let status = AccessibilityStatusBox()
+        let navigator = try await makeMountedNavigator(
+            pageTurnStyle: .push,
+            notificationCenter: notificationCenter,
+            accessibilityStatus: status
+        )
+        let paginationView = try #require(currentPaginationView(in: navigator))
+        let outerScrollView = try #require(
+            paginationView.subviews.compactMap { $0 as? UIScrollView }.first
+        )
+
+        #expect(outerScrollView.panGestureRecognizer.isEnabled)
+        #expect(rootPanRecognizers(in: navigator).isEmpty)
+
+        status.isReduceMotionEnabled = true
+        notificationCenter.post(
+            name: UIAccessibility.reduceMotionStatusDidChangeNotification,
+            object: nil
+        )
+        #expect(!outerScrollView.panGestureRecognizer.isEnabled)
+        #expect(rootPanRecognizers(in: navigator).count == 1)
+
+        status.isReduceMotionEnabled = false
+        status.isVoiceOverRunning = true
+        notificationCenter.post(
+            name: UIAccessibility.voiceOverStatusDidChangeNotification,
+            object: nil
+        )
+        #expect(!outerScrollView.panGestureRecognizer.isEnabled)
+        #expect(rootPanRecognizers(in: navigator).count == 1)
+
+        status.isVoiceOverRunning = false
+        notificationCenter.post(
+            name: UIAccessibility.voiceOverStatusDidChangeNotification,
+            object: nil
+        )
+        #expect(outerScrollView.panGestureRecognizer.isEnabled)
+        #expect(rootPanRecognizers(in: navigator).isEmpty)
+
+        navigator.pageTurnStyle = .simulation
+        #expect(rootPanRecognizers(in: navigator).isEmpty)
+    }
+
+    @Test("accessibility changes cancel pre-commit sessions and reject late commits")
+    func accessibilityChangeCancelsPreCommitSession() async throws {
+        let controller = EPUBPageTurnController(refreshCurrentLocation: {})
+        let session = try #require(controller.begin(to: .right, readingProgression: .ltr))
+        var commitCount = 0
+
+        #expect(controller.invalidatePreCommitSession()?.id == session.id)
+        let committed = await controller.commit(session) {
+            commitCount += 1
+            return true
+        }
+
+        #expect(!committed)
+        #expect(commitCount == 0)
+        #expect(controller.isIdle)
+    }
+
+    @Test("accessibility changes let post-commit sessions finish")
+    func accessibilityChangeFinishesPostCommitSession() async throws {
+        let commitGate = Gate()
+        let controller = EPUBPageTurnController(refreshCurrentLocation: {})
+        let session = try #require(controller.begin(to: .right, readingProgression: .ltr))
+        var commitCount = 0
+
+        let task = Task { @MainActor in
+            await controller.commit(session) {
+                defer { _ = controller.finish(session) }
+                commitCount += 1
+                await commitGate.wait()
+                return true
+            }
+        }
+
+        #expect(await waitUntil { commitCount == 1 })
+        #expect(controller.invalidatePreCommitSession() == nil)
+        #expect(!controller.isIdle)
+
+        commitGate.open()
+        #expect(await task.value)
+        #expect(commitCount == 1)
+        #expect(controller.isIdle)
+    }
+
+    @Test("accessibility observers do not retain the navigator after deinit")
+    func accessibilityObserversReleaseNavigator() async throws {
+        let notificationCenter = NotificationCenter()
+        let status = AccessibilityStatusBox()
+        weak var weakNavigator: EPUBNavigatorViewController?
+
+        do {
+            let navigator = try makeNavigator(
+                notificationCenter: notificationCenter,
+                accessibilityStatus: status
+            )
+            weakNavigator = navigator
+        }
+
+        #expect(await waitUntil { weakNavigator == nil })
+        notificationCenter.post(
+            name: UIAccessibility.reduceMotionStatusDidChangeNotification,
+            object: nil
+        )
+        #expect(weakNavigator == nil)
+    }
+
     @Test("mounted zoom and style changes release none sessions safely")
     func mountedZoomAndStyleReconfiguration() async throws {
         let fixedNavigator = try await makeMountedNavigator(
@@ -811,9 +922,31 @@ struct EPUBPageTurnControllerTests {
         )
     }
 
+    private func makeNavigator(
+        notificationCenter: NotificationCenter,
+        accessibilityStatus: AccessibilityStatusBox
+    ) throws -> EPUBNavigatorViewController {
+        try EPUBNavigatorViewController(
+            publication: Publication(
+                manifest: Manifest(metadata: Metadata(title: "Test"))
+            ),
+            initialLocation: nil,
+            config: .init(),
+            notificationCenter: notificationCenter,
+            accessibilityStatusProvider: {
+                (
+                    accessibilityStatus.isReduceMotionEnabled,
+                    accessibilityStatus.isVoiceOverRunning
+                )
+            }
+        )
+    }
+
     private func makeMountedNavigator(
         layout: Layout? = nil,
-        pageTurnStyle: EPUBPageTurnStyle
+        pageTurnStyle: EPUBPageTurnStyle,
+        notificationCenter: NotificationCenter? = nil,
+        accessibilityStatus: AccessibilityStatusBox? = nil
     ) async throws -> EPUBNavigatorViewController {
         let link = Link(href: "chapter.xhtml", mediaType: .xhtml)
         let publication = Publication(
@@ -826,11 +959,28 @@ struct EPUBPageTurnControllerTests {
                 at: link.url()
             )
         )
-        let navigator = try EPUBNavigatorViewController(
-            publication: publication,
-            initialLocation: nil,
-            config: .init(pageTurnStyle: pageTurnStyle)
-        )
+        let config = EPUBNavigatorViewController.Configuration(pageTurnStyle: pageTurnStyle)
+        let navigator: EPUBNavigatorViewController
+        if let notificationCenter, let accessibilityStatus {
+            navigator = try EPUBNavigatorViewController(
+                publication: publication,
+                initialLocation: nil,
+                config: config,
+                notificationCenter: notificationCenter,
+                accessibilityStatusProvider: {
+                    (
+                        accessibilityStatus.isReduceMotionEnabled,
+                        accessibilityStatus.isVoiceOverRunning
+                    )
+                }
+            )
+        } else {
+            navigator = try EPUBNavigatorViewController(
+                publication: publication,
+                initialLocation: nil,
+                config: config
+            )
+        }
         navigator.view.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
         navigator.loadViewIfNeeded()
         await navigator.initialized()
@@ -908,6 +1058,12 @@ struct EPUBPageTurnControllerTests {
         }
         return condition()
     }
+}
+
+@MainActor
+private final class AccessibilityStatusBox {
+    var isReduceMotionEnabled = false
+    var isVoiceOverRunning = false
 }
 
 @MainActor
