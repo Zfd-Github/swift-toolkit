@@ -4,7 +4,7 @@
 //  available in the top-level LICENSE file of the project.
 //
 
-import ReadiumNavigator
+@testable import ReadiumNavigator
 import ReadiumShared
 import ReadiumStreamer
 import UIKit
@@ -98,13 +98,17 @@ private final class FailureInjectingContainer: ReadiumShared.Container {
     func navigator(
         for publication: Publication,
         epubPreferences: EPUBPreferences = .empty,
-        disablePageTurnsWhileScrolling: Bool = false
+        disablePageTurnsWhileScrolling: Bool = false,
+        pageTurnStyle: EPUBPageTurnStyle = .push,
+        accessibilityOverride: PublicationFixture.AccessibilityOverride = .none
     ) throws -> VisualNavigator & UIViewController {
         if publication.conforms(to: .epub) {
             return try epubNavigator(
                 for: publication,
                 preferences: epubPreferences,
-                disablePageTurnsWhileScrolling: disablePageTurnsWhileScrolling
+                disablePageTurnsWhileScrolling: disablePageTurnsWhileScrolling,
+                pageTurnStyle: pageTurnStyle,
+                accessibilityOverride: accessibilityOverride
             )
         } else if publication.conforms(to: .pdf) {
             return try pdfNavigator(for: publication)
@@ -116,15 +120,32 @@ private final class FailureInjectingContainer: ReadiumShared.Container {
     func epubNavigator(
         for publication: Publication,
         preferences: EPUBPreferences = .empty,
-        disablePageTurnsWhileScrolling: Bool = false
+        disablePageTurnsWhileScrolling: Bool = false,
+        pageTurnStyle: EPUBPageTurnStyle = .push,
+        accessibilityOverride: PublicationFixture.AccessibilityOverride = .none
     ) throws -> EPUBNavigatorViewController {
         let navigator = try EPUBNavigatorViewController(
             publication: publication,
             initialLocation: preferences.scroll == true ? continuousScrollLocation : nil,
             config: EPUBNavigatorViewController.Configuration(
                 preferences: preferences,
+                pageTurnStyle: pageTurnStyle,
                 disablePageTurnsWhileScrolling: disablePageTurnsWhileScrolling
-            )
+            ),
+            notificationCenter: .default,
+            accessibilityStatusProvider: {
+                switch accessibilityOverride {
+                case .none:
+                    return (
+                        UIAccessibility.isReduceMotionEnabled,
+                        UIAccessibility.isVoiceOverRunning
+                    )
+                case .reduceMotion:
+                    return (true, false)
+                case .voiceOver:
+                    return (false, true)
+                }
+            }
         )
         memoryTracker.track(navigator)
         return navigator

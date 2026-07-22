@@ -18,6 +18,7 @@ private final class StubPaginationDelegate: PaginationViewDelegate {
     let views: [Int: StubPageView]
     var unavailableIndices: Set<Int> = []
     var viewportUpdateCount = 0
+    var viewsUpdateCount = 0
     var verticalOffsetResolver: ((PageLocation, Int) async throws -> CGFloat?)?
 
     init(pageCount: Int) {
@@ -34,7 +35,9 @@ private final class StubPaginationDelegate: PaginationViewDelegate {
         return views[index]
     }
 
-    func paginationViewDidUpdateViews(_ paginationView: PaginationView) {}
+    func paginationViewDidUpdateViews(_ paginationView: PaginationView) {
+        viewsUpdateCount += 1
+    }
 
     func paginationViewDidUpdateViewport(_ paginationView: PaginationView) {
         viewportUpdateCount += 1
@@ -363,6 +366,120 @@ struct PaginationViewTests {
             paginationView.orderedViews.map { ObjectIdentifier($0) }
                 == [2, 1, 0].map { ObjectIdentifier(delegate.views[$0]!) }
         )
+    }
+
+    @Test("snapshot exposure reveals and restores a ready neighbor without navigation")
+    func snapshotExposureRestoresWithoutNavigation() async throws {
+        let (paginationView, delegate, window) = await makeHorizontalPagination()
+        defer {
+            window.isHidden = true
+            withExtendedLifetime(delegate) {}
+        }
+        let scrollView = try #require(outerScrollView(in: paginationView))
+        let exposedView = try #require(delegate.views[0])
+        let currentView = try #require(delegate.views[1])
+        let originalOffset = scrollView.contentOffset
+        let originalLoadedViews = paginationView.loadedViews.mapValues(ObjectIdentifier.init)
+        let originalSubviewCount = paginationView.subviews.count
+        let originalViewsUpdateCount = delegate.viewsUpdateCount
+        let originalViewportUpdateCount = delegate.viewportUpdateCount
+
+        let exposure = await paginationView.exposeReadyViewForPageTurnSnapshot(at: 0)
+        let context = try #require(exposure)
+
+        #expect(paginationView.currentIndex == 1)
+        #expect(paginationView.currentView === delegate.views[1])
+        #expect(paginationView.loadedViews.mapValues(ObjectIdentifier.init) == originalLoadedViews)
+        #expect(paginationView.visibleIndices == [0])
+        #expect(scrollView.contentOffset == .zero)
+        #expect(
+            !pageTurnSnapshotsRequireInvalidationForPagesDidChange(
+                exposedView,
+                in: paginationView
+            )
+        )
+        #expect(
+            pageTurnSnapshotsRequireInvalidationForPagesDidChange(
+                currentView,
+                in: paginationView
+            )
+        )
+        #expect(paginationView.subviews.count == originalSubviewCount + 1)
+        #expect(delegate.viewsUpdateCount == originalViewsUpdateCount)
+        #expect(delegate.viewportUpdateCount == originalViewportUpdateCount)
+
+        await paginationView.restorePageTurnSnapshotExposure(context)
+
+        #expect(paginationView.currentIndex == 1)
+        #expect(paginationView.currentView === delegate.views[1])
+        #expect(paginationView.loadedViews.mapValues(ObjectIdentifier.init) == originalLoadedViews)
+        #expect(paginationView.visibleIndices == [1])
+        #expect(scrollView.contentOffset == originalOffset)
+        #expect(paginationView.subviews.count == originalSubviewCount)
+        #expect(scrollView.isScrollEnabled)
+        #expect(scrollView.panGestureRecognizer.isEnabled)
+        #expect(delegate.viewsUpdateCount == originalViewsUpdateCount)
+        #expect(delegate.viewportUpdateCount == originalViewportUpdateCount)
+    }
+
+    @Test("a thrown snapshot capture restores the exposed neighbor before lease release")
+    func snapshotExposureRestoresAfterCaptureFailure() async throws {
+        let (paginationView, delegate, window) = await makeHorizontalPagination()
+        defer {
+            window.isHidden = true
+            withExtendedLifetime(delegate) {}
+        }
+        let scrollView = try #require(outerScrollView(in: paginationView))
+        let originalOffset = scrollView.contentOffset
+        let originalLoadedViews = paginationView.loadedViews.mapValues(ObjectIdentifier.init)
+        let originalSubviewCount = paginationView.subviews.count
+        let provider = EPUBPageTurnSnapshotProvider()
+        let targetView = try #require(delegate.views[0])
+        let target = EPUBPageTurnSnapshotTargetIdentity(
+            pagination: paginationView,
+            spread: targetView,
+            resourceIndex: 0,
+            pageIndex: 0
+        )
+        var exposure: PaginationPageTurnSnapshotExposureContext?
+        var didRestore = false
+
+        do {
+            _ = try await provider.capture(
+                target: target,
+                sourceIdentity: { target },
+                isBlocked: { false },
+                capture: {
+                    guard let context = await paginationView.exposeReadyViewForPageTurnSnapshot(
+                        at: 0
+                    ) else {
+                        throw VerticalOffsetTestError.failed
+                    }
+                    exposure = context
+                    throw VerticalOffsetTestError.failed
+                },
+                restore: {
+                    if let exposure {
+                        await paginationView.restorePageTurnSnapshotExposure(exposure)
+                    }
+                    didRestore = true
+                }
+            )
+            Issue.record("Expected snapshot capture to throw")
+        } catch VerticalOffsetTestError.failed {
+            // Expected failure path.
+        }
+
+        #expect(didRestore)
+        #expect(provider.isIdle)
+        #expect(paginationView.currentIndex == 1)
+        #expect(paginationView.currentView === delegate.views[1])
+        #expect(paginationView.loadedViews.mapValues(ObjectIdentifier.init) == originalLoadedViews)
+        #expect(paginationView.visibleIndices == [1])
+        #expect(scrollView.contentOffset == originalOffset)
+        #expect(paginationView.subviews.count == originalSubviewCount)
+        #expect(scrollView.isScrollEnabled)
+        #expect(scrollView.panGestureRecognizer.isEnabled)
     }
 
     @Test("native paging policy disables only horizontal user pan")
@@ -882,6 +999,35 @@ struct PaginationViewTests {
         await waitUntil { paginationView.loadedViews.count == expectedLoadedCount }
         paginationView.layoutIfNeeded()
         return (paginationView, delegate)
+    }
+
+    private func makeHorizontalPagination() async -> (
+        PaginationView,
+        StubPaginationDelegate,
+        UIWindow
+    ) {
+        let pageCount = 3
+        let delegate = StubPaginationDelegate(pageCount: pageCount)
+        let paginationView = PaginationView(
+            frame: CGRect(x: 0, y: 0, width: 320, height: 500),
+            preloadPreviousPositionCount: 3,
+            preloadNextPositionCount: 3,
+            isScrollEnabled: true
+        )
+        paginationView.delegate = delegate
+        let window = UIWindow(frame: paginationView.bounds)
+        window.addSubview(paginationView)
+        window.isHidden = false
+        paginationView.reloadAtIndex(
+            1,
+            location: .start,
+            pageCount: pageCount,
+            readingProgression: .ltr
+        )
+        await waitUntil { paginationView.loadedViews.count == pageCount }
+        paginationView.layoutIfNeeded()
+        await nextMainRunLoop()
+        return (paginationView, delegate, window)
     }
 
     private func outerScrollView(in paginationView: PaginationView) -> UIScrollView? {

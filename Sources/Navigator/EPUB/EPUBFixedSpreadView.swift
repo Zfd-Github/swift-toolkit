@@ -98,6 +98,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
 
     override func scrollViewDidZoom(_ scrollView: UIScrollView) {
         updateNativeHorizontalPaging()
+        delegate?.spreadViewScaleDidChange(self)
     }
 
     override func layoutSubviews() {

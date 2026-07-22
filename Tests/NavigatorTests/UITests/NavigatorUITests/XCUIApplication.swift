@@ -34,7 +34,22 @@ extension XCUIApplication {
     /// A timeout is used to make sure the memory is cleared.
     @discardableResult
     func assertAllMemoryDeallocated() -> Self {
-        switches[.allMemoryDeallocated].assertIs(true, waitForTimeout: 120)
+        let memorySwitch = switches[.allMemoryDeallocated].firstMatch
+        let fixtureList = collectionViews.firstMatch
+        let didScroll = !memorySwitch.exists && fixtureList.exists
+        if didScroll {
+            fixtureList.swipeUp()
+        }
+        defer {
+            if didScroll {
+                fixtureList.swipeDown()
+            }
+        }
+        guard memorySwitch.waitForExistence(timeout: 5) else {
+            XCTFail("Missing memory-deallocation indicator")
+            return self
+        }
+        memorySwitch.assertIs(true, waitForTimeout: 120)
         return self
     }
 }
@@ -67,44 +82,106 @@ struct ReaderUI {
     func runAction(
         _ action: AccessibilityID,
         completionPrefix: String,
-        timeout: TimeInterval = 30
+        timeout: TimeInterval = 30,
+        afterStart: (() -> Void)? = nil
     ) -> Self {
-        let marker = app.staticTexts[.actionMarker].firstMatch
-        let previous = marker.label
-
-        app.buttons[.testActions].tap()
-        switch action {
-        case .jumpMissingResource,
-             .jumpFirstResourceEnd,
-             .jumpFragment,
-             .jumpText,
-             .jumpTableOfContents,
-             .jumpProgression10,
-             .jumpProgression80,
-             .jumpReflowMarker:
-            openActionGroup(.navigationActions)
-
-        case .captureCurrentLocation,
-             .captureFirstVisible,
-             .captureMetrics,
-             .captureViewportMetrics,
-             .captureTitle,
-             .captureSelection:
-            openActionGroup(.captureActions)
-
-        default:
-            break
-        }
+        let previous = app.staticTexts[.actionMarker].firstMatch.label
         let button = app.buttons[action].firstMatch
+
+        let testActions = app.buttons[.testActions].firstMatch
+        if testActions.exists {
+            testActions.tap()
+        } else {
+            let overflow = app.buttons["OverflowBarButtonItem"].firstMatch
+            XCTAssertTrue(overflow.waitForExistence(timeout: 5), "Missing toolbar overflow")
+            overflow.tap()
+            if !button.waitForExistence(timeout: 1) {
+                if testActions.waitForExistence(timeout: 1) {
+                    testActions.tap()
+                } else {
+                    let toolbarGroup = app.buttons["Run Stress Test"].firstMatch
+                    if toolbarGroup.waitForExistence(timeout: 1) {
+                        toolbarGroup.tap()
+                    }
+                }
+            }
+        }
+        if !button.waitForExistence(timeout: 1) {
+            switch action {
+            case .jumpMissingResource,
+                 .jumpFirstResourceEnd,
+                 .jumpFragment,
+                 .jumpText,
+                 .jumpTableOfContents,
+                 .jumpProgression10,
+                 .jumpProgression80,
+                 .jumpReflowMarker:
+                openActionGroupIfPresent(.navigationActions)
+
+            case .captureCurrentLocation,
+                 .captureFirstVisible,
+                 .captureMetrics,
+                 .captureViewportMetrics,
+                 .captureTitle,
+                 .captureSelection:
+                openActionGroupIfPresent(.captureActions)
+
+            default:
+                break
+            }
+        }
         XCTAssertTrue(button.waitForExistence(timeout: 5), "Missing test action \(action.rawValue)")
         button.tap()
 
-        let predicate = NSPredicate { _, _ in
-            marker.label.hasPrefix("done:\(completionPrefix):") && marker.label != previous
+        let actionStates = afterStart == nil
+            ? ["running", "done", "failed"]
+            : ["running"]
+        let actionPrefixes = actionStates
+            .map { "\($0):\(completionPrefix):" }
+        var generation: String?
+        let generationPredicate = NSPredicate { _, _ in
+            let current = app.staticTexts[.actionMarker].firstMatch.label
+            guard current != previous else { return false }
+            for prefix in actionPrefixes where current.hasPrefix(prefix) {
+                generation = String(
+                    current.dropFirst(prefix.count)
+                        .split(whereSeparator: { $0 == ":" || $0 == "|" })[0]
+                )
+                return true
+            }
+            return false
         }
-        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: marker)
+        let generationExpectation = XCTNSPredicateExpectation(
+            predicate: generationPredicate,
+            object: app
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [generationExpectation], timeout: 5),
+            .completed,
+            "Action did not start: \(app.staticTexts[.actionMarker].firstMatch.label)"
+        )
+        guard let generation else { return self }
+        afterStart?()
+
+        let doneMarker = "done:\(completionPrefix):\(generation)"
+        let failedPrefix = "failed:\(completionPrefix):\(generation):"
+        let predicate = NSPredicate { _, _ in
+            let current = app.staticTexts[.actionMarker].firstMatch.label
+            return current == doneMarker || current.hasPrefix(failedPrefix)
+        }
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: app)
         let result = XCTWaiter.wait(for: [expectation], timeout: timeout)
-        XCTAssertEqual(result, .completed, "Last action marker: \(marker.label)")
+        let marker = app.staticTexts[.actionMarker].firstMatch.label
+        XCTAssertEqual(
+            result,
+            .completed,
+            "Last action marker: \(marker); snapshot probe: \(self.marker(.snapshotProbeMarker))"
+        )
+        XCTAssertEqual(
+            marker,
+            doneMarker,
+            "Action failed: \(marker); snapshot probe: \(self.marker(.snapshotProbeMarker))"
+        )
         return self
     }
 
@@ -112,9 +189,10 @@ struct ReaderUI {
         app.staticTexts[id].firstMatch.label
     }
 
-    private func openActionGroup(_ id: AccessibilityID) {
+    private func openActionGroupIfPresent(_ id: AccessibilityID) {
         let group = app.buttons[id].firstMatch
-        XCTAssertTrue(group.waitForExistence(timeout: 5), "Missing test action group \(id.rawValue)")
-        group.tap()
+        if group.waitForExistence(timeout: 1) {
+            group.tap()
+        }
     }
 }

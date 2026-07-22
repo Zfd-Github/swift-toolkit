@@ -160,9 +160,14 @@ enum EPUBScriptScope {
         }
         needsInvalidatePagination = true
         DispatchQueue.main.async { [self] in
-            needsInvalidatePagination = false
-            delegate?.epubNavigatorViewModelInvalidatePaginationView(self)
+            flushPendingPaginationInvalidation()
         }
+    }
+
+    func flushPendingPaginationInvalidation() {
+        guard needsInvalidatePagination else { return }
+        needsInvalidatePagination = false
+        delegate?.epubNavigatorViewModelInvalidatePaginationView(self)
     }
 
     // MARK: - Web View Server

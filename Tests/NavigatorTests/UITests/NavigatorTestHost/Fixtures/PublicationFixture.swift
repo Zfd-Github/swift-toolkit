@@ -7,10 +7,17 @@
 import Foundation
 
 struct PublicationFixture: Equatable {
+    enum AccessibilityOverride: String {
+        case none
+        case reduceMotion
+        case voiceOver
+    }
+
     let filename: String
     let description: String
     var hasFailedContinuousNeighbor = false
     var failsCurrentResourceOnLayoutSwitch = false
+    var accessibilityOverride: AccessibilityOverride = .none
 
     var accessibilityIdentifier: String {
         let variant = if hasFailedContinuousNeighbor {
@@ -20,7 +27,12 @@ struct PublicationFixture: Equatable {
         } else {
             ""
         }
-        return "publication://\(filename)\(variant)"
+        let coverVariant = switch accessibilityOverride {
+        case .none: variant
+        case .reduceMotion: "?reduce-motion"
+        case .voiceOver: "?voice-over"
+        }
+        return "publication://\(filename)\(coverVariant)"
     }
 
     var startsInContinuousScroll: Bool {
@@ -29,6 +41,10 @@ struct PublicationFixture: Equatable {
 
     var enablesContinuousScrollActions: Bool {
         startsInContinuousScroll || failsCurrentResourceOnLayoutSwitch
+    }
+
+    var usesCoverPageTurn: Bool {
+        filename.hasPrefix("page-turn-probe-")
     }
 
     static let childrensLiteratureEPUB: PublicationFixture = .init(
@@ -57,4 +73,27 @@ struct PublicationFixture: Equatable {
         description: "Paged EPUB whose current resource fails during a continuous-mode transition.",
         failsCurrentResourceOnLayoutSwitch: true
     )
+
+    static let pageTurnProbeLTR: PublicationFixture = .init(
+        filename: "page-turn-probe-ltr.epub",
+        description: "Deterministic LTR snapshot probe."
+    )
+
+    static let pageTurnProbeRTL: PublicationFixture = .init(
+        filename: "page-turn-probe-rtl.epub",
+        description: "Deterministic RTL snapshot probe."
+    )
+
+    static let pageTurnProbeReduceMotion: PublicationFixture = .init(
+        filename: "page-turn-probe-ltr.epub",
+        description: "Cover probe with Reduce Motion enabled.",
+        accessibilityOverride: .reduceMotion
+    )
+
+    static let pageTurnProbeVoiceOver: PublicationFixture = .init(
+        filename: "page-turn-probe-ltr.epub",
+        description: "Cover probe with VoiceOver enabled.",
+        accessibilityOverride: .voiceOver
+    )
+
 }

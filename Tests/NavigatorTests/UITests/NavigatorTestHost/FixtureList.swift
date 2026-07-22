@@ -25,6 +25,10 @@ struct FixtureList: View {
                 fixture(.continuousScrollEPUB)
                 fixture(.continuousScrollFailedNeighborEPUB)
                 fixture(.continuousScrollFailedCurrentTransitionEPUB)
+                fixture(.pageTurnProbeLTR)
+                fixture(.pageTurnProbeRTL)
+                fixture(.pageTurnProbeReduceMotion)
+                fixture(.pageTurnProbeVoiceOver)
                 fixture(.daisyPDF)
             }
 
@@ -105,14 +109,17 @@ class FixtureListViewModel: ObservableObject {
         let navigator = try container.navigator(
             for: publication,
             epubPreferences: preferences,
-            disablePageTurnsWhileScrolling: fixture.startsInContinuousScroll
+            disablePageTurnsWhileScrolling: fixture.startsInContinuousScroll,
+            pageTurnStyle: fixture.usesCoverPageTurn ? .cover : .none,
+            accessibilityOverride: fixture.accessibilityOverride
         )
 
         readerViewModel = ReaderViewModel(
             navigator: navigator,
             enablesContinuousScrollActions: fixture.enablesContinuousScrollActions,
             epubPreferences: preferences,
-            resourceFailureController: resourceFailureController
+            resourceFailureController: resourceFailureController,
+            pageTurnStyle: fixture.usesCoverPageTurn ? .cover : .none
         )
     }
 }

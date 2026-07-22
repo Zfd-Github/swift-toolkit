@@ -380,6 +380,33 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         return true
     }
 
+    override func adjacentPageTurnSnapshotOffset(to direction: Direction) -> CGPoint? {
+        guard
+            !viewModel.scroll,
+            isSpreadLoaded,
+            !isTerminated,
+            scrollView.bounds.width > 0
+        else {
+            return nil
+        }
+        let delta: CGFloat
+        switch direction {
+        case .left:
+            delta = -scrollView.bounds.width
+        case .right:
+            delta = scrollView.bounds.width
+        }
+        let maximumX = max(0, scrollView.contentSize.width - scrollView.bounds.width)
+        let targetX = scrollView.contentOffset.x + delta
+        guard targetX >= -0.5, targetX <= maximumX + 0.5 else { return nil }
+        return CGPoint(x: min(max(targetX, 0), maximumX), y: scrollView.contentOffset.y)
+    }
+
+    override func pageTurnSnapshotPageIndex(at offset: CGPoint) -> Int {
+        guard scrollView.bounds.width > 0 else { return 0 }
+        return Int(round(offset.x / scrollView.bounds.width))
+    }
+
     static func pageTurnScrollBehavior(options: NavigatorGoOptions) -> String {
         options.animated ? "smooth" : "instant"
     }
@@ -551,9 +578,35 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// To check if a progression change was cancelled or not.
     private var previousProgression: ClosedRange<Double>?
 
+    override func beginPageTurnSnapshotSuppression() -> () -> Void {
+        NSObject.cancelPreviousPerformRequests(
+            withTarget: self,
+            selector: #selector(notifyPagesDidChange),
+            object: nil
+        )
+        let savedProgression = progression
+        let savedPreviousProgression = previousProgression
+        let hadPendingNotification = savedPreviousProgression != nil
+            && savedPreviousProgression != savedProgression
+        return { [weak self] in
+            guard let self else { return }
+            NSObject.cancelPreviousPerformRequests(
+                withTarget: self,
+                selector: #selector(notifyPagesDidChange),
+                object: nil
+            )
+            self.progression = savedProgression
+            self.previousProgression = savedPreviousProgression
+            if hadPendingNotification {
+                self.setNeedsNotifyPagesDidChange()
+            }
+        }
+    }
+
     /// Called by the javascript code to notify that scrolling ended.
     private func progressionDidChange(_ body: Any) {
         guard
+            !isCapturingPageTurnSnapshot,
             isSpreadLoaded,
             let body = body as? [String: Any],
             var firstProgression = body["first"] as? Double,
@@ -615,6 +668,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     override func scrollViewDidScroll(_ scrollView: UIScrollView) {
         super.scrollViewDidScroll(scrollView)
+        guard !isCapturingPageTurnSnapshot else { return }
         setNeedsNotifyPagesDidChange()
     }
 }
