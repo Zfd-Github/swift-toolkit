@@ -49,6 +49,9 @@ enum AccessibilityID: String {
     case captureViewportMetrics
     case captureTitle
     case captureSelection
+    case pageTurnBeginMarker
+    case pageTurnTapMarker
+    case pageTurnLinkMarker
 }
 
 extension View {

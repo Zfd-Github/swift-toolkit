@@ -268,6 +268,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private var positionsByReadingOrder: [[Locator]] = []
 
     private let viewModel: EPUBNavigatorViewModel
+    private let notificationCenter: NotificationCenter
+    private let accessibilityStatusProvider: @MainActor () -> (
+        isReduceMotionEnabled: Bool,
+        isVoiceOverRunning: Bool
+    )
     public var publication: Publication {
         viewModel.publication
     }
@@ -291,6 +296,32 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         readingOrder: [Link]? = nil,
         config: Configuration = .init()
     ) throws {
+        try self.init(
+            publication: publication,
+            initialLocation: initialLocation,
+            readingOrder: readingOrder,
+            config: config,
+            notificationCenter: .default,
+            accessibilityStatusProvider: {
+                (
+                    UIAccessibility.isReduceMotionEnabled,
+                    UIAccessibility.isVoiceOverRunning
+                )
+            }
+        )
+    }
+
+    convenience init(
+        publication: Publication,
+        initialLocation: Locator?,
+        readingOrder: [Link]? = nil,
+        config: Configuration = .init(),
+        notificationCenter: NotificationCenter,
+        accessibilityStatusProvider: @escaping @MainActor () -> (
+            isReduceMotionEnabled: Bool,
+            isVoiceOverRunning: Bool
+        )
+    ) throws {
         precondition(readingOrder.map { !$0.isEmpty } ?? true)
 
         guard !publication.isRestricted else {
@@ -313,7 +344,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             // provided with a different reading order, we should assume the
             // positions list is empty, and also not compute the
             // totalProgression when calculating the current locator.
-            (readingOrder != nil) ? { .success([]) } : publication.positionsByReadingOrder
+            (readingOrder != nil) ? { .success([]) } : publication.positionsByReadingOrder,
+            notificationCenter: notificationCenter,
+            accessibilityStatusProvider: accessibilityStatusProvider
         )
     }
 
@@ -338,9 +371,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         viewModel: EPUBNavigatorViewModel,
         initialLocation: Locator?,
         readingOrder: [Link],
-        positionsByReadingOrder: @escaping () async -> ReadResult<[[Locator]]>
+        positionsByReadingOrder: @escaping () async -> ReadResult<[[Locator]]>,
+        notificationCenter: NotificationCenter,
+        accessibilityStatusProvider: @escaping @MainActor () -> (
+            isReduceMotionEnabled: Bool,
+            isVoiceOverRunning: Bool
+        )
     ) {
         self.viewModel = viewModel
+        self.notificationCenter = notificationCenter
+        self.accessibilityStatusProvider = accessibilityStatusProvider
         currentLocation = initialLocation
         pageTurnStyle = viewModel.config.pageTurnStyle
         self.readingOrder = readingOrder
@@ -366,17 +406,31 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
         )
 
-        NotificationCenter.default.addObserver(
+        notificationCenter.addObserver(
             self,
             selector: #selector(didBecomeActive),
             name: UIApplication.didBecomeActiveNotification,
             object: nil
         )
 
-        NotificationCenter.default.addObserver(
+        notificationCenter.addObserver(
             self,
             selector: #selector(willResignActive),
             name: UIApplication.willResignActiveNotification,
+            object: nil
+        )
+
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(accessibilityStatusDidChange),
+            name: UIAccessibility.reduceMotionStatusDidChangeNotification,
+            object: nil
+        )
+
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(accessibilityStatusDidChange),
+            name: UIAccessibility.voiceOverStatusDidChangeNotification,
             object: nil
         )
     }
@@ -388,7 +442,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     deinit {
         viewportPropagationTask?.cancel()
-        NotificationCenter.default.removeObserver(self)
+        notificationCenter.removeObserver(self)
     }
 
     override open func viewDidLoad() {
@@ -689,12 +743,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         to direction: EPUBSpreadView.Direction,
         options: NavigatorGoOptions
     ) async -> Bool {
-        await routePageTurn(
+        let accessibilityStatus = accessibilityStatusProvider()
+        return await routePageTurn(
             to: direction,
             options: options,
             axis: paginationView?.axis,
-            isReduceMotionEnabled: UIAccessibility.isReduceMotionEnabled,
-            isVoiceOverRunning: UIAccessibility.isVoiceOverRunning,
+            isReduceMotionEnabled: accessibilityStatus.isReduceMotionEnabled,
+            isVoiceOverRunning: accessibilityStatus.isVoiceOverRunning,
             usingExistingPath: { [self] direction, options in
                 await goUsingExistingPath(to: direction, options: options)
             },
@@ -971,12 +1026,23 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private func pageTurnInteractionPolicy(
         for axis: PaginationView.Axis
     ) -> EPUBPageTurnInteraction.Policy {
+        let accessibilityStatus = accessibilityStatusProvider()
         let style = effectivePageTurnStyle(
             userStyle: pageTurnStyle,
-            isReduceMotionEnabled: UIAccessibility.isReduceMotionEnabled,
-            isVoiceOverRunning: UIAccessibility.isVoiceOverRunning
+            isReduceMotionEnabled: accessibilityStatus.isReduceMotionEnabled,
+            isVoiceOverRunning: accessibilityStatus.isVoiceOverRunning
         )
         return EPUBPageTurnInteraction.policy(axis: axis, style: style)
+    }
+
+    @objc private func accessibilityStatusDidChange() {
+        if let session = pageTurnController.invalidatePreCommitSession() {
+            if nonePanSession?.id == session.id {
+                nonePanSession = nil
+            }
+            on(.moved)
+        }
+        updatePageTurnInteractionMode()
     }
 
     private func updatePageTurnInteractionMode() {

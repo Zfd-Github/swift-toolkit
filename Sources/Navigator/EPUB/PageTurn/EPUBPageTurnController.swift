@@ -206,6 +206,15 @@ final class EPUBPageTurnController {
         return true
     }
 
+    func invalidatePreCommitSession() -> PageTurnSession? {
+        switch state {
+        case let .tracking(session, _), let .restoring(session):
+            return finish(session) ? session : nil
+        case .idle, .committing:
+            return nil
+        }
+    }
+
     func settle(
         restore: @escaping @MainActor (PageTurnSession) async -> Void
     ) async {

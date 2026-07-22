@@ -17,6 +17,21 @@ private final class WeakObjectBox<Object: AnyObject> {
     }
 }
 
+@MainActor
+private final class PageTurnGestureObserver: NSObject {
+    private let onBegin: () -> Void
+
+    init(onBegin: @escaping () -> Void) {
+        self.onBegin = onBegin
+    }
+
+    @objc func gestureStateDidChange(_ gestureRecognizer: UIGestureRecognizer) {
+        if gestureRecognizer.state == .began {
+            onBegin()
+        }
+    }
+}
+
 /// SwiftUI wrapper for the `ReaderViewController`.
 struct ReaderView: View {
     @ObservedObject var viewModel: ReaderViewModel
@@ -56,6 +71,12 @@ struct ReaderView: View {
                             .accessibilityIdentifier(.selectionMarker)
                         Text(viewModel.decorationMarker)
                             .accessibilityIdentifier(.decorationMarker)
+                        Text(viewModel.pageTurnBeginMarker)
+                            .accessibilityIdentifier(.pageTurnBeginMarker)
+                        Text(viewModel.pageTurnTapMarker)
+                            .accessibilityIdentifier(.pageTurnTapMarker)
+                        Text(viewModel.pageTurnLinkMarker)
+                            .accessibilityIdentifier(.pageTurnLinkMarker)
                     }
                 )
                 .ignoresSafeArea(.all)
@@ -181,9 +202,18 @@ enum ReaderTestAction: String {
     @Published var transitionMarker = "none"
     @Published var selectionMarker = "none"
     @Published var decorationMarker = "none"
+    @Published var pageTurnBeginMarker = "count=0"
+    @Published var pageTurnTapMarker = "count=0"
+    @Published var pageTurnLinkMarker = "count=0"
 
     private var epubPreferences: EPUBPreferences
     private var directionalNavigationAdapter: DirectionalNavigationAdapter?
+    private var pageTurnGestureObserver: PageTurnGestureObserver?
+    private var selectionEvidenceTask: Task<Void, Never>?
+    private var pageTurnBeginCount = 0
+    private var pageTurnTapCount = 0
+    private var pageTurnLinkCount = 0
+    private var selectionEvidenceRevision = 0
     private var actionTask: Task<Void, Never>?
     private var actionGeneration = 0
     private var locationRevision = 0
@@ -207,6 +237,9 @@ enum ReaderTestAction: String {
 
         if let epubNavigator = navigator as? EPUBNavigatorViewController {
             epubNavigator.delegate = self
+            if !enablesContinuousScrollActions {
+                epubNavigator.pageTurnStyle = .none
+            }
         } else if let pdfNavigator = navigator as? PDFNavigatorViewController {
             pdfNavigator.delegate = self
         }
@@ -224,6 +257,7 @@ enum ReaderTestAction: String {
 
     deinit {
         actionTask?.cancel()
+        selectionEvidenceTask?.cancel()
     }
 
     func runNavigationStressTest() {
@@ -839,6 +873,67 @@ enum ReaderTestAction: String {
         }
     }
 
+    private func installPageTurnGestureEvidenceIfNeeded(
+        in navigator: EPUBNavigatorViewController
+    ) {
+        guard
+            !enablesContinuousScrollActions,
+            pageTurnGestureObserver == nil,
+            let gestureRecognizer = navigator.view.gestureRecognizers?
+                .compactMap({ $0 as? UIPanGestureRecognizer })
+                .first
+        else {
+            return
+        }
+
+        let observer = PageTurnGestureObserver { [weak self] in
+            guard let self else { return }
+            pageTurnBeginCount += 1
+            pageTurnBeginMarker = "count=\(pageTurnBeginCount)"
+        }
+        gestureRecognizer.addTarget(
+            observer,
+            action: #selector(PageTurnGestureObserver.gestureStateDidChange(_:))
+        )
+        pageTurnGestureObserver = observer
+    }
+
+    private func updateSelectionMarker(_ selection: Selection?) {
+        selectionEvidenceRevision += 1
+        guard let selection, let frame = selection.frame else {
+            selectionMarker = "sample=\(selectionEvidenceRevision)|none"
+            return
+        }
+        selectionMarker = String(
+            format: "sample=%d|%@|x=%.3f|y=%.3f|w=%.3f|h=%.3f",
+            locale: Locale(identifier: "en_US_POSIX"),
+            selectionEvidenceRevision,
+            selection.locator.href.string,
+            frame.minX,
+            frame.minY,
+            frame.width,
+            frame.height
+        )
+    }
+
+    private func monitorSelectionEvidence() {
+        guard
+            !enablesContinuousScrollActions,
+            let navigator = navigator as? EPUBNavigatorViewController
+        else {
+            return
+        }
+
+        selectionEvidenceTask?.cancel()
+        selectionEvidenceTask = Task { [weak self, weak navigator] in
+            for _ in 0 ..< 20 {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                guard !Task.isCancelled, let self, let navigator else { return }
+                updateSelectionMarker(navigator.currentSelection)
+            }
+        }
+    }
+
     private func installInteractionEvidence(in navigator: EPUBNavigatorViewController) {
         guard let link = readingOrderLink(at: 1) else { return }
 
@@ -1122,10 +1217,27 @@ extension ReaderViewModel: NavigatorDelegate {
         if !isReady {
             isReady = true
         }
+        if let navigator = navigator as? EPUBNavigatorViewController {
+            installPageTurnGestureEvidenceIfNeeded(in: navigator)
+        }
     }
 }
 
 extension ReaderViewModel: EPUBNavigatorDelegate {
+    func navigator(_ navigator: VisualNavigator, didTapAt point: CGPoint) {
+        pageTurnTapCount += 1
+        pageTurnTapMarker = "count=\(pageTurnTapCount)"
+    }
+
+    func navigator(
+        _ navigator: VisualNavigator,
+        shouldNavigateToLink link: ReadiumShared.Link
+    ) -> Bool {
+        pageTurnLinkCount += 1
+        pageTurnLinkMarker = "count=\(pageTurnLinkCount)"
+        return true
+    }
+
     func navigator(
         _ navigator: EPUBNavigatorViewController,
         setupUserScripts userContentController: WKUserContentController
@@ -1175,7 +1287,9 @@ extension ReaderViewModel: EPUBNavigatorDelegate {
         _ navigator: SelectableNavigator,
         shouldShowMenuForSelection selection: Selection
     ) -> Bool {
-        !enablesContinuousScrollActions
+        updateSelectionMarker(selection)
+        monitorSelectionEvidence()
+        return !enablesContinuousScrollActions
     }
 }
 extension ReaderViewModel: PDFNavigatorDelegate {}
