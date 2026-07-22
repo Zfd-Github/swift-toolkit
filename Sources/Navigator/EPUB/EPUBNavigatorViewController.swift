@@ -980,7 +980,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private func updatePageTurnInteractionMode() {
         guard let paginationView else { return }
+        updatePageTurnInteractionMode(for: paginationView)
+    }
+
+    func updatePageTurnInteractionMode(for paginationView: PaginationView) {
         let policy = pageTurnInteractionPolicy(for: paginationView.axis)
+        if !policy.usesNonePan, let session = nonePanSession {
+            nonePanSession = nil
+            finishPageTurn(session)
+        }
         paginationView.allowsNativeHorizontalPaging = policy.allowsNativeHorizontalPaging
         for view in paginationView.loadedViews.values {
             (view as? EPUBSpreadView)?.allowsNativeHorizontalPaging = policy.allowsNativeHorizontalPaging
@@ -989,21 +997,51 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     @objc private func handleNonePan(_ gestureRecognizer: UIPanGestureRecognizer) {
+        handleNonePan(
+            state: gestureRecognizer.state,
+            translationX: gestureRecognizer.translation(in: view).x,
+            velocityX: gestureRecognizer.velocity(in: view).x
+        )
+    }
+
+    func beginNonePan(to direction: EPUBSpreadView.Direction) -> Bool {
+        guard
+            let paginationView,
+            pageTurnInteractionPolicy(for: paginationView.axis).usesNonePan,
+            nonePanSession == nil,
+            state == .idle,
+            let session = beginPageTurn(to: direction)
+        else {
+            return false
+        }
+
+        nonePanSession = session
+        return true
+    }
+
+    func handleNonePan(
+        state: UIGestureRecognizer.State,
+        translationX: CGFloat,
+        velocityX: CGFloat
+    ) {
         guard let session = nonePanSession else { return }
 
-        switch gestureRecognizer.state {
+        switch state {
         case .changed:
             _ = pageTurnController.track(
                 session,
-                translationX: gestureRecognizer.translation(in: view).x,
-                viewportWidth: view.bounds.width
+                translationX: translationX,
+                viewportWidth: view.bounds.width,
+                readingProgression: viewModel.readingProgression
             )
 
         case .ended:
             let shouldCommit = EPUBPageTurnInteraction.shouldCommit(
-                translationX: gestureRecognizer.translation(in: view).x,
+                translationX: translationX,
                 viewportWidth: view.bounds.width,
-                velocityX: gestureRecognizer.velocity(in: view).x
+                velocityX: velocityX,
+                direction: session.direction,
+                readingProgression: viewModel.readingProgression
             )
             nonePanSession = nil
             if shouldCommit {
@@ -1818,12 +1856,11 @@ extension EPUBNavigatorViewController: UIGestureRecognizerDelegate {
                 for: panGestureRecognizer.velocity(in: view),
                 readingProgression: viewModel.readingProgression
             ),
-            let session = beginPageTurn(to: direction)
+            beginNonePan(to: direction)
         else {
             return false
         }
 
-        nonePanSession = session
         return true
     }
 }
