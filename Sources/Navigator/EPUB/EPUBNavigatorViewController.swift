@@ -447,7 +447,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private let onInitializedCallbacks = CompletionList()
 
-    private func initialized() async {
+    func initialized() async {
         await withCheckedContinuation { continuation in
             whenInitialized {
                 continuation.resume()
@@ -660,32 +660,51 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         to direction: EPUBSpreadView.Direction,
         options: NavigatorGoOptions
     ) async -> Bool {
+        await routePageTurn(
+            to: direction,
+            options: options,
+            axis: paginationView?.axis,
+            isReduceMotionEnabled: UIAccessibility.isReduceMotionEnabled,
+            isVoiceOverRunning: UIAccessibility.isVoiceOverRunning,
+            usingExistingPath: { [self] direction, options in
+                await goUsingExistingPath(to: direction, options: options)
+            },
+            usingPageTurn: { [self] direction, options in
+                await runPageTurn(to: direction, options: options)
+            }
+        )
+    }
+
+    func routePageTurn(
+        to direction: EPUBSpreadView.Direction,
+        options: NavigatorGoOptions,
+        axis: PaginationView.Axis?,
+        isReduceMotionEnabled: Bool,
+        isVoiceOverRunning: Bool,
+        usingExistingPath: (EPUBSpreadView.Direction, NavigatorGoOptions) async -> Bool,
+        usingPageTurn: (EPUBSpreadView.Direction, NavigatorGoOptions) async -> Bool
+    ) async -> Bool {
         var routedOptions = options
-        if UIAccessibility.isReduceMotionEnabled
-            || UIAccessibility.isVoiceOverRunning
-        {
+        if isReduceMotionEnabled || isVoiceOverRunning {
             routedOptions.animated = false
         }
 
-        guard paginationView?.axis == .horizontalPaged else {
-            return await goUsingExistingPath(
-                to: direction,
-                options: routedOptions
-            )
+        guard axis == .horizontalPaged else {
+            return await usingExistingPath(direction, routedOptions)
         }
 
         let style = effectivePageTurnStyle(
             userStyle: pageTurnStyle,
-            isReduceMotionEnabled: UIAccessibility.isReduceMotionEnabled,
-            isVoiceOverRunning: UIAccessibility.isVoiceOverRunning
+            isReduceMotionEnabled: isReduceMotionEnabled,
+            isVoiceOverRunning: isVoiceOverRunning
         )
         switch style {
         case .push:
-            return await runPageTurn(to: direction, options: routedOptions)
+            return await usingPageTurn(direction, routedOptions)
         case .none, .simulation:
-            return await runPageTurn(to: direction, options: .none)
+            return await usingPageTurn(direction, .none)
         case .cover:
-            return await runPageTurn(to: direction, options: .none)
+            return await usingPageTurn(direction, .none)
         }
     }
 
@@ -1019,7 +1038,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private var notifiedCurrentLocation: Locator?
 
     private func publishCurrentLocation() async {
-        let (location, newViewport) = await computeCurrentLocationAndViewport()
+        await publishCurrentLocation(calculating: computeCurrentLocationAndViewport)
+    }
+
+    func publishCurrentLocation(
+        calculating calculate: () async -> (Locator?, NavigatorViewport?)
+    ) async {
+        let (location, newViewport) = await calculate()
         viewport = newViewport
 
         guard let location else {
@@ -1042,9 +1067,19 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         pollingInterval: 0.1
     ) { [weak self] in
         guard let self else { return }
+        await performCurrentLocationRefresh()
+    }
+
+    private func performCurrentLocationRefresh() async {
+        await performCurrentLocationRefresh(calculating: computeCurrentLocationAndViewport)
+    }
+
+    func performCurrentLocationRefresh(
+        calculating calculate: () async -> (Locator?, NavigatorViewport?)
+    ) async {
         guard !isCurrentLocationRefreshRunning else { return }
         isCurrentLocationRefreshRunning = true
-        await publishCurrentLocation()
+        await publishCurrentLocation(calculating: calculate)
         isCurrentLocationRefreshRunning = false
         let waiters = currentLocationRefreshWaiters
         currentLocationRefreshWaiters.removeAll()
@@ -1052,9 +1087,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func awaitCurrentLocationRefresh() async {
+        await awaitCurrentLocationRefresh(request: updateCurrentLocation)
+    }
+
+    func awaitCurrentLocationRefresh(request: () -> Void) async {
         await withCheckedContinuation { continuation in
             currentLocationRefreshWaiters.append(continuation)
-            updateCurrentLocation()
+            request()
         }
     }
 

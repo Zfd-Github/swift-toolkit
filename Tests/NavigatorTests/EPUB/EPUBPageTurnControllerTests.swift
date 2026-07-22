@@ -7,6 +7,7 @@
 @testable import ReadiumNavigator
 import ReadiumShared
 import Testing
+import UIKit
 
 @MainActor
 @Suite(.serialized)
@@ -56,6 +57,120 @@ struct EPUBPageTurnControllerTests {
                 isVoiceOverRunning: true
             ) == .none)
         }
+    }
+
+    @Test("production router exhaustively routes horizontal styles and bypasses continuous pagination")
+    func productionRouter() async throws {
+        let navigator = try makeNavigator()
+        let options = NavigatorGoOptions(
+            animated: true,
+            otherOptions: ["probe": .string("preserved")]
+        )
+        let styles: [(EPUBPageTurnStyle, NavigatorGoOptions)] = [
+            (.push, options),
+            (.none, .none),
+            (.simulation, .none),
+            (.cover, .none),
+        ]
+
+        for (style, expectedOptions) in styles {
+            navigator.pageTurnStyle = style
+            var existingPathOptions: [NavigatorGoOptions] = []
+            var pageTurnOptions: [NavigatorGoOptions] = []
+
+            let result = await navigator.routePageTurn(
+                to: .right,
+                options: options,
+                axis: .horizontalPaged,
+                isReduceMotionEnabled: false,
+                isVoiceOverRunning: false,
+                usingExistingPath: { _, routedOptions in
+                    existingPathOptions.append(routedOptions)
+                    return true
+                },
+                usingPageTurn: { _, routedOptions in
+                    pageTurnOptions.append(routedOptions)
+                    return true
+                }
+            )
+
+            #expect(result)
+            #expect(existingPathOptions.isEmpty)
+            #expect(pageTurnOptions == [expectedOptions])
+        }
+
+        for (style, _) in styles {
+            navigator.pageTurnStyle = style
+            var existingPathOptions: [NavigatorGoOptions] = []
+            var pageTurnCount = 0
+
+            let result = await navigator.routePageTurn(
+                to: .left,
+                options: options,
+                axis: .verticalContinuous,
+                isReduceMotionEnabled: false,
+                isVoiceOverRunning: false,
+                usingExistingPath: { _, routedOptions in
+                    existingPathOptions.append(routedOptions)
+                    return true
+                },
+                usingPageTurn: { _, _ in
+                    pageTurnCount += 1
+                    return true
+                }
+            )
+
+            #expect(result)
+            #expect(existingPathOptions == [options])
+            #expect(pageTurnCount == 0)
+        }
+    }
+
+    @Test("production location publisher calculates each time but notifies a successful locator once")
+    func productionLocationPublisherDeduplicates() async throws {
+        let oldLocation = makeLocator(href: "old.xhtml", progression: 0)
+        let newLocation = makeLocator(href: "new.xhtml", progression: 0.5)
+        let navigator = try makeNavigator(initialLocation: oldLocation)
+        let delegate = Delegate()
+        navigator.delegate = delegate
+        var calculationCount = 0
+
+        for _ in 0 ..< 2 {
+            await navigator.publishCurrentLocation {
+                calculationCount += 1
+                return (newLocation, nil)
+            }
+        }
+
+        #expect(calculationCount == 2)
+        #expect(navigator.currentLocation == newLocation)
+        #expect(delegate.locationChangeCount == 1)
+        #expect(delegate.errorCount == 0)
+    }
+
+    @Test("real navigator go publishes once and pre-commit cancellation publishes nothing")
+    func realNavigatorGoAndCancellation() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator()
+
+        delegate.resetLocationChanges()
+        #expect(await navigator.goForward(options: .none))
+        await navigator.settlePageTurn()
+        #expect(delegate.locationChangeCount == 1)
+
+        delegate.resetLocationChanges()
+        let startGate = Gate()
+        let cancelledTurn = Task { @MainActor in
+            await startGate.wait()
+            return await navigator.goBackward(options: .none)
+        }
+        cancelledTurn.cancel()
+        startGate.open()
+
+        let cancelledResult = await cancelledTurn.value
+        #expect(!cancelledResult)
+        await navigator.settlePageTurn()
+        #expect(delegate.locationChangeCount == 0)
+        #expect(delegate.errorCount == 0)
     }
 
     @Test("a second page turn is rejected until the active session finishes")
@@ -123,6 +238,36 @@ struct EPUBPageTurnControllerTests {
 
         #expect(restoreCount == 1)
         #expect(settledCount == 2)
+        #expect(controller.isIdle)
+    }
+
+    @Test("settle restore owns the reversible session before commit can start")
+    func settleRestoreCannotRaceCommit() async throws {
+        let restoreGate = Gate()
+        let controller = EPUBPageTurnController(refreshCurrentLocation: {})
+        let session = try #require(controller.begin(to: .right))
+        var restoreStarted = false
+        var commitStarted = false
+
+        let settleTask = Task { @MainActor in
+            await controller.settle { restoredSession in
+                restoreStarted = true
+                await restoreGate.wait()
+                #expect(controller.finish(restoredSession))
+            }
+        }
+
+        #expect(await waitUntil { restoreStarted })
+        let committed = await controller.commit(session) {
+            commitStarted = true
+            return true
+        }
+
+        #expect(!committed)
+        #expect(!commitStarted)
+
+        restoreGate.open()
+        await settleTask.value
         #expect(controller.isIdle)
     }
 
@@ -195,6 +340,121 @@ struct EPUBPageTurnControllerTests {
         #expect(idleRefreshCount == 1)
     }
 
+    @Test("moving and coalesced idle location failures preserve the last locator and release all waiters")
+    func productionLocationFailureReleasesWaiters() async throws {
+        let lastLocation = makeLocator(href: "last-valid.xhtml", progression: 0.75)
+        let navigator = try makeNavigator(initialLocation: lastLocation)
+        let delegate = Delegate()
+        navigator.delegate = delegate
+        let idleCalculationGate = Gate()
+        var calculationCount = 0
+        var settledCount = 0
+
+        let calculate: () async -> (Locator?, NavigatorViewport?) = {
+            calculationCount += 1
+            if calculationCount == 2 {
+                await idleCalculationGate.wait()
+            }
+            return (nil, nil)
+        }
+        let requestRefresh = {
+            _ = Task { @MainActor in
+                await navigator.performCurrentLocationRefresh(calculating: calculate)
+            }
+        }
+        let controller = EPUBPageTurnController {
+            await navigator.awaitCurrentLocationRefresh(request: requestRefresh)
+        }
+        let session = try #require(controller.begin(to: .right))
+
+        let moved = await controller.commit(session) {
+            defer { _ = controller.finish(session) }
+            await navigator.publishCurrentLocation(calculating: calculate)
+            return true
+        }
+        #expect(moved)
+
+        let firstSettle = Task { @MainActor in
+            await controller.settle(restore: { _ in })
+            settledCount += 1
+        }
+        let secondSettle = Task { @MainActor in
+            await controller.settle(restore: { _ in })
+            settledCount += 1
+        }
+
+        #expect(await waitUntil { calculationCount == 2 })
+        #expect(settledCount == 0)
+        idleCalculationGate.open()
+        await firstSettle.value
+        await secondSettle.value
+
+        #expect(calculationCount == 2)
+        #expect(settledCount == 2)
+        #expect(controller.isIdle)
+        #expect(navigator.currentLocation == lastLocation)
+        #expect(delegate.locationChangeCount == 0)
+        #expect(delegate.errorCount == 0)
+    }
+
+    private func makeNavigator(
+        initialLocation: Locator? = nil,
+        config: EPUBNavigatorViewController.Configuration = .init()
+    ) throws -> EPUBNavigatorViewController {
+        try EPUBNavigatorViewController(
+            publication: Publication(
+                manifest: Manifest(metadata: Metadata(title: "Test"))
+            ),
+            initialLocation: initialLocation,
+            config: config
+        )
+    }
+
+    private func makeLoadedNavigator() async throws -> (EPUBNavigatorViewController, Delegate) {
+        let readingOrder = [
+            Link(href: "chapter-1.xhtml", mediaType: .xhtml),
+            Link(href: "chapter-2.xhtml", mediaType: .xhtml),
+        ]
+        let containers: [Container] = readingOrder.map { link in
+            SingleResourceContainer(
+                resource: DataResource(string: "<html><body><p>Page</p></body></html>"),
+                at: link.url()
+            )
+        }
+        let publication = Publication(
+            manifest: Manifest(
+                metadata: Metadata(title: "Test"),
+                readingOrder: readingOrder
+            ),
+            container: CompositeContainer(containers)
+        )
+        let navigator = try EPUBNavigatorViewController(
+            publication: publication,
+            initialLocation: makeLocator(href: "chapter-1.xhtml", progression: 0),
+            config: .init(pageTurnStyle: .push)
+        )
+        let delegate = Delegate()
+        navigator.delegate = delegate
+        navigator.view.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        navigator.loadViewIfNeeded()
+        await navigator.initialized()
+
+        for _ in 0 ..< 100 where delegate.locationChangeCount == 0 {
+            await navigator.settlePageTurn()
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(delegate.locationChangeCount == 1)
+        return (navigator, delegate)
+    }
+
+    private func makeLocator(href: String, progression: Double) -> Locator {
+        Locator(
+            href: AnyURL(string: href)!,
+            mediaType: .xhtml,
+            locations: .init(progression: progression)
+        )
+    }
+
     private func waitUntil(
         _ condition: @escaping @MainActor () -> Bool
     ) async -> Bool {
@@ -247,5 +507,9 @@ private final class Delegate: EPUBNavigatorDelegate {
         presentationDidChange presentation: VisualNavigatorPresentation
     ) {
         presentationChangeCount += 1
+    }
+
+    func resetLocationChanges() {
+        locationChangeCount = 0
     }
 }
