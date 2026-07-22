@@ -36,13 +36,14 @@ final class EPUBPageTurnController {
     private enum State {
         case idle
         case tracking(PageTurnSession)
+        case restoring(PageTurnSession)
         case committing(PageTurnSession)
 
         var session: PageTurnSession? {
             switch self {
             case .idle:
                 return nil
-            case let .tracking(session), let .committing(session):
+            case let .tracking(session), let .restoring(session), let .committing(session):
                 return session
             }
         }
@@ -105,13 +106,14 @@ final class EPUBPageTurnController {
         case .idle:
             break
         case let .tracking(session):
+            state = .restoring(session)
             if restoreTask == nil {
                 restoreTask = Task { @MainActor in
                     await restore(session)
                 }
             }
             await waitUntilIdle()
-        case .committing:
+        case .restoring, .committing:
             await waitUntilIdle()
         }
 
