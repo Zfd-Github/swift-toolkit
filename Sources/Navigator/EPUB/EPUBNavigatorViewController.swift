@@ -1076,12 +1076,27 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         )
     }
 
-    func beginNonePan(to direction: EPUBSpreadView.Direction) -> Bool {
+    func shouldBeginNonePan() -> Bool {
         guard
             let paginationView,
+            paginationView.axis == .horizontalPaged,
             pageTurnInteractionPolicy(for: paginationView.axis).usesNonePan,
             nonePanSession == nil,
             state == .idle,
+            pageTurnController.isIdle,
+            currentSelection == nil,
+            !((paginationView.currentView as? EPUBSpreadView)?.hasActiveInteractivePointer ?? false),
+            (paginationView.currentView as? EPUBSpreadView)?.allowsPageTurn != false
+        else {
+            return false
+        }
+
+        return true
+    }
+
+    func beginNonePan(to direction: EPUBSpreadView.Direction) -> Bool {
+        guard
+            shouldBeginNonePan(),
             let session = beginPageTurn(to: direction)
         else {
             return false
@@ -1096,10 +1111,18 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         translationX: CGFloat,
         velocityX: CGFloat
     ) {
-        guard let session = nonePanSession else { return }
-
         switch state {
+        case .began:
+            guard let direction = EPUBPageTurnInteraction.direction(
+                for: CGPoint(x: velocityX, y: 0),
+                readingProgression: viewModel.readingProgression
+            ) else {
+                return
+            }
+            _ = beginNonePan(to: direction)
+
         case .changed:
+            guard let session = nonePanSession else { return }
             _ = pageTurnController.track(
                 session,
                 translationX: translationX,
@@ -1107,6 +1130,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             )
 
         case .ended:
+            guard let session = nonePanSession else { return }
             let shouldCommit = EPUBPageTurnInteraction.shouldCommit(
                 translationX: translationX,
                 viewportWidth: view.bounds.width,
@@ -1127,6 +1151,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
 
         case .cancelled, .failed:
+            guard let session = nonePanSession else { return }
             nonePanSession = nil
             finishPageTurn(session)
 
@@ -1913,24 +1938,15 @@ extension EPUBNavigatorViewController: UIGestureRecognizerDelegate {
         guard
             gestureRecognizer === nonePanGestureRecognizer,
             let panGestureRecognizer = gestureRecognizer as? UIPanGestureRecognizer,
-            let paginationView,
-            paginationView.axis == .horizontalPaged,
-            pageTurnInteractionPolicy(for: paginationView.axis).usesNonePan,
-            state == .idle,
-            pageTurnController.isIdle,
-            currentSelection == nil,
-            !((paginationView.currentView as? EPUBSpreadView)?.hasActiveInteractivePointer ?? false),
-            (paginationView.currentView as? EPUBSpreadView)?.allowsPageTurn != false,
-            let direction = EPUBPageTurnInteraction.direction(
+            EPUBPageTurnInteraction.direction(
                 for: panGestureRecognizer.velocity(in: view),
                 readingProgression: viewModel.readingProgression
-            ),
-            beginNonePan(to: direction)
+            ) != nil
         else {
             return false
         }
 
-        return true
+        return shouldBeginNonePan()
     }
 }
 
