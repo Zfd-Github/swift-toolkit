@@ -83,28 +83,32 @@ struct EPUBPageTurnControllerTests {
         ) == nil)
     }
 
-    @Test("interactive content keeps none pan blocked for its pointer lifetime")
-    func interactivePointerPolicy() {
-        var isActive = EPUBPageTurnInteraction.interactivePointerIsActive(
-            current: false,
-            phase: .down,
-            hasInteractiveElement: true
-        )
-        #expect(isActive)
+    @Test("interactive pointer IDs clear after target changes and remain isolated")
+    func interactivePointerPolicy() async throws {
+        let navigator = try await makeMountedNavigator(pageTurnStyle: .none)
+        let paginationView = try #require(currentPaginationView(in: navigator))
+        let spreadView = try #require(paginationView.currentView as? EPUBSpreadView)
 
-        isActive = EPUBPageTurnInteraction.interactivePointerIsActive(
-            current: isActive,
-            phase: .move,
-            hasInteractiveElement: false
-        )
-        #expect(isActive)
+        spreadView.updateInteractivePointerState(from: [
+            "pointerId": 1, "phase": "down", "interactiveElement": "<a>",
+        ])
+        spreadView.updateInteractivePointerState(from: [
+            "pointerId": 2, "phase": "down", "interactiveElement": "<video>",
+        ])
+        #expect(spreadView.hasActiveInteractivePointer)
 
-        isActive = EPUBPageTurnInteraction.interactivePointerIsActive(
-            current: isActive,
-            phase: .up,
-            hasInteractiveElement: true
-        )
-        #expect(!isActive)
+        spreadView.updateInteractivePointerState(from: [
+            "pointerId": 1, "phase": "move",
+        ])
+        spreadView.updateInteractivePointerState(from: [
+            "pointerId": 1, "phase": "up",
+        ])
+        #expect(spreadView.hasActiveInteractivePointer)
+
+        spreadView.updateInteractivePointerState(from: [
+            "pointerId": 2, "phase": "cancel",
+        ])
+        #expect(!spreadView.hasActiveInteractivePointer)
     }
 
     @Test("none pan commits at the exact distance or velocity threshold")
@@ -112,42 +116,158 @@ struct EPUBPageTurnControllerTests {
         #expect(!EPUBPageTurnInteraction.shouldCommit(
             translationX: 21.9,
             viewportWidth: 100,
-            velocityX: 0
+            velocityX: 0,
+            direction: .left,
+            readingProgression: .ltr
         ))
         #expect(EPUBPageTurnInteraction.shouldCommit(
             translationX: 22,
             viewportWidth: 100,
-            velocityX: 0
+            velocityX: 0,
+            direction: .left,
+            readingProgression: .ltr
         ))
         #expect(!EPUBPageTurnInteraction.shouldCommit(
             translationX: 0,
             viewportWidth: 100,
-            velocityX: 649
+            velocityX: 649,
+            direction: .left,
+            readingProgression: .ltr
         ))
         #expect(EPUBPageTurnInteraction.shouldCommit(
             translationX: 0,
             viewportWidth: 100,
-            velocityX: 650
+            velocityX: 650,
+            direction: .left,
+            readingProgression: .ltr
         ))
     }
 
-    @Test("none tracking records progress without moving the live view")
-    func nonePanTrackingDoesNotMoveView() throws {
-        let controller = EPUBPageTurnController(refreshCurrentLocation: {})
-        let session = try #require(controller.begin(to: .right))
-        let view = UIView(frame: CGRect(x: 10, y: 20, width: 100, height: 200))
-        view.transform = CGAffineTransform(scaleX: 0.9, y: 0.9)
-        let frame = view.frame
-        let transform = view.transform
+    @Test("none pan never commits after reversing away from its LTR or RTL session direction")
+    func nonePanReverseDirection() {
+        let cases: [(ReadiumNavigator.ReadingProgression, EPUBSpreadView.Direction, CGFloat)] = [
+            (.ltr, .right, 1),
+            (.ltr, .left, -1),
+            (.rtl, .right, -1),
+            (.rtl, .left, 1),
+        ]
 
-        let progress = try #require(
-            controller.track(session, translationX: 21.9, viewportWidth: 100)
+        for (readingProgression, direction, reverseSign) in cases {
+            #expect(!EPUBPageTurnInteraction.shouldCommit(
+                translationX: reverseSign * 22,
+                viewportWidth: 100,
+                velocityX: reverseSign * 650,
+                direction: direction,
+                readingProgression: readingProgression
+            ))
+        }
+    }
+
+    @Test("none changed handler tracks without moving the mounted pagination or spread")
+    func nonePanTrackingDoesNotMoveView() async throws {
+        let navigator = try await makeMountedNavigator(pageTurnStyle: .none)
+        let paginationView = try #require(currentPaginationView(in: navigator))
+        let spreadView = try #require(paginationView.currentView as? EPUBSpreadView)
+        let outerScrollView = try #require(
+            paginationView.subviews.compactMap { $0 as? UIScrollView }.first
         )
-        #expect(abs(progress - 0.219) < 0.0001)
+        let baseline = [paginationView, outerScrollView, spreadView, spreadView.scrollView]
+            .map { ($0.frame, $0.transform) }
+        let offsets = [outerScrollView.contentOffset, spreadView.scrollView.contentOffset]
 
-        #expect(view.frame == frame)
-        #expect(view.transform == transform)
-        #expect(controller.finish(session))
+        #expect(navigator.beginNonePan(to: .right))
+        navigator.handleNonePan(
+            state: .changed,
+            translationX: -100,
+            velocityX: -100
+        )
+
+        let current = [paginationView, outerScrollView, spreadView, spreadView.scrollView]
+            .map { ($0.frame, $0.transform) }
+        #expect(current.elementsEqual(baseline, by: ==))
+        #expect(outerScrollView.contentOffset == offsets[0])
+        #expect(spreadView.scrollView.contentOffset == offsets[1])
+
+        navigator.handleNonePan(state: .cancelled, translationX: 0, velocityX: 0)
+    }
+
+    @Test("mounted navigator reconfigures outer, spread, and none recognizers for runtime styles")
+    func mountedRuntimeInteractionPolicy() async throws {
+        let navigator = try await makeMountedNavigator(pageTurnStyle: .push)
+        let paginationView = try #require(currentPaginationView(in: navigator))
+        let spreadView = try #require(paginationView.currentView as? EPUBSpreadView)
+        let outerScrollView = try #require(
+            paginationView.subviews.compactMap { $0 as? UIScrollView }.first
+        )
+        let nonePan = try #require(
+            navigator.view.gestureRecognizers?.compactMap { $0 as? UIPanGestureRecognizer }.first
+        )
+
+        #expect(outerScrollView.panGestureRecognizer.isEnabled)
+        #expect(spreadView.scrollView.panGestureRecognizer.isEnabled)
+        #expect(!nonePan.isEnabled)
+
+        navigator.pageTurnStyle = .none
+        #expect(!outerScrollView.panGestureRecognizer.isEnabled)
+        #expect(!spreadView.scrollView.panGestureRecognizer.isEnabled)
+        #expect(nonePan.isEnabled)
+
+        navigator.pageTurnStyle = .simulation
+        #expect(!outerScrollView.panGestureRecognizer.isEnabled)
+        #expect(!spreadView.scrollView.panGestureRecognizer.isEnabled)
+        #expect(!nonePan.isEnabled)
+
+        navigator.pageTurnStyle = .push
+        #expect(outerScrollView.panGestureRecognizer.isEnabled)
+        #expect(spreadView.scrollView.panGestureRecognizer.isEnabled)
+        #expect(!nonePan.isEnabled)
+    }
+
+    @Test("mounted zoom and style or axis changes release none sessions safely")
+    func mountedZoomAndSessionReconfiguration() async throws {
+        let fixedNavigator = try await makeMountedNavigator(
+            layout: .fixed,
+            pageTurnStyle: .none
+        )
+        let fixedPagination = try #require(currentPaginationView(in: fixedNavigator))
+        let fixedSpread = try #require(fixedPagination.currentView as? EPUBFixedSpreadView)
+        fixedSpread.scrollView.minimumZoomScale = 1
+        fixedSpread.scrollView.maximumZoomScale = 3
+        fixedSpread.scrollView.zoomScale = 2
+        fixedSpread.scrollViewDidZoom(fixedSpread.scrollView)
+        #expect(!fixedSpread.allowsPageTurn)
+        #expect(fixedSpread.scrollView.panGestureRecognizer.isEnabled)
+
+        fixedSpread.scrollView.zoomScale = 1
+        fixedSpread.scrollViewDidZoom(fixedSpread.scrollView)
+        #expect(fixedSpread.allowsPageTurn)
+        #expect(!fixedSpread.scrollView.panGestureRecognizer.isEnabled)
+
+        let navigator = try await makeMountedNavigator(pageTurnStyle: .none)
+        #expect(navigator.beginNonePan(to: .right))
+        navigator.pageTurnStyle = .simulation
+        navigator.pageTurnStyle = .none
+        #expect(navigator.beginNonePan(to: .right))
+        navigator.handleNonePan(state: .cancelled, translationX: 0, velocityX: 0)
+
+        #expect(navigator.beginNonePan(to: .right))
+        let horizontalPagination = try #require(currentPaginationView(in: navigator))
+        let continuousPagination = PaginationView(
+            frame: navigator.view.bounds,
+            preloadPreviousPositionCount: 0,
+            preloadNextPositionCount: 0,
+            isScrollEnabled: true,
+            axis: .verticalContinuous
+        )
+        navigator.view.addSubview(continuousPagination)
+        navigator.updatePageTurnInteractionMode(for: continuousPagination)
+        let nonePan = try #require(
+            navigator.view.gestureRecognizers?.compactMap { $0 as? UIPanGestureRecognizer }.first
+        )
+        #expect(!nonePan.isEnabled)
+        navigator.updatePageTurnInteractionMode(for: horizontalPagination)
+        #expect(navigator.beginNonePan(to: .left))
+        navigator.handleNonePan(state: .cancelled, translationX: 0, velocityX: 0)
     }
 
     @Test("native horizontal pan is enabled only for effective push")
@@ -629,6 +749,39 @@ struct EPUBPageTurnControllerTests {
             initialLocation: initialLocation,
             config: config
         )
+    }
+
+    private func makeMountedNavigator(
+        layout: Layout? = nil,
+        pageTurnStyle: EPUBPageTurnStyle
+    ) async throws -> EPUBNavigatorViewController {
+        let link = Link(href: "chapter.xhtml", mediaType: .xhtml)
+        let publication = Publication(
+            manifest: Manifest(
+                metadata: Metadata(title: "Test", layout: layout),
+                readingOrder: [link]
+            ),
+            container: SingleResourceContainer(
+                resource: DataResource(string: "<html><body><p>Page</p></body></html>"),
+                at: link.url()
+            )
+        )
+        let navigator = try EPUBNavigatorViewController(
+            publication: publication,
+            initialLocation: nil,
+            config: .init(pageTurnStyle: pageTurnStyle)
+        )
+        navigator.view.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        navigator.loadViewIfNeeded()
+        await navigator.initialized()
+        navigator.view.layoutIfNeeded()
+        return navigator
+    }
+
+    private func currentPaginationView(
+        in navigator: EPUBNavigatorViewController
+    ) -> PaginationView? {
+        navigator.view.subviews.compactMap { $0 as? PaginationView }.last
     }
 
     private func makeLoadedNavigator() async throws -> (EPUBNavigatorViewController, Delegate) {

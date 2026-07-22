@@ -67,37 +67,71 @@ enum EPUBPageTurnInteraction {
 
     static func progress(
         translationX: CGFloat,
-        viewportWidth: CGFloat
+        viewportWidth: CGFloat,
+        direction: EPUBSpreadView.Direction,
+        readingProgression: ReadingProgression
     ) -> CGFloat {
         guard viewportWidth > 0 else { return 0 }
-        return abs(translationX) / viewportWidth
+        return signedHorizontalValue(
+            translationX,
+            direction: direction,
+            readingProgression: readingProgression
+        ) / viewportWidth
     }
 
     static func shouldCommit(
         translationX: CGFloat,
         viewportWidth: CGFloat,
-        velocityX: CGFloat
+        velocityX: CGFloat,
+        direction: EPUBSpreadView.Direction,
+        readingProgression: ReadingProgression
     ) -> Bool {
-        progress(translationX: translationX, viewportWidth: viewportWidth) >= 0.22
-            || abs(velocityX) >= 650
+        progress(
+            translationX: translationX,
+            viewportWidth: viewportWidth,
+            direction: direction,
+            readingProgression: readingProgression
+        ) >= 0.22
+            || signedHorizontalValue(
+                velocityX,
+                direction: direction,
+                readingProgression: readingProgression
+            ) >= 650
     }
 
-    static func interactivePointerIsActive(
-        current: Bool,
+    private static func signedHorizontalValue(
+        _ value: CGFloat,
+        direction: EPUBSpreadView.Direction,
+        readingProgression: ReadingProgression
+    ) -> CGFloat {
+        switch (direction, readingProgression) {
+        case (.left, .ltr), (.right, .rtl):
+            return value
+        case (.right, .ltr), (.left, .rtl):
+            return -value
+        }
+    }
+}
+
+struct EPUBInteractivePointerTracker {
+    private var activePointerIDs: Set<Int> = []
+
+    var hasActivePointer: Bool {
+        !activePointerIDs.isEmpty
+    }
+
+    mutating func receive(
+        pointerID: Int,
         phase: PointerEvent.Phase,
         hasInteractiveElement: Bool
-    ) -> Bool {
-        guard hasInteractiveElement else {
-            return current
-        }
-
+    ) {
         switch phase {
-        case .down:
-            return true
+        case .down where hasInteractiveElement:
+            activePointerIDs.insert(pointerID)
         case .up, .cancel:
-            return false
-        case .move:
-            return current
+            activePointerIDs.remove(pointerID)
+        case .down, .move:
+            break
         }
     }
 }
@@ -148,7 +182,8 @@ final class EPUBPageTurnController {
     func track(
         _ session: PageTurnSession,
         translationX: CGFloat,
-        viewportWidth: CGFloat
+        viewportWidth: CGFloat,
+        readingProgression: ReadingProgression
     ) -> CGFloat? {
         guard
             case let .tracking(activeSession, _) = state,
@@ -159,7 +194,9 @@ final class EPUBPageTurnController {
 
         let progress = EPUBPageTurnInteraction.progress(
             translationX: translationX,
-            viewportWidth: viewportWidth
+            viewportWidth: viewportWidth,
+            direction: session.direction,
+            readingProgression: readingProgression
         )
         state = .tracking(session, progress: progress)
         return progress

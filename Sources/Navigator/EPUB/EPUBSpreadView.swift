@@ -65,7 +65,10 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
     private var lastClick: ClickEvent?
 
-    private(set) var hasActiveInteractivePointer = false
+    private var interactivePointerTracker = EPUBInteractivePointerTracker()
+    var hasActiveInteractivePointer: Bool {
+        interactivePointerTracker.hasActivePointer
+    }
 
     /// If YES, the content will be faded in once loaded.
     let animatedLoad: Bool
@@ -262,13 +265,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             return
         }
 
-        if let phase = PointerEvent.Phase(json: json["phase"]) {
-            hasActiveInteractivePointer = EPUBPageTurnInteraction.interactivePointerIsActive(
-                current: hasActiveInteractivePointer,
-                phase: phase,
-                hasInteractiveElement: (json["interactiveElement"] as? String) != nil
-            )
-        }
+        updateInteractivePointerState(from: json)
 
         guard
             // FIXME: Really needed?
@@ -288,6 +285,21 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         }
 
         delegate?.spreadView(self, didReceive: event)
+    }
+
+    func updateInteractivePointerState(from json: [String: Any]) {
+        guard
+            let pointerID = json["pointerId"] as? Int,
+            let phase = PointerEvent.Phase(json: json["phase"])
+        else {
+            return
+        }
+
+        interactivePointerTracker.receive(
+            pointerID: pointerID,
+            phase: phase,
+            hasInteractiveElement: (json["interactiveElement"] as? String) != nil
+        )
     }
 
     /// Parses the target element JSON produced by `extractTargetElement()` in
