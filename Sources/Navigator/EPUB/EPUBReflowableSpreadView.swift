@@ -351,7 +351,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         // `contentOffset.x` is always non-negative. A relative displacement
         // (`offsetX`) is coordinate-system agnostic and works for both LTR and
         // RTL.
-        let behavior = options.animated ? "smooth" : "instant"
+        let behavior = Self.pageTurnScrollBehavior(options: options)
         await evaluateScript("window.scrollBy({ left: \(offsetX), behavior: '\(behavior)' });")
 
         if options.animated {
@@ -372,6 +372,10 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
 
         return true
+    }
+
+    static func pageTurnScrollBehavior(options: NavigatorGoOptions) -> String {
+        options.animated ? "smooth" : "instant"
     }
 
     private struct PendingLocation {

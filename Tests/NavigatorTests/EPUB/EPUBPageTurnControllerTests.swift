@@ -126,6 +126,47 @@ struct EPUBPageTurnControllerTests {
         }
     }
 
+    @Test("continuous pagination bypasses page-turn transactions and disables animation for accessibility")
+    func accessibleContinuousRouting() async throws {
+        let navigator = try makeNavigator()
+        navigator.pageTurnStyle = .push
+        let options = NavigatorGoOptions(
+            animated: true,
+            otherOptions: ["probe": .string("preserved")]
+        )
+        let accessibilityFlags = [
+            (isReduceMotionEnabled: true, isVoiceOverRunning: false),
+            (isReduceMotionEnabled: false, isVoiceOverRunning: true),
+        ]
+
+        for flags in accessibilityFlags {
+            var existingPathOptions: [NavigatorGoOptions] = []
+            var pageTurnCount = 0
+
+            let result = await navigator.routePageTurn(
+                to: .right,
+                options: options,
+                axis: .verticalContinuous,
+                isReduceMotionEnabled: flags.isReduceMotionEnabled,
+                isVoiceOverRunning: flags.isVoiceOverRunning,
+                usingExistingPath: { _, routedOptions in
+                    existingPathOptions.append(routedOptions)
+                    return true
+                },
+                usingPageTurn: { _, _ in
+                    pageTurnCount += 1
+                    return true
+                }
+            )
+
+            #expect(result)
+            #expect(existingPathOptions.count == 1)
+            #expect(existingPathOptions.first?.animated == false)
+            #expect(existingPathOptions.first?.otherOptions == options.otherOptions)
+            #expect(pageTurnCount == 0)
+        }
+    }
+
     @Test("production location publisher calculates each time but notifies a successful locator once")
     func productionLocationPublisherDeduplicates() async throws {
         let oldLocation = makeLocator(href: "old.xhtml", progression: 0)
@@ -171,6 +212,47 @@ struct EPUBPageTurnControllerTests {
         await navigator.settlePageTurn()
         #expect(delegate.locationChangeCount == 0)
         #expect(delegate.errorCount == 0)
+    }
+
+    @Test("same-resource push maps instant and animated navigation to WebView behavior")
+    func pushSameResourceWebViewBehavior() {
+        #expect(EPUBReflowableSpreadView.pageTurnScrollBehavior(options: .none) == "instant")
+        #expect(EPUBReflowableSpreadView.pageTurnScrollBehavior(options: .animated) == "smooth")
+    }
+
+    @Test("animated cross-resource push keeps a snapshot for the slide")
+    func pushCrossResourceAnimatedSnapshot() async throws {
+        let (navigator, _) = try await makeLoadedNavigator()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        window.rootViewController = navigator
+        window.isHidden = false
+        navigator.view.frame = window.bounds
+        navigator.view.layoutIfNeeded()
+        await Task.yield()
+
+        let paginationView = try #require(
+            navigator.view.subviews.compactMap { $0 as? PaginationView }.first
+        )
+        let baselineSubviewCount = paginationView.subviews.count
+        var didFinish = false
+        var moved = false
+        let turn = Task { @MainActor in
+            moved = await navigator.goForward(options: .animated)
+            didFinish = true
+        }
+
+        let observedSnapshot = await waitUntil {
+            paginationView.subviews.count > baselineSubviewCount
+        }
+        #expect(observedSnapshot)
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        #expect(paginationView.subviews.count > baselineSubviewCount)
+        #expect(!didFinish)
+
+        await turn.value
+        #expect(moved)
+        #expect(paginationView.subviews.count == baselineSubviewCount)
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-2.xhtml"))
     }
 
     @Test("a second page turn is rejected until the active session finishes")
