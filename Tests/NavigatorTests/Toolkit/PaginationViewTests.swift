@@ -365,6 +365,39 @@ struct PaginationViewTests {
         )
     }
 
+    @Test("native paging policy disables only horizontal user pan")
+    func nativePagingPolicy() throws {
+        let horizontal = PaginationView(
+            frame: CGRect(x: 0, y: 0, width: 320, height: 500),
+            preloadPreviousPositionCount: 0,
+            preloadNextPositionCount: 0,
+            isScrollEnabled: true
+        )
+        let horizontalScrollView = try #require(outerScrollView(in: horizontal))
+
+        horizontal.allowsNativeHorizontalPaging = false
+
+        #expect(horizontalScrollView.isScrollEnabled)
+        #expect(!horizontalScrollView.panGestureRecognizer.isEnabled)
+
+        horizontal.allowsNativeHorizontalPaging = true
+        #expect(horizontalScrollView.panGestureRecognizer.isEnabled)
+
+        let continuous = PaginationView(
+            frame: CGRect(x: 0, y: 0, width: 320, height: 500),
+            preloadPreviousPositionCount: 0,
+            preloadNextPositionCount: 0,
+            isScrollEnabled: true,
+            axis: .verticalContinuous
+        )
+        let continuousScrollView = try #require(outerScrollView(in: continuous))
+
+        continuous.allowsNativeHorizontalPaging = false
+
+        #expect(continuousScrollView.isScrollEnabled)
+        #expect(continuousScrollView.panGestureRecognizer.isEnabled)
+    }
+
     @Test("same-resource scrolling emits one throttled viewport update")
     func viewportUpdatesAreThrottled() async throws {
         let (paginationView, delegate) = await makePagination(pageCount: 1, currentIndex: 0)

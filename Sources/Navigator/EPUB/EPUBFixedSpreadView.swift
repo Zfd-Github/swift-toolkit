@@ -18,6 +18,32 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
 
     private static let fixedScript = loadScript(named: "readium-fixed")
 
+    override var allowsPageTurn: Bool {
+        Self.allowsPageTurn(
+            zoomScale: scrollView.zoomScale,
+            minimumZoomScale: scrollView.minimumZoomScale
+        )
+    }
+
+    static func allowsContentPan(
+        allowsNativeHorizontalPaging: Bool,
+        zoomScale: CGFloat,
+        minimumZoomScale: CGFloat
+    ) -> Bool {
+        allowsNativeHorizontalPaging
+            || !allowsPageTurn(
+                zoomScale: zoomScale,
+                minimumZoomScale: minimumZoomScale
+            )
+    }
+
+    static func allowsPageTurn(
+        zoomScale: CGFloat,
+        minimumZoomScale: CGFloat
+    ) -> Bool {
+        zoomScale <= minimumZoomScale
+    }
+
     required init(
         viewModel: EPUBNavigatorViewModel,
         spread: EPUBSpread,
@@ -60,6 +86,18 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
             // The publication's base URL is used to make sure we can access the resources through the iframe with JavaScript.
             webView.loadHTMLString(wrapperPage, baseURL: viewModel.publicationBaseURL.url)
         }
+    }
+
+    override func updateNativeHorizontalPaging() {
+        scrollView.panGestureRecognizer.isEnabled = Self.allowsContentPan(
+            allowsNativeHorizontalPaging: allowsNativeHorizontalPaging,
+            zoomScale: scrollView.zoomScale,
+            minimumZoomScale: scrollView.minimumZoomScale
+        )
+    }
+
+    override func scrollViewDidZoom(_ scrollView: UIScrollView) {
+        updateNativeHorizontalPaging()
     }
 
     override func layoutSubviews() {

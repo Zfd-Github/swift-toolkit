@@ -5,6 +5,7 @@
 //
 
 import Foundation
+import UIKit
 
 public enum EPUBPageTurnStyle: Sendable, Equatable {
     case simulation
@@ -26,6 +27,81 @@ extension EPUBPageTurnStyle {
     }
 }
 
+enum EPUBPageTurnInteraction {
+    struct Policy: Equatable {
+        let allowsNativeHorizontalPaging: Bool
+        let usesNonePan: Bool
+    }
+
+    static func policy(
+        axis: PaginationView.Axis,
+        style: EPUBPageTurnStyle
+    ) -> Policy {
+        guard axis == .horizontalPaged else {
+            return Policy(
+                allowsNativeHorizontalPaging: true,
+                usesNonePan: false
+            )
+        }
+        return Policy(
+            allowsNativeHorizontalPaging: style == .push,
+            usesNonePan: style == .none
+        )
+    }
+
+    static func direction(
+        for velocity: CGPoint,
+        readingProgression: ReadingProgression
+    ) -> EPUBSpreadView.Direction? {
+        guard abs(velocity.x) > abs(velocity.y), velocity.x != 0 else {
+            return nil
+        }
+
+        switch (velocity.x < 0, readingProgression) {
+        case (true, .ltr), (false, .rtl):
+            return .right
+        case (false, .ltr), (true, .rtl):
+            return .left
+        }
+    }
+
+    static func progress(
+        translationX: CGFloat,
+        viewportWidth: CGFloat
+    ) -> CGFloat {
+        guard viewportWidth > 0 else { return 0 }
+        return abs(translationX) / viewportWidth
+    }
+
+    static func shouldCommit(
+        translationX: CGFloat,
+        viewportWidth: CGFloat,
+        velocityX: CGFloat
+    ) -> Bool {
+        progress(translationX: translationX, viewportWidth: viewportWidth) >= 0.22
+            || abs(velocityX) >= 650
+    }
+
+    static func interactivePointerIsActive(
+        current: Bool,
+        phase: PointerEvent.Phase,
+        hasInteractiveElement: Bool
+    ) -> Bool {
+        guard hasInteractiveElement else {
+            return current
+        }
+
+        switch phase {
+        case .down:
+            return true
+        case .up, .cancel:
+            return false
+        case .move:
+            return current
+        }
+    }
+}
+
 struct PageTurnSession {
     let id = UUID()
     let direction: EPUBSpreadView.Direction
@@ -35,7 +111,7 @@ struct PageTurnSession {
 final class EPUBPageTurnController {
     private enum State {
         case idle
-        case tracking(PageTurnSession)
+        case tracking(PageTurnSession, progress: CGFloat)
         case restoring(PageTurnSession)
         case committing(PageTurnSession)
 
@@ -43,7 +119,7 @@ final class EPUBPageTurnController {
             switch self {
             case .idle:
                 return nil
-            case let .tracking(session), let .restoring(session), let .committing(session):
+            case let .tracking(session, _), let .restoring(session), let .committing(session):
                 return session
             }
         }
@@ -65,8 +141,28 @@ final class EPUBPageTurnController {
     func begin(to direction: EPUBSpreadView.Direction) -> PageTurnSession? {
         guard isIdle else { return nil }
         let session = PageTurnSession(direction: direction)
-        state = .tracking(session)
+        state = .tracking(session, progress: 0)
         return session
+    }
+
+    func track(
+        _ session: PageTurnSession,
+        translationX: CGFloat,
+        viewportWidth: CGFloat
+    ) -> CGFloat? {
+        guard
+            case let .tracking(activeSession, _) = state,
+            activeSession.id == session.id
+        else {
+            return nil
+        }
+
+        let progress = EPUBPageTurnInteraction.progress(
+            translationX: translationX,
+            viewportWidth: viewportWidth
+        )
+        state = .tracking(session, progress: progress)
+        return progress
     }
 
     func commit(
@@ -74,7 +170,7 @@ final class EPUBPageTurnController {
         operation: @escaping @MainActor () async -> Bool
     ) async -> Bool {
         guard
-            case let .tracking(activeSession) = state,
+            case let .tracking(activeSession, _) = state,
             activeSession.id == session.id
         else {
             return false
@@ -105,7 +201,7 @@ final class EPUBPageTurnController {
         switch state {
         case .idle:
             break
-        case let .tracking(session):
+        case let .tracking(session, _):
             state = .restoring(session)
             if restoreTask == nil {
                 restoreTask = Task { @MainActor in

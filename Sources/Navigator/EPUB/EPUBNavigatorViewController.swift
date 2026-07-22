@@ -261,7 +261,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private let readingOrder: [Link]
     public private(set) var currentLocation: Locator?
-    public var pageTurnStyle: EPUBPageTurnStyle
+    public var pageTurnStyle: EPUBPageTurnStyle {
+        didSet { updatePageTurnInteractionMode() }
+    }
     private let loadPositionsByReadingOrder: () async -> ReadResult<[[Locator]]>
     private var positionsByReadingOrder: [[Locator]] = []
 
@@ -436,6 +438,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         paginationView!.frame = view.bounds
         paginationView!.autoresizingMask = [.flexibleHeight, .flexibleWidth]
         view.addSubview(paginationView!)
+        view.addGestureRecognizer(nonePanGestureRecognizer)
+        updatePageTurnInteractionMode()
         updatePaginationContentInset()
 
         applySettings()
@@ -538,6 +542,19 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
     )
 
+    private lazy var nonePanGestureRecognizer: UIPanGestureRecognizer = {
+        let gestureRecognizer = UIPanGestureRecognizer(
+            target: self,
+            action: #selector(handleNonePan(_:))
+        )
+        gestureRecognizer.maximumNumberOfTouches = 1
+        gestureRecognizer.cancelsTouchesInView = false
+        gestureRecognizer.delegate = self
+        return gestureRecognizer
+    }()
+
+    private var nonePanSession: PageTurnSession?
+
     private func effectivePageTurnStyle(
         userStyle: EPUBPageTurnStyle,
         isReduceMotionEnabled: Bool,
@@ -596,7 +613,25 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private func finishPageTurn(_ session: PageTurnSession) {
         guard pageTurnController.finish(session) else { return }
+        if nonePanSession?.id == session.id {
+            nonePanSession = nil
+        }
         on(.moved)
+    }
+
+    private func commitPageTurn(
+        _ session: PageTurnSession,
+        to direction: EPUBSpreadView.Direction,
+        options: NavigatorGoOptions
+    ) async -> Bool {
+        await pageTurnController.commit(session) { [self] in
+            defer { finishPageTurn(session) }
+            let moved = await performPageTurn(to: direction, options: options)
+            if moved {
+                await publishCurrentLocation()
+            }
+            return moved
+        }
     }
 
     private func runPageTurn(
@@ -609,14 +644,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return false
         }
 
-        return await pageTurnController.commit(session) { [self] in
-            defer { finishPageTurn(session) }
-            let moved = await performPageTurn(to: direction, options: options)
-            if moved {
-                await publishCurrentLocation()
-            }
-            return moved
-        }
+        return await commitPageTurn(session, to: direction, options: options)
     }
 
     private func goUsingExistingPath(
@@ -748,6 +776,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             isScrollEnabled: isPaginationViewScrollingEnabled(for: axis),
             axis: axis
         )
+        view.allowsNativeHorizontalPaging = pageTurnInteractionPolicy(for: axis)
+            .allowsNativeHorizontalPaging
         view.delegate = self
         view.backgroundColor = .clear
         return view
@@ -784,6 +814,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
         if let paginationView {
             paginationView.isScrollEnabled = isPaginationViewScrollingEnabled(for: paginationView.axis)
+            updatePageTurnInteractionMode()
         }
         reloadSpreads()
     }
@@ -934,6 +965,67 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private func isPaginationViewScrollingEnabled(for axis: PaginationView.Axis) -> Bool {
         axis == .verticalContinuous
             || !(config.disablePageTurnsWhileScrolling && settings.scroll)
+    }
+
+    private func pageTurnInteractionPolicy(
+        for axis: PaginationView.Axis
+    ) -> EPUBPageTurnInteraction.Policy {
+        let style = effectivePageTurnStyle(
+            userStyle: pageTurnStyle,
+            isReduceMotionEnabled: UIAccessibility.isReduceMotionEnabled,
+            isVoiceOverRunning: UIAccessibility.isVoiceOverRunning
+        )
+        return EPUBPageTurnInteraction.policy(axis: axis, style: style)
+    }
+
+    private func updatePageTurnInteractionMode() {
+        guard let paginationView else { return }
+        let policy = pageTurnInteractionPolicy(for: paginationView.axis)
+        paginationView.allowsNativeHorizontalPaging = policy.allowsNativeHorizontalPaging
+        for view in paginationView.loadedViews.values {
+            (view as? EPUBSpreadView)?.allowsNativeHorizontalPaging = policy.allowsNativeHorizontalPaging
+        }
+        nonePanGestureRecognizer.isEnabled = policy.usesNonePan
+    }
+
+    @objc private func handleNonePan(_ gestureRecognizer: UIPanGestureRecognizer) {
+        guard let session = nonePanSession else { return }
+
+        switch gestureRecognizer.state {
+        case .changed:
+            _ = pageTurnController.track(
+                session,
+                translationX: gestureRecognizer.translation(in: view).x,
+                viewportWidth: view.bounds.width
+            )
+
+        case .ended:
+            let shouldCommit = EPUBPageTurnInteraction.shouldCommit(
+                translationX: gestureRecognizer.translation(in: view).x,
+                viewportWidth: view.bounds.width,
+                velocityX: gestureRecognizer.velocity(in: view).x
+            )
+            nonePanSession = nil
+            if shouldCommit {
+                Task { [weak self] in
+                    guard let self else { return }
+                    _ = await commitPageTurn(
+                        session,
+                        to: session.direction,
+                        options: .none
+                    )
+                }
+            } else {
+                finishPageTurn(session)
+            }
+
+        case .cancelled, .failed:
+            nonePanSession = nil
+            finishPageTurn(session)
+
+        default:
+            break
+        }
     }
 
     public var presentation: VisualNavigatorPresentation {
@@ -1313,6 +1405,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         view.backgroundColor = settings.effectiveBackgroundColor.uiColor
         if let paginationView {
             paginationView.isScrollEnabled = isPaginationViewScrollingEnabled(for: paginationView.axis)
+            updatePageTurnInteractionMode()
         }
         updatePaginationContentInset()
     }
@@ -1706,6 +1799,35 @@ extension EPUBNavigatorViewController: EditingActionsControllerDelegate {
     }
 }
 
+extension EPUBNavigatorViewController: UIGestureRecognizerDelegate {
+    public func gestureRecognizerShouldBegin(
+        _ gestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        guard
+            gestureRecognizer === nonePanGestureRecognizer,
+            let panGestureRecognizer = gestureRecognizer as? UIPanGestureRecognizer,
+            let paginationView,
+            paginationView.axis == .horizontalPaged,
+            pageTurnInteractionPolicy(for: paginationView.axis).usesNonePan,
+            state == .idle,
+            pageTurnController.isIdle,
+            currentSelection == nil,
+            !((paginationView.currentView as? EPUBSpreadView)?.hasActiveInteractivePointer ?? false),
+            (paginationView.currentView as? EPUBSpreadView)?.allowsPageTurn != false,
+            let direction = EPUBPageTurnInteraction.direction(
+                for: panGestureRecognizer.velocity(in: view),
+                readingProgression: viewModel.readingProgression
+            ),
+            let session = beginPageTurn(to: direction)
+        else {
+            return false
+        }
+
+        nonePanSession = session
+        return true
+    }
+}
+
 extension EPUBNavigatorViewController: PaginationViewDelegate {
     func paginationView(_ paginationView: PaginationView, pageViewAtIndex index: Int) -> (UIView & PageView)? {
         let spread = spreads[index]
@@ -1717,6 +1839,7 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
             animatedLoad: false
         )
         spreadView.delegate = self
+        spreadView.allowsNativeHorizontalPaging = paginationView.allowsNativeHorizontalPaging
 
         if let spreadView = spreadView as? EPUBReflowableSpreadView {
             spreadView.contentHeightDidChange = { [weak paginationView, weak spreadView] height in

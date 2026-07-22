@@ -55,9 +55,17 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     let spread: EPUBSpread
     private(set) var focusedResource: ReadingOrder.Index?
 
+    var allowsNativeHorizontalPaging = true {
+        didSet { updateNativeHorizontalPaging() }
+    }
+
+    var allowsPageTurn: Bool { true }
+
     let webView: WebView
 
     private var lastClick: ClickEvent?
+
+    private(set) var hasActiveInteractivePointer = false
 
     /// If YES, the content will be faded in once loaded.
     let animatedLoad: Bool
@@ -160,6 +168,10 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         scrollView.delegate = self
     }
 
+    func updateNativeHorizontalPaging() {}
+
+    func scrollViewDidZoom(_ scrollView: UIScrollView) {}
+
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
@@ -246,8 +258,19 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
     /// Called from the JS code when receiving a pointer event.
     private func didReceivePointerEvent(_ data: Any) {
+        guard let json = data as? [String: Any] else {
+            return
+        }
+
+        if let phase = PointerEvent.Phase(json: json["phase"]) {
+            hasActiveInteractivePointer = EPUBPageTurnInteraction.interactivePointerIsActive(
+                current: hasActiveInteractivePointer,
+                phase: phase,
+                hasInteractiveElement: (json["interactiveElement"] as? String) != nil
+            )
+        }
+
         guard
-            let json = data as? [String: Any],
             // FIXME: Really needed?
             let defaultPrevented = json["defaultPrevented"] as? Bool,
             !defaultPrevented,

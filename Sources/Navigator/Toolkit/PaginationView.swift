@@ -204,7 +204,12 @@ final class PaginationView: UIView, Loggable {
 
     /// Allows the scroll view to scroll.
     var isScrollEnabled: Bool {
-        didSet { scrollView.isScrollEnabled = isScrollEnabled }
+        didSet { restoreScrollInteraction() }
+    }
+
+    /// Allows the user to drive horizontal paging with the native scroll view pan.
+    var allowsNativeHorizontalPaging = true {
+        didSet { restoreScrollInteraction() }
     }
 
     init(
@@ -227,7 +232,7 @@ final class PaginationView: UIView, Loggable {
         scrollView.isPagingEnabled = axis == .horizontalPaged
         scrollView.bounces = false
         scrollView.showsHorizontalScrollIndicator = false
-        scrollView.isScrollEnabled = isScrollEnabled
+        restoreScrollInteraction()
         addSubview(scrollView)
 
         // Adds an empty view before the scroll view to have a consistent behavior on all iOS
@@ -956,7 +961,7 @@ final class PaginationView: UIView, Loggable {
         defer {
             snapshot?.removeFromSuperview()
             isAnimatingContentOffset = false
-            scrollView.isScrollEnabled = isScrollEnabled
+            restoreScrollInteraction()
         }
 
         setCurrentIndex(index, location: location)
@@ -1000,7 +1005,7 @@ final class PaginationView: UIView, Loggable {
             return
         }
 
-        scrollView.isScrollEnabled = isScrollEnabled
+        restoreScrollInteraction()
         setCurrentIndex(index, location: location)
 
         scrollView.scrollRectToVisible(CGRect(
@@ -1027,6 +1032,12 @@ final class PaginationView: UIView, Loggable {
             animations()
         }
     }
+
+    private func restoreScrollInteraction() {
+        scrollView.isScrollEnabled = isScrollEnabled
+        scrollView.panGestureRecognizer.isEnabled = isScrollEnabled
+            && (axis != .horizontalPaged || allowsNativeHorizontalPaging)
+    }
 }
 
 extension PaginationView: UIScrollViewDelegate {
@@ -1042,12 +1053,12 @@ extension PaginationView: UIScrollViewDelegate {
     }
 
     func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
-        scrollView.isScrollEnabled = isScrollEnabled
+        restoreScrollInteraction()
     }
 
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
         if !decelerate {
-            scrollView.isScrollEnabled = isScrollEnabled
+            restoreScrollInteraction()
         }
     }
 
@@ -1059,7 +1070,7 @@ extension PaginationView: UIScrollViewDelegate {
         // that window it could call setCurrentIndex with a stale offset, so we bail out.
         guard !isAnimatingContentOffset else { return }
 
-        scrollView.isScrollEnabled = isScrollEnabled
+        restoreScrollInteraction()
 
         let currentOffset = (readingProgression == .rtl)
             ? scrollView.contentSize.width - (scrollView.contentOffset.x + scrollView.frame.width)

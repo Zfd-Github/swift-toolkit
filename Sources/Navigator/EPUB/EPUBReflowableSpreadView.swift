@@ -123,9 +123,15 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private func updateContinuousScrolling() {
         let isContinuous = viewModel.scroll && !viewModel.verticalText
         scrollView.isScrollEnabled = !isContinuous
+        updateNativeHorizontalPaging()
         if isContinuous {
             scrollView.contentOffset = .zero
         }
+    }
+
+    override func updateNativeHorizontalPaging() {
+        scrollView.panGestureRecognizer.isEnabled = !usesContinuousOuterScroll
+            && allowsNativeHorizontalPaging
     }
 
     override func convertPointToNavigatorSpace(_ point: CGPoint) -> CGPoint {
