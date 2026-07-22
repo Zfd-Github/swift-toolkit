@@ -291,29 +291,32 @@ struct EPUBPageTurnControllerTests {
         #expect(rootPanRecognizers(in: navigator).isEmpty)
 
         status.isReduceMotionEnabled = true
-        notificationCenter.post(
-            name: UIAccessibility.reduceMotionStatusDidChangeNotification,
-            object: nil
+        await postFromBackground(
+            UIAccessibility.reduceMotionStatusDidChangeNotification,
+            to: notificationCenter
         )
         #expect(!outerScrollView.panGestureRecognizer.isEnabled)
         #expect(rootPanRecognizers(in: navigator).count == 1)
+        #expect(status.wereAllReadsOnMainThread)
 
         status.isReduceMotionEnabled = false
         status.isVoiceOverRunning = true
-        notificationCenter.post(
-            name: UIAccessibility.voiceOverStatusDidChangeNotification,
-            object: nil
+        await postFromBackground(
+            UIAccessibility.voiceOverStatusDidChangeNotification,
+            to: notificationCenter
         )
         #expect(!outerScrollView.panGestureRecognizer.isEnabled)
         #expect(rootPanRecognizers(in: navigator).count == 1)
+        #expect(status.wereAllReadsOnMainThread)
 
         status.isVoiceOverRunning = false
-        notificationCenter.post(
-            name: UIAccessibility.voiceOverStatusDidChangeNotification,
-            object: nil
+        await postFromBackground(
+            UIAccessibility.voiceOverStatusDidChangeNotification,
+            to: notificationCenter
         )
         #expect(outerScrollView.panGestureRecognizer.isEnabled)
         #expect(rootPanRecognizers(in: navigator).isEmpty)
+        #expect(status.wereAllReadsOnMainThread)
 
         navigator.pageTurnStyle = .simulation
         #expect(rootPanRecognizers(in: navigator).isEmpty)
@@ -362,9 +365,54 @@ struct EPUBPageTurnControllerTests {
         #expect(controller.isIdle)
     }
 
+    @Test("accessibility invalidation does not finish an in-flight restore")
+    func accessibilityChangeWaitsForRestore() async throws {
+        let restoreGate = Gate()
+        var refreshCount = 0
+        var restoreStarted = false
+        var settleFinished = false
+        var restoreSession: PageTurnSession?
+        let controller = EPUBPageTurnController {
+            refreshCount += 1
+        }
+        let session = try #require(controller.begin(to: .right, readingProgression: .ltr))
+
+        let settleTask = Task { @MainActor in
+            await controller.settle { restoringSession in
+                restoreSession = restoringSession
+                restoreStarted = true
+                await restoreGate.wait()
+                _ = controller.finish(restoringSession)
+            }
+            settleFinished = true
+        }
+
+        #expect(await waitUntil { restoreStarted })
+        #expect(controller.invalidatePreCommitSession() == nil)
+        #expect(!controller.isIdle)
+        await Task.yield()
+        #expect(!settleFinished)
+        #expect(refreshCount == 0)
+
+        var lateCommitCount = 0
+        let committed = await controller.commit(session) {
+            lateCommitCount += 1
+            return true
+        }
+        #expect(!committed)
+        #expect(lateCommitCount == 0)
+
+        restoreGate.open()
+        await settleTask.value
+        #expect(restoreSession?.id == session.id)
+        #expect(settleFinished)
+        #expect(refreshCount == 1)
+        #expect(controller.isIdle)
+    }
+
     @Test("accessibility observers do not retain the navigator after deinit")
     func accessibilityObserversReleaseNavigator() async throws {
-        let notificationCenter = NotificationCenter()
+        let notificationCenter = ObserverRemovalTrackingNotificationCenter()
         let status = AccessibilityStatusBox()
         weak var weakNavigator: EPUBNavigatorViewController?
 
@@ -377,6 +425,7 @@ struct EPUBPageTurnControllerTests {
         }
 
         #expect(await waitUntil { weakNavigator == nil })
+        #expect(notificationCenter.removeObserverCount == 3)
         notificationCenter.post(
             name: UIAccessibility.reduceMotionStatusDidChangeNotification,
             object: nil
@@ -934,10 +983,7 @@ struct EPUBPageTurnControllerTests {
             config: .init(),
             notificationCenter: notificationCenter,
             accessibilityStatusProvider: {
-                (
-                    accessibilityStatus.isReduceMotionEnabled,
-                    accessibilityStatus.isVoiceOverRunning
-                )
+                accessibilityStatus.read()
             }
         )
     }
@@ -968,10 +1014,7 @@ struct EPUBPageTurnControllerTests {
                 config: config,
                 notificationCenter: notificationCenter,
                 accessibilityStatusProvider: {
-                    (
-                        accessibilityStatus.isReduceMotionEnabled,
-                        accessibilityStatus.isVoiceOverRunning
-                    )
+                    accessibilityStatus.read()
                 }
             )
         } else {
@@ -1058,12 +1101,39 @@ struct EPUBPageTurnControllerTests {
         }
         return condition()
     }
+
+    private func postFromBackground(
+        _ name: Notification.Name,
+        to notificationCenter: NotificationCenter
+    ) async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                notificationCenter.post(name: name, object: nil)
+                continuation.resume()
+            }
+        }
+    }
 }
 
 @MainActor
 private final class AccessibilityStatusBox {
     var isReduceMotionEnabled = false
     var isVoiceOverRunning = false
+    private(set) var wereAllReadsOnMainThread = true
+
+    func read() -> (isReduceMotionEnabled: Bool, isVoiceOverRunning: Bool) {
+        wereAllReadsOnMainThread = wereAllReadsOnMainThread && Thread.isMainThread
+        return (isReduceMotionEnabled, isVoiceOverRunning)
+    }
+}
+
+private final class ObserverRemovalTrackingNotificationCenter: NotificationCenter, @unchecked Sendable {
+    private(set) var removeObserverCount = 0
+
+    override func removeObserver(_ observer: Any) {
+        removeObserverCount += 1
+        super.removeObserver(observer)
+    }
 }
 
 @MainActor

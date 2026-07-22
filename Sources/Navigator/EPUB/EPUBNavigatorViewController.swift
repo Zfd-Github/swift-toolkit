@@ -269,6 +269,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private let viewModel: EPUBNavigatorViewModel
     private let notificationCenter: NotificationCenter
+    private var accessibilityObserverTokens: [NSObjectProtocol] = []
     private let accessibilityStatusProvider: @MainActor () -> (
         isReduceMotionEnabled: Bool,
         isVoiceOverRunning: Bool
@@ -420,19 +421,20 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             object: nil
         )
 
-        notificationCenter.addObserver(
-            self,
-            selector: #selector(accessibilityStatusDidChange),
-            name: UIAccessibility.reduceMotionStatusDidChangeNotification,
-            object: nil
-        )
-
-        notificationCenter.addObserver(
-            self,
-            selector: #selector(accessibilityStatusDidChange),
-            name: UIAccessibility.voiceOverStatusDidChangeNotification,
-            object: nil
-        )
+        accessibilityObserverTokens = [
+            UIAccessibility.reduceMotionStatusDidChangeNotification,
+            UIAccessibility.voiceOverStatusDidChangeNotification,
+        ].map { name in
+            notificationCenter.addObserver(
+                forName: name,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.accessibilityStatusDidChange()
+                }
+            }
+        }
     }
 
     @available(*, unavailable)
@@ -442,6 +444,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     deinit {
         viewportPropagationTask?.cancel()
+        accessibilityObserverTokens.forEach(notificationCenter.removeObserver)
         notificationCenter.removeObserver(self)
     }
 
@@ -1035,7 +1038,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return EPUBPageTurnInteraction.policy(axis: axis, style: style)
     }
 
-    @objc private func accessibilityStatusDidChange() {
+    private func accessibilityStatusDidChange() {
         if let session = pageTurnController.invalidatePreCommitSession() {
             if nonePanSession?.id == session.id {
                 nonePanSession = nil
