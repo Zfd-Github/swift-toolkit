@@ -581,21 +581,21 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func performPageTurn(
-        to direction: EPUBSpreadView.Direction,
+        _ session: PageTurnSession,
         options: NavigatorGoOptions
     ) async -> Bool {
         guard let paginationView else { return false }
 
         if
             let spreadView = paginationView.currentView as? EPUBSpreadView,
-            await spreadView.go(to: direction, options: options)
+            await spreadView.go(to: session.direction, options: options)
         {
             return true
         }
 
-        let isRTL = (viewModel.readingProgression == .rtl)
+        let isRTL = (session.readingProgression == .rtl)
         let delta = isRTL ? -1 : 1
-        switch direction {
+        switch session.direction {
         case .left:
             let location: PageLocation = isRTL ? .start : .end
             return await paginationView.goToIndex(
@@ -623,12 +623,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private func commitPageTurn(
         _ session: PageTurnSession,
-        to direction: EPUBSpreadView.Direction,
         options: NavigatorGoOptions
     ) async -> Bool {
         await pageTurnController.commit(session) { [self] in
             defer { finishPageTurn(session) }
-            let moved = await performPageTurn(to: direction, options: options)
+            let moved = await performPageTurn(session, options: options)
             if moved {
                 await publishCurrentLocation()
             }
@@ -646,7 +645,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return false
         }
 
-        return await commitPageTurn(session, to: direction, options: options)
+        return await commitPageTurn(session, options: options)
     }
 
     private func goUsingExistingPath(
@@ -1051,7 +1050,6 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                     guard let self else { return }
                     _ = await commitPageTurn(
                         session,
-                        to: session.direction,
                         options: .none
                     )
                 }

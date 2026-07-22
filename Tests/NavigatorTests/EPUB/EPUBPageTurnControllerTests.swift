@@ -190,6 +190,26 @@ struct EPUBPageTurnControllerTests {
         ))
     }
 
+    @Test("none cross-resource handoff keeps the session reading progression")
+    func noneCrossResourceHandoffSnapshotsReadingProgression() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(pageTurnStyle: .none)
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-1.xhtml"))
+        #expect(navigator.beginNonePan(to: .right))
+
+        navigator.submitPreferences(EPUBPreferences(readingProgression: .rtl))
+        navigator.handleNonePan(
+            state: .ended,
+            translationX: -100,
+            velocityX: -700
+        )
+
+        #expect(await waitUntil {
+            self.currentPaginationView(in: navigator)?.currentIndex == 1
+        })
+        await navigator.settlePageTurn()
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-2.xhtml"))
+    }
+
     @Test("none changed handler tracks without moving the mounted pagination or spread")
     func nonePanTrackingDoesNotMoveView() async throws {
         let navigator = try await makeMountedNavigator(pageTurnStyle: .none)
@@ -830,7 +850,9 @@ struct EPUBPageTurnControllerTests {
         navigator.view.gestureRecognizers?.compactMap { $0 as? UIPanGestureRecognizer } ?? []
     }
 
-    private func makeLoadedNavigator() async throws -> (EPUBNavigatorViewController, Delegate) {
+    private func makeLoadedNavigator(
+        pageTurnStyle: EPUBPageTurnStyle = .push
+    ) async throws -> (EPUBNavigatorViewController, Delegate) {
         let readingOrder = [
             Link(href: "chapter-1.xhtml", mediaType: .xhtml),
             Link(href: "chapter-2.xhtml", mediaType: .xhtml),
@@ -851,7 +873,7 @@ struct EPUBPageTurnControllerTests {
         let navigator = try EPUBNavigatorViewController(
             publication: publication,
             initialLocation: makeLocator(href: "chapter-1.xhtml", progression: 0),
-            config: .init(pageTurnStyle: .push)
+            config: .init(pageTurnStyle: pageTurnStyle)
         )
         let delegate = Delegate()
         navigator.delegate = delegate
