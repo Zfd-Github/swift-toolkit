@@ -340,6 +340,21 @@ final class EPUBPageTurnSurfaceAnimator {
         }
     }
 
+    /// Keeps the original-page snapshot above the live reader while a cancelled
+    /// turn is waiting for an exact recovery.
+    func retainCurrentSurfaceForSafety() {
+        guard
+            let rootView = rootViewProvider(),
+            currentView.superview === rootView.superview
+        else {
+            return
+        }
+        currentView.transform = .identity
+        currentView.frame = rootView.frame
+        targetView?.isHidden = true
+        currentView.superview?.bringSubviewToFront(currentView)
+    }
+
     func animate(to progress: CGFloat, duration: TimeInterval) async {
         await withCheckedContinuation { continuation in
             UIView.animate(
@@ -608,6 +623,27 @@ final class EPUBPageTurnController {
         }
 
         await refreshCurrentLocation()
+    }
+
+    func settleRecovering(
+        _ recovering: @escaping @MainActor (PageTurnSession) async -> Bool
+    ) async {
+        switch state {
+        case .idle:
+            break
+        case let .tracking(session, _):
+            state = .settling(session)
+            let restored = await recovering(session)
+            if restored, isTracking(session) {
+                _ = finish(session)
+            }
+        case .settling, .restoring, .committing:
+            await waitUntilIdle()
+        }
+
+        if isIdle {
+            await refreshCurrentLocation()
+        }
     }
 
     private func waitUntilIdle() async {

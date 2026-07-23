@@ -2438,23 +2438,57 @@ struct EPUBPageTurnControllerTests {
             velocityX: 0
         )
 
-        #expect(await waitUntil { navigator.isPageTurnIdleForTesting })
+        #expect(await waitUntil {
+            navigationCount == 3 && !navigator.isPageTurnControllerIdleForTesting
+        })
         #expect(navigationCount == 3)
         #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-1.xhtml"))
         #expect(delegate.locationChangeCount == 0)
-        #expect(pageTurnSurfaces(in: container).isEmpty)
+        #expect(!pageTurnSurfaces(in: container).isEmpty)
+        #expect(!navigator.canBeginPageTurnPanForTesting())
+    }
+
+    @Test("unrestorable cancellation retains the original surface over a real target pagination")
+    func unrecoverableCancellationKeepsTargetPaginationCovered() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .cover)
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = SnapshotObservingView(frame: container.bounds)
+        navigator.view.frame = root.bounds
+        root.addSubview(navigator.view)
+        container.addSubview(root)
+        delegate.pageTurnRootView = root
+        let original = try #require(navigator.currentLocation)
+        delegate.resetLocationChanges()
+        var preparedRestoreAttempts = 0
+        navigator.pageTurnPreparedPageRestoreForTesting = {
+            preparedRestoreAttempts += 1
+            return false
+        }
+        navigator.pageTurnOriginalLocationRestoreForTesting = { false }
 
         navigator.handlePageTurnPanForTesting(
             state: .began,
             translationX: 0,
             velocityX: -700
         )
-        #expect(!navigator.isPageTurnControllerIdleForTesting)
+        #expect(await waitUntil {
+            currentPaginationView(in: navigator)?.currentIndex == 1
+                && navigator.pageTurnSurfaceTransactionEvidenceForTesting.hasPreparedTarget
+        })
         navigator.handlePageTurnPanForTesting(
             state: .cancelled,
             translationX: 0,
             velocityX: 0
         )
+        await navigator.settlePageTurn()
+
+        #expect(preparedRestoreAttempts == 4)
+        #expect(currentPaginationView(in: navigator)?.currentIndex == 1)
+        #expect(navigator.currentLocation == original)
+        #expect(delegate.locationChangeCount == 0)
+        #expect(delegate.previews.last?.0 == original)
+        #expect(!pageTurnSurfaces(in: container).isEmpty)
+        #expect(!navigator.canBeginPageTurnPanForTesting())
     }
 
     @Test("irreversible surface commit reports publication failure and clears preview")
