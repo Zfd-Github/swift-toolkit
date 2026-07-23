@@ -504,6 +504,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
     }
 
+    override open func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        if
+            pageTurnTransaction?.isRunning == false,
+            !pageTurnController.isIdle
+        {
+            pageTurnSurfaceAnimator?.retainCurrentSurfaceForSafety()
+        }
+    }
+
     private var isActive = true
 
     @objc private func willResignActive() {
@@ -819,6 +829,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     )?
     var pageTurnDisplayFrameWaiterForTesting: (() async -> Void)?
     var pageTurnWillValidateCommitForTesting: (() -> Void)?
+    var pageTurnPreparedPageRestoreForTesting: (() async -> Bool)?
+    var pageTurnOriginalLocationRestoreForTesting: (() async -> Bool)?
     private var coldPageTurnTargetIndexForTesting: Int?
     private var isColdPageTurnArmedForTesting = false
     private var didBeginWithColdTargetForTesting = false
@@ -1131,7 +1143,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 transaction.session
             )
             if !restored {
-                await owner.releaseFailedPageTurnRestore(
+                _ = await owner.releaseFailedPageTurnRestore(
                     transaction.session
                 )
             }
@@ -1139,7 +1151,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         transaction.complete(with: result)
-        if owner.pageTurnTransaction === transaction {
+        if
+            owner.pageTurnTransaction === transaction,
+            owner.pageTurnController.isIdle
+        {
             owner.pageTurnTransaction = nil
             owner.resumePendingPageTurnGesture()
         }
@@ -1409,23 +1424,27 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 await animator?.animate(to: 0, duration: 0.18)
                 var restored = true
                 if pageTurnSurfaceDidPrepareTarget {
-                    let inverse = PageTurnSession(
-                        direction: session.direction == .left ? .right : .left,
-                        readingProgression: session.readingProgression
-                    )
-                    restored = await pageTurnController.restorePreparedPage(
-                        inverse: { [self] in
-                            await performPageTurn(inverse, options: .none)
-                        },
-                        validateOriginalLocation: { [self] in
-                            await waitForStablePageTurnLiveView(
-                                at: pageTurnSurfaceOriginalPreview?.location
-                            )
-                        },
-                        originalLocation: { [self] in
-                            await restorePageTurnOriginalLocation()
-                        }
-                    )
+                    if let pageTurnPreparedPageRestoreForTesting {
+                        restored = await pageTurnPreparedPageRestoreForTesting()
+                    } else {
+                        let inverse = PageTurnSession(
+                            direction: session.direction == .left ? .right : .left,
+                            readingProgression: session.readingProgression
+                        )
+                        restored = await pageTurnController.restorePreparedPage(
+                            inverse: { [self] in
+                                await performPageTurn(inverse, options: .none)
+                            },
+                            validateOriginalLocation: { [self] in
+                                await waitForStablePageTurnLiveView(
+                                    at: pageTurnSurfaceOriginalPreview?.location
+                                )
+                            },
+                            originalLocation: { [self] in
+                                await restorePageTurnOriginalLocation()
+                            }
+                        )
+                    }
                     if !restored {
                         log(.error, "Failed to restore the original page-turn location.")
                     }
@@ -1456,12 +1475,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private func cancelPageTurnSurface(_ session: PageTurnSession) async -> Bool {
         if !(await restorePageTurnSurface(session)) {
-            await releaseFailedPageTurnRestore(session)
+            _ = await releaseFailedPageTurnRestore(session)
         }
         return false
     }
 
     private func restorePageTurnOriginalLocation() async -> Bool {
+        if let pageTurnOriginalLocationRestoreForTesting {
+            return await pageTurnOriginalLocationRestoreForTesting()
+        }
         guard
             let originalLocation = pageTurnSurfaceOriginalPreview?.location,
             let paginationView,
@@ -1520,6 +1542,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         pendingPageTurnGesture = nil
         guard !pageTurnController.isCommitting else { return }
         guard let transaction = pageTurnTransaction else {
+            if !pageTurnController.isIdle, pageTurnSurfaceAnimator != nil {
+                pageTurnSurfaceAnimator?.retainCurrentSurfaceForSafety()
+                return
+            }
             guard
                 let session = pageTurnController.activeSession,
                 pageTurnController.invalidatePreCommitSession()?.id == session.id
@@ -1546,18 +1572,32 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         transaction.resolve(.cancel)
     }
 
-    private func releaseFailedPageTurnRestore(_ session: PageTurnSession) async {
-        guard pageTurnController.isTracking(session) else { return }
+    private func releaseFailedPageTurnRestore(_ session: PageTurnSession) async -> Bool {
+        guard pageTurnController.isTracking(session) else { return false }
         if
             pageTurnSurfaceDidPrepareTarget,
             let animator = pageTurnSurfaceAnimator,
             !(await recoverOriginalPageTurnAfterCommitFailure(animator))
         {
-            animator.render(progress: 0)
+            retainPageTurnSafetySurface(animator)
+            return false
         }
         await waitForPageTurnDisplayFrames()
         cleanupPageTurnSurface(session)
         finishPageTurn(session)
+        return true
+    }
+
+    private func retainPageTurnSafetySurface(_ animator: EPUBPageTurnSurfaceAnimator) {
+        animator.render(progress: 0)
+        if let originalPreview = pageTurnSurfaceOriginalPreview {
+            delegate?.navigator(
+                self,
+                previewLocationDidChange: originalPreview.location,
+                viewport: originalPreview.viewport
+            )
+        }
+        animator.retainCurrentSurfaceForSafety()
     }
 
     private func cleanupPageTurnSurface(_ session: PageTurnSession) {
@@ -2409,7 +2449,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         if let transaction = pageTurnTransaction {
-            return !pageTurnController.isCommitting
+            return transaction.isRunning
+                && !pageTurnController.isCommitting
                 && pendingPageTurnGesture == nil
                 && transaction.session.direction != direction
         }
@@ -2823,11 +2864,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
             _ = await transaction.waitForCompletion()
         }
-        await pageTurnController.settle { [weak self] session in
-            guard let self else { return }
+        await pageTurnController.settleRecovering { [weak self] session in
+            guard let self else { return false }
             if !(await restorePageTurnSurface(session)) {
-                await releaseFailedPageTurnRestore(session)
+                return await releaseFailedPageTurnRestore(session)
             }
+            return true
         }
         await snapshotProvider.settle()
     }
