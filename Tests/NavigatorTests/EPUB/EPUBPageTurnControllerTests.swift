@@ -456,6 +456,92 @@ struct EPUBPageTurnControllerTests {
         #expect(pageTurnSurfaces(in: container).isEmpty)
     }
 
+    @Test("animated pan serializes a cold chapter seam and its immediate reverse")
+    func animatedPanSerializesColdChapterSeamAndReverse() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .push)
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = SnapshotObservingView(frame: container.bounds)
+        navigator.view.frame = root.bounds
+        root.addSubview(navigator.view)
+        container.addSubview(root)
+        delegate.pageTurnRootView = root
+        #expect(navigator.armColdForwardPageTurnTargetForTesting())
+
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: -700
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .ended,
+            translationX: -100,
+            velocityX: -700
+        )
+        #expect(await waitUntil {
+            currentPaginationView(in: navigator)?.currentIndex == 1
+        })
+        await navigator.settlePageTurn()
+
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: 700
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .ended,
+            translationX: 100,
+            velocityX: 700
+        )
+        #expect(await waitUntil {
+            currentPaginationView(in: navigator)?.currentIndex == 0
+        })
+        await navigator.settlePageTurn()
+
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-1.xhtml"))
+        #expect(navigator.isPageTurnIdleForTesting)
+        #expect(pageTurnSurfaces(in: container).isEmpty)
+    }
+
+    @Test("accessibility cancellation before preparation publishes no target")
+    func accessibilityCancellationBeforePreparationPublishesNothing() async throws {
+        let notificationCenter = NotificationCenter()
+        let status = AccessibilityStatusBox()
+        let (navigator, delegate) = try await makeLoadedNavigator(
+            pageTurnStyle: .push,
+            notificationCenter: notificationCenter,
+            accessibilityStatus: status
+        )
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = SnapshotObservingView(frame: container.bounds)
+        navigator.view.frame = root.bounds
+        root.addSubview(navigator.view)
+        container.addSubview(root)
+        delegate.pageTurnRootView = root
+        delegate.resetLocationChanges()
+
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: -700
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .ended,
+            translationX: -100,
+            velocityX: -700
+        )
+        status.isReduceMotionEnabled = true
+        notificationCenter.post(
+            name: UIAccessibility.reduceMotionStatusDidChangeNotification,
+            object: nil
+        )
+        await navigator.settlePageTurn()
+
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-1.xhtml"))
+        #expect(delegate.locationChangeCount == 0)
+        #expect(navigator.isPageTurnIdleForTesting)
+        #expect(pageTurnSurfaces(in: container).isEmpty)
+    }
+
     @Test("mounted navigator keeps one transaction recognizer across push none and cover")
     func mountedRuntimeInteractionPolicy() async throws {
         let navigator = try await makeMountedNavigator(pageTurnStyle: .push)
@@ -2448,7 +2534,9 @@ struct EPUBPageTurnControllerTests {
     }
 
     private func makeLoadedNavigator(
-        pageTurnStyle: EPUBPageTurnStyle = .push
+        pageTurnStyle: EPUBPageTurnStyle = .push,
+        notificationCenter: NotificationCenter? = nil,
+        accessibilityStatus: AccessibilityStatusBox? = nil
     ) async throws -> (EPUBNavigatorViewController, Delegate) {
         let readingOrder = [
             Link(href: "chapter-1.xhtml", mediaType: .xhtml),
@@ -2467,11 +2555,25 @@ struct EPUBPageTurnControllerTests {
             ),
             container: CompositeContainer(containers)
         )
-        let navigator = try EPUBNavigatorViewController(
-            publication: publication,
-            initialLocation: makeLocator(href: "chapter-1.xhtml", progression: 0),
-            config: .init(pageTurnStyle: pageTurnStyle)
-        )
+        let initialLocation = makeLocator(href: "chapter-1.xhtml", progression: 0)
+        let config = EPUBNavigatorViewController.Configuration(pageTurnStyle: pageTurnStyle)
+        let navigator = if let notificationCenter, let accessibilityStatus {
+            try EPUBNavigatorViewController(
+                publication: publication,
+                initialLocation: initialLocation,
+                config: config,
+                notificationCenter: notificationCenter,
+                accessibilityStatusProvider: {
+                    accessibilityStatus.read()
+                }
+            )
+        } else {
+            try EPUBNavigatorViewController(
+                publication: publication,
+                initialLocation: initialLocation,
+                config: config
+            )
+        }
         let delegate = Delegate()
         navigator.delegate = delegate
         navigator.view.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
