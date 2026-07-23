@@ -46,6 +46,7 @@ final class EPUBPageTurnSnapshotProvider {
 
     private var deferredReload: (() -> Void)?
     private var deferredPreferences: (() -> Void)?
+    private var deferredPageTurnInteraction: (() -> Void)?
 
     var isIdle: Bool {
         !hasCaptureLease && leaseWaiters.isEmpty && !hasDeferredMutations
@@ -98,6 +99,15 @@ final class EPUBPageTurnSnapshotProvider {
 
     func deferPreferences(_ mutation: @escaping () -> Void) {
         deferredPreferences = mutation
+        cancelActiveCapture()
+        drainDeferredMutationsIfPossible()
+    }
+
+    /// Defers a recognizer-mode change until an in-flight snapshot has restored
+    /// its source hierarchy. The page-turn style itself remains immediately
+    /// observable; only UIKit's competing recognizers wait for the lease.
+    func deferPageTurnInteraction(_ mutation: @escaping () -> Void) {
+        deferredPageTurnInteraction = mutation
         cancelActiveCapture()
         drainDeferredMutationsIfPossible()
     }
@@ -206,7 +216,9 @@ final class EPUBPageTurnSnapshotProvider {
     }
 
     private var hasDeferredMutations: Bool {
-        deferredReload != nil || deferredPreferences != nil
+        deferredReload != nil
+            || deferredPreferences != nil
+            || deferredPageTurnInteraction != nil
     }
 
     private func acquireCaptureLease() async {
@@ -244,10 +256,13 @@ final class EPUBPageTurnSnapshotProvider {
     private func drainDeferredMutations() {
         let reload = deferredReload
         let preferences = deferredPreferences
+        let pageTurnInteraction = deferredPageTurnInteraction
         deferredReload = nil
         deferredPreferences = nil
+        deferredPageTurnInteraction = nil
         reload?()
         preferences?()
+        pageTurnInteraction?()
     }
 
     private func resumeWaitersIfIdle() {
