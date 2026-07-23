@@ -977,16 +977,45 @@ final class EPUBPageTurnSnapshotCaptureContext {
 final class PageTurnAnimationFrameWaiter: NSObject {
     private var continuation: CheckedContinuation<Void, Never>?
     private var displayLink: CADisplayLink?
+    private var isFinished = false
 
-    static func wait() async {
-        await withCheckedContinuation { continuation in
-            _ = PageTurnAnimationFrameWaiter(continuation)
+    static func wait(
+        scheduleDisplayFrame: @MainActor (PageTurnAnimationFrameWaiter) -> Void = {
+            $0.scheduleDisplayFrame()
+        }
+    ) async {
+        let waiter = PageTurnAnimationFrameWaiter()
+        await withTaskCancellationHandler {
+            await waiter.waitForFrame(scheduleDisplayFrame)
+        } onCancel: {
+            Task { @MainActor in
+                waiter.finish()
+            }
         }
     }
 
-    private init(_ continuation: CheckedContinuation<Void, Never>) {
-        self.continuation = continuation
+    private override init() {
         super.init()
+    }
+
+    private func waitForFrame(
+        _ scheduleDisplayFrame: @MainActor (PageTurnAnimationFrameWaiter) -> Void
+    ) async {
+        guard !Task.isCancelled else { return }
+        await withCheckedContinuation { continuation in
+            guard !isFinished else {
+                continuation.resume()
+                return
+            }
+            self.continuation = continuation
+            scheduleDisplayFrame(self)
+            if Task.isCancelled {
+                finish()
+            }
+        }
+    }
+
+    private func scheduleDisplayFrame() {
         let displayLink = CADisplayLink(target: self, selector: #selector(frameDidDisplay))
         self.displayLink = displayLink
         displayLink.add(to: .main, forMode: .common)
@@ -997,11 +1026,13 @@ final class PageTurnAnimationFrameWaiter: NSObject {
     }
 
     private func finish() {
-        guard continuation != nil else { return }
+        guard !isFinished else { return }
+        isFinished = true
         displayLink?.invalidate()
         displayLink = nil
+        let continuation = self.continuation
+        self.continuation = nil
         continuation?.resume()
-        continuation = nil
     }
 }
 
