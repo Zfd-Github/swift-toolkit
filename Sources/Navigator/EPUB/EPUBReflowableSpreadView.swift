@@ -12,6 +12,8 @@ import WebKit
 
 /// A view rendering a spread of resources with a reflowable layout.
 final class EPUBReflowableSpreadView: EPUBSpreadView {
+    private var pageTurnPanEnabledObservation: NSKeyValueObservation?
+
     var contentHeightDidChange: ((CGFloat) -> Void)?
 
     private var topConstraint: NSLayoutConstraint!
@@ -130,8 +132,29 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     override func updateNativeHorizontalPaging() {
+        if !allowsNativeHorizontalPaging {
+            installNativeHorizontalPanGuard()
+            scrollView.panGestureRecognizer.isEnabled = false
+            return
+        }
+        pageTurnPanEnabledObservation = nil
         scrollView.panGestureRecognizer.isEnabled = !usesContinuousOuterScroll
-            && allowsNativeHorizontalPaging
+    }
+
+    private func installNativeHorizontalPanGuard() {
+        guard pageTurnPanEnabledObservation == nil else { return }
+        pageTurnPanEnabledObservation = scrollView.panGestureRecognizer.observe(
+            \.isEnabled,
+            options: [.new]
+        ) { [weak self] recognizer, change in
+            guard
+                self?.allowsNativeHorizontalPaging == false,
+                change.newValue == true
+            else {
+                return
+            }
+            recognizer.isEnabled = false
+        }
     }
 
     override func convertPointToNavigatorSpace(_ point: CGPoint) -> CGPoint {
