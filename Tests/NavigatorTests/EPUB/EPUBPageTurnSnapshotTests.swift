@@ -298,7 +298,7 @@ struct EPUBPageTurnSnapshotTests {
         #expect(spread.locationPublishCount == 0)
     }
 
-    @Test("named deferred slots drain reload then preferences and re-enable input")
+    @Test("named deferred slots drain reload, preferences, then interaction and re-enable input")
     func namedDeferredMutationSlotsDrainInOrder() async throws {
         let provider = EPUBPageTurnSnapshotProvider()
         let spread = FakeSnapshotSpread(pageIndex: 1)
@@ -311,6 +311,12 @@ struct EPUBPageTurnSnapshotTests {
         provider.deferPreferences { spread.mutationEvents.append("preferences:last") }
         provider.deferReload { spread.mutationEvents.append("reload") }
         provider.deferReload { spread.mutationEvents.append("reload") }
+        provider.deferPageTurnInteraction {
+            spread.mutationEvents.append("interaction:first")
+        }
+        provider.deferPageTurnInteraction {
+            spread.mutationEvents.append("interaction:last")
+        }
         #expect(!provider.isInputEnabled)
 
         let settleTask = Task { await provider.settle() }
@@ -323,7 +329,11 @@ struct EPUBPageTurnSnapshotTests {
         spread.allowedRestoreFrames = 2
         await settleTask.value
         _ = await captureTask.value
-        #expect(spread.mutationEvents == ["reload", "preferences:last"])
+        #expect(spread.mutationEvents == [
+            "reload",
+            "preferences:last",
+            "interaction:last",
+        ])
         #expect(provider.isInputEnabled)
         #expect(provider.isIdle)
 
@@ -332,6 +342,18 @@ struct EPUBPageTurnSnapshotTests {
         spread.replaceIdentity()
         #expect(try await capture(with: provider, spread: spread) != nil)
         #expect(spread.captureCount == 2)
+    }
+
+    @Test("page-turn interaction changes immediately when no snapshot lease exists")
+    func pageTurnInteractionDrainsImmediatelyWithoutCaptureLease() {
+        let provider = EPUBPageTurnSnapshotProvider()
+        var mutationCount = 0
+
+        provider.deferPageTurnInteraction { mutationCount += 1 }
+
+        #expect(mutationCount == 1)
+        #expect(provider.isInputEnabled)
+        #expect(provider.isIdle)
     }
 
     @Test("selection and active media independently suppress capture without mutations")
