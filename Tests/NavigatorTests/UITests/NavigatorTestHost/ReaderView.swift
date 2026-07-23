@@ -6,6 +6,7 @@
 
 @testable import ReadiumNavigator
 import CoreImage
+import CryptoKit
 import ReadiumShared
 import SwiftUI
 import WebKit
@@ -31,6 +32,46 @@ private final class PageTurnGestureObserver: NSObject {
     }
 }
 
+@MainActor
+private final class PageTurnFrameSampler: NSObject {
+    private let sample: () -> Bool
+    private var displayLink: CADisplayLink?
+    private var remainingKeyFrames: Int
+
+    init(maximumKeyFrames: Int, sample: @escaping () -> Bool) {
+        remainingKeyFrames = maximumKeyFrames
+        self.sample = sample
+    }
+
+    func start() {
+        let displayLink = CADisplayLink(
+            target: self,
+            selector: #selector(sampleFrame)
+        )
+        displayLink.add(to: .main, forMode: .common)
+        self.displayLink = displayLink
+    }
+
+    func stop() {
+        displayLink?.invalidate()
+        displayLink = nil
+    }
+
+    @objc private func sampleFrame() {
+        guard remainingKeyFrames > 0 else {
+            stop()
+            return
+        }
+        if sample() {
+            remainingKeyFrames -= 1
+        }
+    }
+
+    deinit {
+        displayLink?.invalidate()
+    }
+}
+
 /// SwiftUI wrapper for the `ReaderViewController`.
 struct ReaderView: View {
     @ObservedObject var viewModel: ReaderViewModel
@@ -39,7 +80,7 @@ struct ReaderView: View {
 
     var body: some View {
         NavigationView {
-            ReaderViewControllerWrapper(navigator: viewModel.navigator)
+            ReaderViewControllerWrapper(viewModel: viewModel)
                 // State information checked in UI tests, not meant to be
                 // visible.
                 .background(
@@ -52,8 +93,8 @@ struct ReaderView: View {
                             .accessibilityIdentifier(.actionMarker)
                         Text(viewModel.snapshotProbeMarker)
                             .accessibilityIdentifier(.snapshotProbeMarker)
-                        Text(viewModel.coverProbeMarker)
-                            .accessibilityIdentifier(.coverProbeMarker)
+                        Text(viewModel.pageTurnProbeMarker)
+                            .accessibilityIdentifier(.pageTurnProbeMarker)
                         Text(viewModel.activeMediaMarker)
                             .accessibilityIdentifier(.activeMediaMarker)
                         Text(viewModel.currentLocationMarker)
@@ -163,29 +204,39 @@ struct ReaderView: View {
                                         id: .captureSnapshotMediaProbe
                                     )
                                     testAction(
+                                        "Prepare Push Probe",
+                                        .preparePushProbe,
+                                        id: .preparePushProbe
+                                    )
+                                    testAction(
+                                        "Prepare None Probe",
+                                        .prepareNoneProbe,
+                                        id: .prepareNoneProbe
+                                    )
+                                    testAction(
                                         "Prepare Cover Probe",
                                         .prepareCoverProbe,
                                         id: .prepareCoverProbe
                                     )
                                     testAction(
+                                        "Re-arm Page Turn Probe",
+                                        .rearmPageTurnProbe,
+                                        id: .rearmPageTurnProbe
+                                    )
+                                    testAction(
                                         "Capture Cover Probe",
-                                        .captureCoverProbe,
-                                        id: .captureCoverProbe
-                                    )
-                                    testAction(
-                                        "Await Forward Cover Ready",
-                                        .awaitCoverForwardReady,
-                                        id: .awaitCoverForwardReady
-                                    )
-                                    testAction(
-                                        "Await Backward Cover Ready",
-                                        .awaitCoverBackwardReady,
-                                        id: .awaitCoverBackwardReady
+                                        .capturePageTurnProbe,
+                                        id: .capturePageTurnProbe
                                     )
                                     testAction(
                                         "Prepare Cross-resource Cover Probe",
-                                        .prepareCoverCrossResource,
-                                        id: .prepareCoverCrossResource
+                                        .prepareCrossResourceProbe,
+                                        id: .prepareCrossResourceProbe
+                                    )
+                                    testAction(
+                                        "Arm Cold Cross-resource Cover",
+                                        .armColdCoverCrossResource,
+                                        id: .armColdCoverCrossResource
                                     )
                                     testAction(
                                         "Start Cover Media Probe",
@@ -242,11 +293,13 @@ enum ReaderTestAction: String {
     case captureSnapshotProbe
     case captureSnapshotSelectionProbe
     case captureSnapshotMediaProbe
+    case preparePushProbe
+    case prepareNoneProbe
     case prepareCoverProbe
-    case captureCoverProbe
-    case awaitCoverForwardReady
-    case awaitCoverBackwardReady
-    case prepareCoverCrossResource
+    case rearmPageTurnProbe
+    case capturePageTurnProbe
+    case prepareCrossResourceProbe
+    case armColdCoverCrossResource
     case startCoverMediaProbe
     case stopCoverMediaProbe
 }
@@ -276,8 +329,12 @@ enum ReaderTestAction: String {
     @Published var pageTurnTapMarker = "count=0"
     @Published var pageTurnLinkMarker = "count=0"
     @Published var snapshotProbeMarker = "unavailable"
-    @Published var coverProbeMarker = "unavailable"
+    @Published var pageTurnProbeMarker = "unavailable"
     @Published var activeMediaMarker = "sample=0|active=false"
+
+    weak var pageTurnRootView: UIView?
+    weak var pageTurnTopChrome: UILabel?
+    weak var pageTurnBottomChrome: UILabel?
 
     private var epubPreferences: EPUBPreferences
     private var directionalNavigationAdapter: DirectionalNavigationAdapter?
@@ -297,11 +354,32 @@ enum ReaderTestAction: String {
     private let resourceFailureController: ResourceFailureController?
     private var resourceFailureRevision = 0
     private var lastFailedResourceHREF: RelativeURL?
-    private var coverEvidenceLocationRevision = 0
-    private var coverOverlaySampleCount = 0
-    private var coverLocationDuringOverlayCount = 0
-    private var didTrackCover = false
-    private var didProgressCover = false
+    private var pageTurnEvidenceLocationRevision = 0
+    private var pageTurnSurfaceSampleCount = 0
+    private var didTrackPageTurn = false
+    private var didProgressPageTurn = false
+    private var didUseFullReaderSurface = false
+    private var didKeepHandoffIdentity = false
+    private var pageTurnEvidenceStyle: EPUBPageTurnStyle = .cover
+    private var pageTurnFrameSampler: PageTurnFrameSampler?
+    private var didRemainStillWhileTracking = true
+    private var didRenderThreeDistinctZones = false
+    private var didMoveZonesTogether = false
+    private var didMatchCurrentZoneBlocks = false
+    private var didMatchTargetZoneBlocks = false
+    private var didObserveStyleGeometry = false
+    private var didObserveEqualPushVelocity = false
+    private var pageTurnSurfaceContractViolation: String?
+    private var didArmColdCover = false
+    private var didBeginColdCover = false
+    private var didNavigateColdCover = false
+    private var didCaptureColdCover = false
+    private var lastTargetSurfaceSnapshot: PageTurnSurfaceSnapshot?
+    private var targetLiveSnapshotAtPreview: ReaderLiveSurfaceSnapshot?
+    private var trackingBaselineLiveSnapshot: ReaderLiveSurfaceSnapshot?
+    private var sampledPageTurnFrameKeys: Set<String> = []
+    private var lastPairedTranslations: (current: CGFloat, target: CGFloat)?
+    private var observedPushPhysicalDirection: String?
     private var activeMediaEvidenceRevision = 0
 
     init(
@@ -341,6 +419,9 @@ enum ReaderTestAction: String {
         actionTask?.cancel()
         selectionEvidenceTask?.cancel()
         activeMediaEvidenceTask?.cancel()
+        MainActor.assumeIsolated {
+            stopPageTurnFrameSampler()
+        }
     }
 
     func runNavigationStressTest() {
@@ -975,45 +1056,45 @@ enum ReaderTestAction: String {
                 generation: generation
             )
 
-        case .prepareCoverProbe:
-            await prepareCoverProbe(
+        case .preparePushProbe, .prepareNoneProbe, .prepareCoverProbe:
+            let style: EPUBPageTurnStyle = action == .preparePushProbe
+                ? .push
+                : action == .prepareNoneProbe ? .none : .cover
+            await preparePageTurnProbe(
                 in: navigator,
                 action: action,
                 generation: generation,
+                style: style,
                 progression: 0,
                 expectedMarker: "PAGE-A"
             )
 
-        case .prepareCoverCrossResource:
-            await prepareCoverProbe(
+        case .rearmPageTurnProbe:
+            resetPageTurnEvidence(style: navigator.pageTurnStyle, in: navigator)
+            complete(action, generation: generation)
+
+        case .prepareCrossResourceProbe:
+            await preparePageTurnProbe(
                 in: navigator,
                 action: action,
                 generation: generation,
+                style: navigator.pageTurnStyle,
                 progression: 1,
                 expectedMarker: "PAGE-E"
             )
 
-        case .captureCoverProbe:
-            await captureCoverProbe(
+        case .armColdCoverCrossResource:
+            await armColdCoverCrossResource(
                 in: navigator,
                 action: action,
                 generation: generation
             )
 
-        case .awaitCoverForwardReady:
-            await awaitCoverReady(
+        case .capturePageTurnProbe:
+            await capturePageTurnProbe(
                 in: navigator,
                 action: action,
-                generation: generation,
-                isForward: true
-            )
-
-        case .awaitCoverBackwardReady:
-            await awaitCoverReady(
-                in: navigator,
-                action: action,
-                generation: generation,
-                isForward: false
+                generation: generation
             )
 
         case .startCoverMediaProbe:
@@ -1028,7 +1109,7 @@ enum ReaderTestAction: String {
             }
             guard isCurrentAction(generation) else { return }
             monitorActiveMediaEvidence(in: navigator)
-            resetCoverEvidence()
+            resetPageTurnEvidence(style: .cover, in: navigator)
             complete(action, generation: generation)
 
         case .stopCoverMediaProbe:
@@ -1057,16 +1138,17 @@ enum ReaderTestAction: String {
         }
     }
 
-    private func prepareCoverProbe(
+    private func preparePageTurnProbe(
         in navigator: EPUBNavigatorViewController,
         action: ReaderTestAction,
         generation: Int,
+        style: EPUBPageTurnStyle,
         progression: Double,
         expectedMarker: String
     ) async {
         guard isCurrentAction(generation) else { return }
-        if navigator.pageTurnStyle != .cover {
-            navigator.pageTurnStyle = .cover
+        if navigator.pageTurnStyle != style {
+            navigator.pageTurnStyle = style
         }
         navigator.clearSelection()
         if let webView = await currentMountedWebView(in: navigator) {
@@ -1094,54 +1176,47 @@ enum ReaderTestAction: String {
             fail(action, generation: generation, reason: "positioning-failed")
             return
         }
-        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        try? await Task.sleep(nanoseconds: 100_000_000)
         guard isCurrentAction(generation) else { return }
-        resetCoverEvidence()
+        resetPageTurnEvidence(style: style, in: navigator)
         complete(action, generation: generation)
     }
 
-    private func awaitCoverReady(
-        in navigator: EPUBNavigatorViewController,
-        action: ReaderTestAction,
-        generation: Int,
-        isForward: Bool
-    ) async {
-        let isRTL = navigator.presentation.readingProgression == .rtl
-        let direction: EPUBSpreadView.Direction = switch (isForward, isRTL) {
-        case (true, false), (false, true): .right
-        case (false, false), (true, true): .left
-        }
-        let deadline = ProcessInfo.processInfo.systemUptime + 10
-        while
-            isCurrentAction(generation),
-            !navigator.canBeginCoverPanForTesting(to: direction),
-            ProcessInfo.processInfo.systemUptime < deadline
-        {
-            try? await Task.sleep(nanoseconds: 10_000_000)
-        }
-        guard isCurrentAction(generation) else { return }
-        guard navigator.canBeginCoverPanForTesting(to: direction) else {
-            let input = navigator.isPageTurnSnapshotInputEnabledForTesting
-            let cached = navigator.hasCachedCoverSnapshotPairForTesting(to: direction)
-            fail(
-                action,
-                generation: generation,
-                reason: "cover-pan-not-ready-input-\(input)-cached-\(cached)"
-            )
-            return
-        }
-        complete(action, generation: generation)
-    }
-
-    private func captureCoverProbe(
+    private func armColdCoverCrossResource(
         in navigator: EPUBNavigatorViewController,
         action: ReaderTestAction,
         generation: Int
     ) async {
+        navigator.pageTurnStyle = .cover
+        navigator.snapshotProvider.invalidate()
+        resetPageTurnEvidence(style: .cover, in: navigator)
+        didArmColdCover = navigator.armColdForwardPageTurnTargetForTesting()
+        let initialBeginCount = pageTurnBeginCount
+        let deadline = ProcessInfo.processInfo.systemUptime + 20
+        while isCurrentAction(generation), ProcessInfo.processInfo.systemUptime < deadline {
+            if pageTurnBeginCount > initialBeginCount, navigator.isPageTurnIdleForTesting {
+                let evidence = navigator.pageTurnSurfaceTransactionEvidenceForTesting
+                didNavigateColdCover = evidence.didNavigateColdTarget
+                didCaptureColdCover = evidence.didCaptureAfterColdNavigation
+                complete(action, generation: generation)
+                return
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        guard isCurrentAction(generation) else { return }
+        fail(action, generation: generation, reason: "cold-cover-swipe-did-not-settle")
+    }
+
+    private func capturePageTurnProbe(
+        in navigator: EPUBNavigatorViewController,
+        action: ReaderTestAction,
+        generation: Int
+    ) async {
+        defer { stopPageTurnFrameSampler() }
         let deadline = ProcessInfo.processInfo.systemUptime + 5
         while
             isCurrentAction(generation),
-            (!navigator.isPageTurnIdleForTesting || !coverOverlayViews(in: navigator).isEmpty),
+            (!navigator.isPageTurnIdleForTesting || !pageTurnSurfaces(in: navigator).isEmpty),
             ProcessInfo.processInfo.systemUptime < deadline
         {
             try? await Task.sleep(nanoseconds: 10_000_000)
@@ -1149,7 +1224,7 @@ enum ReaderTestAction: String {
         guard isCurrentAction(generation) else { return }
         guard
             navigator.isPageTurnIdleForTesting,
-            coverOverlayViews(in: navigator).isEmpty
+            pageTurnSurfaces(in: navigator).isEmpty
         else {
             fail(action, generation: generation, reason: "page-turn-not-settled")
             return
@@ -1160,27 +1235,96 @@ enum ReaderTestAction: String {
             fail(action, generation: generation, reason: "missing-visible-marker")
             return
         }
-        let overlayCount = coverOverlayViews(in: navigator).count
-        coverProbeMarker = [
+        pageTurnFrameSampler?.stop()
+        if
+            let target = lastTargetSurfaceSnapshot,
+            let preview = targetLiveSnapshotAtPreview,
+            let live = readerLiveSurfaceSnapshot(in: navigator)
+        {
+            didKeepHandoffIdentity = handoffMatches(
+                target: target,
+                preview: preview,
+                live: live
+            )
+        }
+        let overlayCount = pageTurnSurfaces(in: navigator).count
+        pageTurnProbeMarker = [
+            "style=\(pageTurnStyleName(pageTurnEvidenceStyle))",
+            "settled=true",
+            "idle=true",
             "visible=\(visibleMarker)",
             "overlayCount=\(overlayCount)",
-            "overlaySamples=\(coverOverlaySampleCount)",
+            "overlaySamples=\(pageTurnSurfaceSampleCount)",
             "began=\(pageTurnBeginCount)",
-            "tracked=\(didTrackCover)",
-            "progressed=\(didProgressCover)",
-            "locationDelta=\(locationRevision - coverEvidenceLocationRevision)",
-            "locationDuringOverlay=\(coverLocationDuringOverlayCount)",
+            "tracked=\(didTrackPageTurn)",
+            "progressed=\(didProgressPageTurn)",
+            "fullSurface=\(didUseFullReaderSurface)",
+            "threeZones=\(didRenderThreeDistinctZones)",
+            "zonesTogether=\(didMoveZonesTogether)",
+            "currentBlocksMatch=\(didMatchCurrentZoneBlocks)",
+            "targetBlocksMatch=\(didMatchTargetZoneBlocks)",
+            "styleGeometry=\(didObserveStyleGeometry)",
+            "equalPushVelocity=\(didObserveEqualPushVelocity)",
+            "pushDirection=\(observedPushPhysicalDirection ?? "none")",
+            "stillWhileTracking=\(didRemainStillWhileTracking)",
+            "handoffStable=\(didKeepHandoffIdentity)",
+            "coldArmed=\(didArmColdCover)",
+            "coldAtBegin=\(didBeginColdCover)",
+            "coldNavigated=\(didNavigateColdCover)",
+            "coldCaptured=\(didCaptureColdCover)",
+            "violation=\(pageTurnSurfaceContractViolation ?? "none")",
+            "locationDelta=\(locationRevision - pageTurnEvidenceLocationRevision)",
         ].joined(separator: "|")
-        resetCoverEvidence()
+        clearPageTurnEvidence()
         complete(action, generation: generation)
     }
 
-    private func resetCoverEvidence() {
-        coverEvidenceLocationRevision = locationRevision
-        coverOverlaySampleCount = 0
-        coverLocationDuringOverlayCount = 0
-        didTrackCover = false
-        didProgressCover = false
+    private func resetPageTurnEvidence(
+        style: EPUBPageTurnStyle,
+        in navigator: EPUBNavigatorViewController
+    ) {
+        clearPageTurnEvidence()
+        pageTurnEvidenceStyle = style
+        trackingBaselineLiveSnapshot = readerLiveSurfaceSnapshot(in: navigator)
+        let sampler = PageTurnFrameSampler(maximumKeyFrames: 4) { [weak self, weak navigator] in
+            guard let self, let navigator else { return false }
+            return samplePageTurnSurfaces(in: navigator)
+        }
+        pageTurnFrameSampler = sampler
+        sampler.start()
+    }
+
+    private func clearPageTurnEvidence() {
+        stopPageTurnFrameSampler()
+        pageTurnEvidenceLocationRevision = locationRevision
+        pageTurnSurfaceSampleCount = 0
+        didTrackPageTurn = false
+        didProgressPageTurn = false
+        didUseFullReaderSurface = false
+        didKeepHandoffIdentity = false
+        didRemainStillWhileTracking = true
+        didRenderThreeDistinctZones = false
+        didMoveZonesTogether = false
+        didMatchCurrentZoneBlocks = false
+        didMatchTargetZoneBlocks = false
+        didObserveStyleGeometry = false
+        didObserveEqualPushVelocity = false
+        pageTurnSurfaceContractViolation = nil
+        didArmColdCover = false
+        didBeginColdCover = false
+        didNavigateColdCover = false
+        didCaptureColdCover = false
+        lastTargetSurfaceSnapshot = nil
+        targetLiveSnapshotAtPreview = nil
+        trackingBaselineLiveSnapshot = nil
+        sampledPageTurnFrameKeys = []
+        lastPairedTranslations = nil
+        observedPushPhysicalDirection = nil
+    }
+
+    private func stopPageTurnFrameSampler() {
+        pageTurnFrameSampler?.stop()
+        pageTurnFrameSampler = nil
     }
 
     private func monitorActiveMediaEvidence(
@@ -1202,11 +1346,367 @@ enum ReaderTestAction: String {
         activeMediaMarker = "sample=\(activeMediaEvidenceRevision)|active=\(isActive)"
     }
 
-    private func coverOverlayViews(
+    private func pageTurnSurfaces(
         in navigator: EPUBNavigatorViewController
-    ) -> [UIImageView] {
-        navigator.view.subviews.compactMap { $0 as? UIImageView }
-            .filter { !$0.isUserInteractionEnabled && $0.accessibilityElementsHidden }
+    ) -> [UIView] {
+        func markedSurfaces(in view: UIView) -> [UIView] {
+            view.subviews.flatMap { child in
+                let descendants = markedSurfaces(in: child)
+                guard child.accessibilityIdentifier?.hasPrefix("readium.page-turn.surface.") == true else {
+                    return descendants
+                }
+                return [child] + descendants
+            }
+        }
+        let searchRoot = pageTurnRootView?.superview ?? pageTurnRootView ?? navigator.view!
+        return markedSurfaces(in: searchRoot)
+    }
+
+    private func surfacesCoverFullReader(_ surfaces: [UIView]) -> Bool {
+        guard
+            (1 ... 2).contains(surfaces.count),
+            let root = pageTurnRootView,
+            let parent = root.superview
+        else {
+            return false
+        }
+        if surfaces.count == 1, let surface = surfaces.first {
+            let presentationFrame = surface.layer.presentation()?.frame ?? surface.frame
+            return surface.superview === parent
+                && surface.bounds.size.approximatelyEquals(root.bounds.size)
+                && presentationFrame.approximatelyEquals(root.frame)
+        }
+        return surfaces.allSatisfy { surface in
+            surface.superview === parent
+                && surface.bounds.size.approximatelyEquals(root.bounds.size)
+                && surface.frame.size.approximatelyEquals(root.frame.size)
+        }
+    }
+
+    private func readerLiveSurfaceSnapshot(
+        in navigator: EPUBNavigatorViewController
+    ) -> ReaderLiveSurfaceSnapshot? {
+        guard
+            let root = pageTurnRootView,
+            let topChrome = pageTurnTopChrome,
+            let bottomChrome = pageTurnBottomChrome
+        else {
+            return nil
+        }
+        guard let render = renderSignature(of: root) else { return nil }
+        return ReaderLiveSurfaceSnapshot(
+            rootBounds: root.bounds,
+            rootTransform: root.transform,
+            documentFrame: navigator.view.convert(navigator.view.bounds, to: root),
+            documentTransform: navigator.view.transform,
+            contentOffset: mountedWebView(in: navigator.view)?.scrollView.contentOffset ?? .zero,
+            render: render,
+            topChromeFrame: topChrome.frame,
+            topChromeTransform: topChrome.transform,
+            bottomChromeFrame: bottomChrome.frame,
+            bottomChromeTransform: bottomChrome.transform
+        )
+    }
+
+    @discardableResult
+    private func samplePageTurnSurfaces(
+        in navigator: EPUBNavigatorViewController
+    ) -> Bool {
+        let surfaces = pageTurnSurfaces(in: navigator)
+        guard !surfaces.isEmpty else {
+            if pageTurnEvidenceStyle == .none,
+               locationRevision > pageTurnEvidenceLocationRevision {
+                didObserveStyleGeometry = true
+            }
+            return false
+        }
+        guard pageTurnEvidenceStyle != .none else {
+            pageTurnSurfaceContractViolation = "none-created-surface"
+            return false
+        }
+        guard (1 ... 2).contains(surfaces.count) else {
+            pageTurnSurfaceContractViolation = "surface-count-\(surfaces.count)"
+            return false
+        }
+        let roles = Set(surfaces.compactMap(\.accessibilityIdentifier))
+        let currentRole = "readium.page-turn.surface.current"
+        let targetRole = "readium.page-turn.surface.target"
+        let expectedRoles = surfaces.count == 1
+            ? Set([currentRole])
+            : Set([currentRole, targetRole])
+        guard roles == expectedRoles else {
+            pageTurnSurfaceContractViolation = "surface-roles"
+            return false
+        }
+
+        let isFullReaderSurface = surfacesCoverFullReader(surfaces)
+        didUseFullReaderSurface = didUseFullReaderSurface || isFullReaderSurface
+        if !isFullReaderSurface {
+            pageTurnSurfaceContractViolation = "surface-not-full-reader"
+        }
+
+        guard let frameKey = pageTurnFrameKey(surfaces) else {
+            return false
+        }
+        guard sampledPageTurnFrameKeys.insert(frameKey).inserted else {
+            return false
+        }
+
+        pageTurnSurfaceSampleCount += 1
+        var snapshotsByRole: [String: PageTurnSurfaceSnapshot] = [:]
+        for surface in surfaces {
+            guard let snapshot = pageTurnSurfaceSnapshot(of: surface) else {
+                pageTurnSurfaceContractViolation = "surface-render"
+                continue
+            }
+            guard let role = surface.accessibilityIdentifier else { continue }
+            snapshotsByRole[role] = snapshot
+            let zones = [
+                snapshot.render.top,
+                snapshot.render.document,
+                snapshot.render.bottom,
+            ]
+            let hasDistinctZones = Set(zones).count == 3
+            didRenderThreeDistinctZones = didRenderThreeDistinctZones || hasDistinctZones
+
+            if role == currentRole, let liveBefore = trackingBaselineLiveSnapshot {
+                let matches = snapshot.render == liveBefore.render
+                didMatchCurrentZoneBlocks = didMatchCurrentZoneBlocks || matches
+                if !matches {
+                    pageTurnSurfaceContractViolation = "current-zone-blocks"
+                }
+            }
+            if role == targetRole {
+                lastTargetSurfaceSnapshot = snapshot
+                if let preview = targetLiveSnapshotAtPreview {
+                    let matches = snapshot.render == preview.render
+                    didMatchTargetZoneBlocks = didMatchTargetZoneBlocks || matches
+                    if !matches {
+                        pageTurnSurfaceContractViolation = "target-zone-blocks"
+                    }
+                }
+            }
+        }
+
+        if snapshotsByRole.count == 2 {
+            validatePageTurnGeometry(snapshotsByRole)
+        }
+        return true
+    }
+
+    private func pageTurnFrameKey(_ surfaces: [UIView]) -> String? {
+        guard surfaces.count == 2 else { return "current-only" }
+        guard
+            let current = surfaces.first(where: {
+                $0.accessibilityIdentifier == "readium.page-turn.surface.current"
+            }),
+            let target = surfaces.first(where: {
+                $0.accessibilityIdentifier == "readium.page-turn.surface.target"
+            })
+        else {
+            return nil
+        }
+        let transform = current.layer.presentation()?.affineTransform() ?? current.transform
+        let targetTransform = target.layer.presentation()?.affineTransform() ?? target.transform
+        let progress = abs(transform.tx) / max(current.bounds.width, 1)
+        switch progress {
+        case ...0.1: return "start"
+        case 0.35 ... 0.65: return "mid"
+        case 0.9... where abs(targetTransform.tx) <= 0.02: return "handoff"
+        default: return nil
+        }
+    }
+
+    private func validatePageTurnGeometry(
+        _ snapshots: [String: PageTurnSurfaceSnapshot]
+    ) {
+        guard
+            let root = pageTurnRootView,
+            let current = snapshots["readium.page-turn.surface.current"],
+            let target = snapshots["readium.page-turn.surface.target"]
+        else {
+            return
+        }
+        let width = max(root.bounds.width, 1)
+        let currentX = current.presentationTransform.tx
+        let targetX = target.presentationTransform.tx
+
+        switch pageTurnEvidenceStyle {
+        case .push:
+            let presentationSeparation = target.presentationFrame.minX
+                - current.presentationFrame.minX
+            let separationMatches = abs(abs(presentationSeparation) - width) <= 2
+            let bothInMotion = abs(currentX) > 1
+                && abs(currentX) < width - 1
+                && abs(targetX) > 1
+                && abs(targetX) < width - 1
+            if bothInMotion {
+                didProgressPageTurn = true
+                let movesLeft = currentX < 0
+                let roleSignsMatch = movesLeft
+                    ? targetX > 0
+                    : currentX > 0 && targetX < 0
+                let relativePositionMatches = movesLeft
+                    ? presentationSeparation > 0
+                    : presentationSeparation < 0
+                let framesTrackTransforms = abs(
+                    current.presentationFrame.minX - (root.frame.minX + currentX)
+                ) <= 2 && abs(
+                    target.presentationFrame.minX - (root.frame.minX + targetX)
+                ) <= 2
+                let physicalGeometryMatches = separationMatches
+                    && roleSignsMatch
+                    && relativePositionMatches
+                    && framesTrackTransforms
+                didObserveStyleGeometry = didObserveStyleGeometry || physicalGeometryMatches
+                if physicalGeometryMatches {
+                    observedPushPhysicalDirection = movesLeft ? "left" : "right"
+                } else {
+                    pageTurnSurfaceContractViolation = "push-physical-direction"
+                }
+                if let previous = lastPairedTranslations {
+                    let currentDelta = currentX - previous.current
+                    let targetDelta = targetX - previous.target
+                    if abs(currentDelta) > 0.25 || abs(targetDelta) > 0.25 {
+                        let equalVelocity = abs(currentDelta - targetDelta) <= 2
+                        didObserveEqualPushVelocity = didObserveEqualPushVelocity || equalVelocity
+                        if !equalVelocity {
+                            pageTurnSurfaceContractViolation = "push-unequal-velocity"
+                        }
+                    }
+                }
+                didMoveZonesTogether = didMoveZonesTogether
+                    || (physicalGeometryMatches && didRenderThreeDistinctZones)
+            }
+            lastPairedTranslations = (currentX, targetX)
+
+        case .cover:
+            let currentIsMoving = abs(currentX) > 1 && abs(currentX) < width - 1
+            let targetIsStatic = abs(targetX) <= 1
+                && abs(target.presentationTransform.ty) <= 1
+            guard currentIsMoving else { return }
+            didProgressPageTurn = true
+            let geometryMatches = targetIsStatic && current.zIndex > target.zIndex
+                && target.presentationFrame.approximatelyEquals(root.frame)
+                && abs(
+                    current.presentationFrame.minX - (root.frame.minX + currentX)
+                ) <= 2
+            didObserveStyleGeometry = didObserveStyleGeometry || geometryMatches
+            didMoveZonesTogether = didMoveZonesTogether
+                || (geometryMatches && didRenderThreeDistinctZones)
+            if !geometryMatches {
+                pageTurnSurfaceContractViolation = "cover-role-geometry"
+            }
+
+        case .none, .simulation:
+            pageTurnSurfaceContractViolation = "unexpected-style-surfaces"
+        }
+    }
+
+    private func pageTurnSurfaceSnapshot(of surface: UIView) -> PageTurnSurfaceSnapshot? {
+        guard
+            let root = pageTurnRootView,
+            let parent = root.superview,
+            let render = renderSignature(of: surface)
+        else {
+            return nil
+        }
+        return PageTurnSurfaceSnapshot(
+            frame: surface.convert(surface.bounds, to: parent),
+            presentationFrame: surface.layer.presentation()?.frame ?? surface.frame,
+            presentationTransform: surface.layer.presentation()?.affineTransform() ?? surface.transform,
+            render: render,
+            zIndex: surface.superview?.subviews.firstIndex(of: surface) ?? -1
+        )
+    }
+
+    private func renderSignature(of view: UIView) -> ReaderZoneRenderSignature? {
+        guard view.bounds.width > 60, view.bounds.height > 120 else { return nil }
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let image = UIGraphicsImageRenderer(bounds: view.bounds, format: format).image { _ in
+            view.drawHierarchy(in: view.bounds, afterScreenUpdates: false)
+        }
+        let topPoint = CGPoint(x: 50, y: 32)
+        let documentPoint = CGPoint(x: 50, y: 84)
+        let bottomPoint = CGPoint(x: 50, y: view.bounds.height - 22)
+        guard
+            let top = blockSignature(in: image, centeredAt: topPoint),
+            let document = blockSignature(in: image, centeredAt: documentPoint),
+            let bottom = blockSignature(in: image, centeredAt: bottomPoint)
+        else {
+            return nil
+        }
+        return ReaderZoneRenderSignature(top: top, document: document, bottom: bottom)
+    }
+
+    private func blockSignature(
+        in image: UIImage,
+        centeredAt point: CGPoint
+    ) -> String? {
+        guard let ciImage = CIImage(image: image) else { return nil }
+        let scaleX = ciImage.extent.width / image.size.width
+        let scaleY = ciImage.extent.height / image.size.height
+        let blockSize = CGSize(width: 12, height: 12)
+        let pixelWidth = Int(blockSize.width * scaleX)
+        let pixelHeight = Int(blockSize.height * scaleY)
+        guard pixelWidth > 0, pixelHeight > 0 else { return nil }
+        var pixels = [UInt8](repeating: 0, count: pixelWidth * pixelHeight * 4)
+        snapshotProbeCIContext.render(
+            ciImage,
+            toBitmap: &pixels,
+            rowBytes: pixelWidth * 4,
+            bounds: CGRect(
+                x: (point.x - blockSize.width / 2) * scaleX,
+                y: ciImage.extent.height
+                    - (point.y + blockSize.height / 2) * scaleY,
+                width: CGFloat(pixelWidth),
+                height: CGFloat(pixelHeight)
+            ),
+            format: .RGBA8,
+            colorSpace: CGColorSpace(name: CGColorSpace.sRGB)
+        )
+        return SHA256.hash(data: Data(pixels)).map {
+            String(format: "%02x", $0)
+        }.joined()
+    }
+
+    private func mountedWebView(in view: UIView) -> WKWebView? {
+        if let webView = view as? WKWebView, webView.window != nil {
+            return webView
+        }
+        return view.subviews.lazy.compactMap { self.mountedWebView(in: $0) }.first
+    }
+
+    private func handoffMatches(
+        target: PageTurnSurfaceSnapshot,
+        preview: ReaderLiveSurfaceSnapshot,
+        live: ReaderLiveSurfaceSnapshot
+    ) -> Bool {
+        guard let root = pageTurnRootView else { return false }
+        return target.frame.approximatelyEquals(root.frame)
+            && target.presentationTransform.approximatelyEquals(live.rootTransform)
+            && target.render == preview.render
+            && preview.render == live.render
+            && preview.contentOffset.approximatelyEquals(live.contentOffset)
+            && preview.rootBounds.approximatelyEquals(live.rootBounds)
+            && preview.rootTransform.approximatelyEquals(live.rootTransform)
+            && preview.documentFrame.approximatelyEquals(live.documentFrame)
+            && preview.documentTransform.approximatelyEquals(live.documentTransform)
+            && preview.topChromeFrame.approximatelyEquals(live.topChromeFrame)
+            && preview.topChromeTransform.approximatelyEquals(live.topChromeTransform)
+            && preview.bottomChromeFrame.approximatelyEquals(live.bottomChromeFrame)
+            && preview.bottomChromeTransform.approximatelyEquals(live.bottomChromeTransform)
+    }
+
+    private func pageTurnStyleName(_ style: EPUBPageTurnStyle) -> String {
+        switch style {
+        case .push: "push"
+        case .none: "none"
+        case .cover: "cover"
+        case .simulation: "simulation"
+        }
     }
 
     private func captureSnapshotProbe(
@@ -1678,16 +2178,31 @@ enum ReaderTestAction: String {
             guard let navigator else { return }
             guard let self else { return }
             if gestureRecognizer.state == .began {
+                if locationRevision > pageTurnEvidenceLocationRevision,
+                   navigator.isPageTurnIdleForTesting {
+                    resetPageTurnEvidence(style: pageTurnEvidenceStyle, in: navigator)
+                }
                 pageTurnBeginCount += 1
                 pageTurnBeginMarker = "count=\(pageTurnBeginCount)"
+                trackingBaselineLiveSnapshot = readerLiveSurfaceSnapshot(in: navigator)
+                if didArmColdCover {
+                    didBeginColdCover = navigator.pageTurnSurfaceTransactionEvidenceForTesting.isCold
+                    if !didBeginColdCover {
+                        pageTurnSurfaceContractViolation = "cold-cover-was-rewarmed-before-begin"
+                    }
+                }
             } else if gestureRecognizer.state == .changed {
-                let overlays = coverOverlayViews(in: navigator)
-                guard overlays.count == 2 else { return }
-                didTrackCover = true
-                coverOverlaySampleCount += 1
-                didProgressCover = didProgressCover || overlays.contains { imageView in
-                    let translation = abs(imageView.transform.tx)
-                    return translation > 1 && translation < navigator.view.bounds.width - 1
+                didTrackPageTurn = true
+                if pageTurnEvidenceStyle == .none {
+                    let isStill = pageTurnSurfaces(in: navigator).isEmpty
+                        && trackingBaselineLiveSnapshot == readerLiveSurfaceSnapshot(in: navigator)
+                    didRemainStillWhileTracking = didRemainStillWhileTracking && isStill
+                    didObserveStyleGeometry = didObserveStyleGeometry || isStill
+                    if !isStill {
+                        pageTurnSurfaceContractViolation = "none-moved-before-threshold"
+                    }
+                } else {
+                    samplePageTurnSurfaces(in: navigator)
                 }
             }
         }
@@ -1949,6 +2464,15 @@ enum ReaderTestAction: String {
         )
     }
 
+    private func updateReaderChrome(for locator: Locator?) {
+        pageTurnTopChrome?.text = "TOP|\(locator?.href.string ?? "none")"
+        pageTurnBottomChrome?.text = String(
+            format: "BOTTOM|%.5f",
+            locale: Locale(identifier: "en_US_POSIX"),
+            locator?.locations.progression ?? -1
+        )
+    }
+
     private func isCurrentAction(_ generation: Int) -> Bool {
         !Task.isCancelled && generation == actionGeneration
     }
@@ -1959,6 +2483,7 @@ enum ReaderTestAction: String {
     }
 
     private func fail(_ action: ReaderTestAction, generation: Int, reason: String) {
+        stopPageTurnFrameSampler()
         guard isCurrentAction(generation) else { return }
         actionMarker = "failed:\(action.rawValue):\(generation):\(reason)"
     }
@@ -1996,10 +2521,70 @@ private struct SnapshotProbeState {
     let locationRevision: Int
 }
 
+private struct ReaderZoneRenderSignature: Equatable {
+    let top: String
+    let document: String
+    let bottom: String
+}
+
+private struct PageTurnSurfaceSnapshot: Equatable {
+    let frame: CGRect
+    let presentationFrame: CGRect
+    let presentationTransform: CGAffineTransform
+    let render: ReaderZoneRenderSignature
+    let zIndex: Int
+}
+
+private struct ReaderLiveSurfaceSnapshot: Equatable {
+    let rootBounds: CGRect
+    let rootTransform: CGAffineTransform
+    let documentFrame: CGRect
+    let documentTransform: CGAffineTransform
+    let contentOffset: CGPoint
+    let render: ReaderZoneRenderSignature
+    let topChromeFrame: CGRect
+    let topChromeTransform: CGAffineTransform
+    let bottomChromeFrame: CGRect
+    let bottomChromeTransform: CGAffineTransform
+}
+
 private typealias SnapshotExpectation = (direction: EPUBSpreadView.Direction, color: String)
 
 private extension CGRect {
     var area: CGFloat { width * height }
+
+    func approximatelyEquals(_ other: CGRect, tolerance: CGFloat = 1) -> Bool {
+        abs(minX - other.minX) <= tolerance
+            && abs(minY - other.minY) <= tolerance
+            && abs(width - other.width) <= tolerance
+            && abs(height - other.height) <= tolerance
+    }
+}
+
+private extension CGSize {
+    func approximatelyEquals(_ other: CGSize, tolerance: CGFloat = 1) -> Bool {
+        abs(width - other.width) <= tolerance && abs(height - other.height) <= tolerance
+    }
+}
+
+private extension CGPoint {
+    func approximatelyEquals(_ other: CGPoint, tolerance: CGFloat = 0.5) -> Bool {
+        abs(x - other.x) <= tolerance && abs(y - other.y) <= tolerance
+    }
+}
+
+private extension CGAffineTransform {
+    func approximatelyEquals(
+        _ other: CGAffineTransform,
+        tolerance: CGFloat = 0.01
+    ) -> Bool {
+        abs(a - other.a) <= tolerance
+            && abs(b - other.b) <= tolerance
+            && abs(c - other.c) <= tolerance
+            && abs(d - other.d) <= tolerance
+            && abs(tx - other.tx) <= tolerance
+            && abs(ty - other.ty) <= tolerance
+    }
 }
 
 // MARK: - NavigatorDelegate
@@ -2017,15 +2602,12 @@ extension ReaderViewModel: NavigatorDelegate {
     }
 
     func navigator(_ navigator: Navigator, locationDidChange locator: Locator) {
-        if
-            let epubNavigator = navigator as? EPUBNavigatorViewController,
-            coverOverlayViews(in: epubNavigator).count == 2
-        {
-            coverOverlaySampleCount += 1
-            coverLocationDuringOverlayCount += 1
+        latestLocator = locator
+        updateReaderChrome(for: locator)
+        if let epubNavigator = navigator as? EPUBNavigatorViewController {
+            samplePageTurnSurfaces(in: epubNavigator)
         }
         locationRevision += 1
-        latestLocator = locator
         currentLocationMarker = describe(locator)
         locationRevisionMarker = "r=\(locationRevision)|\(describe(locator))"
         if enablesContinuousScrollActions {
@@ -2051,6 +2633,20 @@ extension ReaderViewModel: NavigatorDelegate {
 }
 
 extension ReaderViewModel: EPUBNavigatorDelegate {
+    func pageTurnRootView(for navigator: EPUBNavigatorViewController) -> UIView? {
+        pageTurnRootView
+    }
+
+    func navigator(
+        _ navigator: EPUBNavigatorViewController,
+        previewLocationDidChange locator: Locator?,
+        viewport: NavigatorViewport?
+    ) {
+        updateReaderChrome(for: locator)
+        targetLiveSnapshotAtPreview = readerLiveSurfaceSnapshot(in: navigator)
+        samplePageTurnSurfaces(in: navigator)
+    }
+
     func navigator(_ navigator: VisualNavigator, didTapAt point: CGPoint) {
         pageTurnTapCount += 1
         pageTurnTapMarker = "count=\(pageTurnTapCount)"

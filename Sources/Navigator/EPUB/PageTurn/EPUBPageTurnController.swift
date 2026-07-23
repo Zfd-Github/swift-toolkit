@@ -30,8 +30,6 @@ extension EPUBPageTurnStyle {
 enum EPUBPageTurnInteraction {
     struct Policy: Equatable {
         let allowsNativeHorizontalPaging: Bool
-        let usesNonePan: Bool
-        let usesCoverPan: Bool
     }
 
     static func policy(
@@ -39,17 +37,9 @@ enum EPUBPageTurnInteraction {
         style: EPUBPageTurnStyle
     ) -> Policy {
         guard axis == .horizontalPaged else {
-            return Policy(
-                allowsNativeHorizontalPaging: true,
-                usesNonePan: false,
-                usesCoverPan: false
-            )
+            return Policy(allowsNativeHorizontalPaging: true)
         }
-        return Policy(
-            allowsNativeHorizontalPaging: style == .push,
-            usesNonePan: style == .none,
-            usesCoverPan: style == .cover
-        )
+        return Policy(allowsNativeHorizontalPaging: false)
     }
 
     static func direction(
@@ -155,6 +145,246 @@ enum EPUBPageTurnInteraction {
     }
 }
 
+@MainActor
+final class EPUBPageTurnSurfaceAnimator {
+    private struct RootIdentity: Equatable {
+        let root: ObjectIdentifier
+        let parent: ObjectIdentifier?
+        let window: ObjectIdentifier?
+        let frame: CGRect
+        let bounds: CGRect
+        let documentFrame: CGRect
+        let scale: CGFloat
+    }
+
+    private let rootViewProvider: () -> UIView?
+    private weak var documentView: UIView?
+    private var currentView: UIView
+    private var currentRootIdentity: RootIdentity
+    private var targetView: UIView?
+    private var targetRootIdentity: RootIdentity?
+    private let style: EPUBPageTurnStyle
+    private let physicalCompletionDirection: EPUBSpreadView.Direction
+    private var progress: CGFloat = 0
+
+    convenience init?(
+        rootView: UIView,
+        documentView: UIView? = nil,
+        style: EPUBPageTurnStyle,
+        physicalCompletionDirection: EPUBSpreadView.Direction
+    ) {
+        self.init(
+            rootViewProvider: { [weak rootView] in rootView },
+            documentView: documentView,
+            style: style,
+            physicalCompletionDirection: physicalCompletionDirection
+        )
+    }
+
+    init?(
+        rootViewProvider: @escaping () -> UIView?,
+        documentView: UIView? = nil,
+        style: EPUBPageTurnStyle,
+        physicalCompletionDirection: EPUBSpreadView.Direction
+    ) {
+        guard
+            let rootView = rootViewProvider(),
+            let parentView = rootView.superview,
+            let currentView = rootView.snapshotView(afterScreenUpdates: true)
+        else {
+            return nil
+        }
+        self.rootViewProvider = rootViewProvider
+        self.documentView = documentView ?? rootView
+        self.currentView = currentView
+        currentRootIdentity = Self.rootIdentity(
+            rootView: rootView,
+            documentView: documentView ?? rootView
+        )
+        self.style = style
+        self.physicalCompletionDirection = physicalCompletionDirection
+        configure(currentView, role: "current", frame: rootView.frame)
+        parentView.insertSubview(currentView, aboveSubview: rootView)
+    }
+
+    var hasTarget: Bool {
+        targetView != nil
+    }
+
+    var hasMatchingCurrentRootIdentity: Bool {
+        guard let rootView = rootViewProvider(), let documentView else { return false }
+        return currentRootIdentity == Self.rootIdentity(
+            rootView: rootView,
+            documentView: documentView
+        )
+    }
+
+    var hasMatchingTargetRootIdentity: Bool {
+        guard
+            let rootView = rootViewProvider(),
+            let documentView,
+            let targetRootIdentity
+        else {
+            return false
+        }
+        return targetRootIdentity == Self.rootIdentity(
+            rootView: rootView,
+            documentView: documentView
+        )
+    }
+
+    @discardableResult
+    func captureTarget() -> Bool {
+        guard
+            targetView == nil,
+            let rootView = rootViewProvider(),
+            let parentView = rootView.superview,
+            currentView.superview === parentView,
+            let targetView = rootView.snapshotView(afterScreenUpdates: true)
+        else {
+            return false
+        }
+        configure(targetView, role: "target", frame: rootView.frame)
+        parentView.insertSubview(targetView, aboveSubview: rootView)
+        parentView.bringSubviewToFront(currentView)
+        self.targetView = targetView
+        targetRootIdentity = Self.rootIdentity(
+            rootView: rootView,
+            documentView: documentView ?? rootView
+        )
+        render(progress: progress)
+        return true
+    }
+
+    @discardableResult
+    func recaptureTarget() -> Bool {
+        targetView?.removeFromSuperview()
+        targetView = nil
+        targetRootIdentity = nil
+        return captureTarget()
+    }
+
+    @discardableResult
+    func recaptureCommittedTarget() -> Bool {
+        guard
+            let rootView = rootViewProvider(),
+            let documentView,
+            let parentView = rootView.superview,
+            let replacement = rootView.snapshotView(afterScreenUpdates: true)
+        else {
+            return false
+        }
+        configure(replacement, role: "target", frame: rootView.frame)
+        parentView.insertSubview(replacement, aboveSubview: rootView)
+        targetView?.removeFromSuperview()
+        targetView = replacement
+        targetRootIdentity = Self.rootIdentity(
+            rootView: rootView,
+            documentView: documentView
+        )
+        render(progress: progress)
+        return true
+    }
+
+    @discardableResult
+    func recaptureCurrent() -> Bool {
+        guard
+            let rootView = rootViewProvider(),
+            let documentView,
+            let parentView = rootView.superview,
+            let replacement = rootView.snapshotView(afterScreenUpdates: true)
+        else {
+            return false
+        }
+        configure(replacement, role: "current", frame: rootView.frame)
+        parentView.insertSubview(replacement, aboveSubview: rootView)
+        currentView.removeFromSuperview()
+        currentView = replacement
+        currentRootIdentity = Self.rootIdentity(
+            rootView: rootView,
+            documentView: documentView
+        )
+        if let targetView, targetView.superview === parentView {
+            parentView.bringSubviewToFront(targetView)
+            parentView.bringSubviewToFront(currentView)
+        }
+        render(progress: progress)
+        return true
+    }
+
+    func render(progress: CGFloat) {
+        let progress = min(max(progress, 0), 1)
+        self.progress = progress
+        guard let rootView = rootViewProvider(), let targetView else { return }
+        let width = rootView.bounds.width
+        let sign: CGFloat = physicalCompletionDirection == .left ? -1 : 1
+        switch style {
+        case .push:
+            currentView.transform = CGAffineTransform(
+                translationX: sign * width * progress,
+                y: 0
+            )
+            targetView.transform = CGAffineTransform(
+                translationX: -sign * width * (1 - progress),
+                y: 0
+            )
+        case .cover:
+            currentView.transform = CGAffineTransform(
+                translationX: sign * width * progress,
+                y: 0
+            )
+            targetView.transform = .identity
+        case .none, .simulation:
+            currentView.transform = .identity
+            targetView.transform = .identity
+        }
+    }
+
+    func animate(to progress: CGFloat, duration: TimeInterval) async {
+        await withCheckedContinuation { continuation in
+            UIView.animate(
+                withDuration: duration,
+                delay: 0,
+                options: [.beginFromCurrentState, .curveEaseOut, .allowUserInteraction],
+                animations: { self.render(progress: progress) },
+                completion: { _ in continuation.resume() }
+            )
+        }
+    }
+
+    func remove() {
+        currentView.layer.removeAllAnimations()
+        targetView?.layer.removeAllAnimations()
+        currentView.removeFromSuperview()
+        targetView?.removeFromSuperview()
+        targetView = nil
+        targetRootIdentity = nil
+    }
+
+    private func configure(_ view: UIView, role: String, frame: CGRect) {
+        view.frame = frame
+        view.autoresizingMask = []
+        view.isAccessibilityElement = false
+        view.accessibilityElementsHidden = true
+        view.accessibilityIdentifier = "readium.page-turn.surface.\(role)"
+        view.isUserInteractionEnabled = false
+    }
+
+    private static func rootIdentity(rootView: UIView, documentView: UIView) -> RootIdentity {
+        rootView.layoutIfNeeded()
+        documentView.layoutIfNeeded()
+        return RootIdentity(
+            root: ObjectIdentifier(rootView),
+            parent: rootView.superview.map(ObjectIdentifier.init),
+            window: rootView.window.map(ObjectIdentifier.init),
+            frame: rootView.frame,
+            bounds: rootView.bounds,
+            documentFrame: documentView.convert(documentView.bounds, to: rootView),
+            scale: rootView.window?.screen.scale ?? rootView.traitCollection.displayScale
+        )
+    }
+}
+
 struct PageTurnSession {
     let id = UUID()
     let direction: EPUBSpreadView.Direction
@@ -175,125 +405,11 @@ struct PageTurnSession {
 }
 
 @MainActor
-final class EPUBCoverPageTurnAnimator {
-    struct Geometry: Equatable {
-        let currentX: CGFloat
-        let targetX: CGFloat
-        let shadowAlpha: CGFloat
-    }
-
-    private let currentView: UIImageView
-    private let targetView: UIImageView
-    private let shadowView = UIView()
-    private let isForward: Bool
-    private let physicalCompletionDirection: EPUBSpreadView.Direction
-    private weak var hostView: UIView?
-
-    init(
-        hostView: UIView,
-        currentImage: UIImage,
-        targetImage: UIImage,
-        isForward: Bool,
-        physicalCompletionDirection: EPUBSpreadView.Direction
-    ) {
-        self.hostView = hostView
-        self.isForward = isForward
-        self.physicalCompletionDirection = physicalCompletionDirection
-        currentView = Self.makeImageView(image: currentImage, frame: hostView.bounds)
-        targetView = Self.makeImageView(image: targetImage, frame: hostView.bounds)
-
-        shadowView.frame = CGRect(x: 0, y: 0, width: 12, height: hostView.bounds.height)
-        shadowView.autoresizingMask = [.flexibleHeight]
-        shadowView.backgroundColor = UIColor.black
-        shadowView.isAccessibilityElement = false
-        shadowView.accessibilityElementsHidden = true
-        shadowView.isUserInteractionEnabled = false
-
-        if isForward {
-            hostView.addSubview(targetView)
-            hostView.addSubview(currentView)
-        } else {
-            hostView.addSubview(currentView)
-            hostView.addSubview(targetView)
-        }
-        hostView.addSubview(shadowView)
-        render(progress: 0)
-    }
-
-    static func geometry(
-        progress: CGFloat,
-        viewportWidth: CGFloat,
-        isForward: Bool,
-        physicalCompletionDirection: EPUBSpreadView.Direction
-    ) -> Geometry {
-        let progress = min(max(progress, 0), 1)
-        let travelSign: CGFloat = physicalCompletionDirection == .left ? -1 : 1
-        return Geometry(
-            currentX: isForward ? travelSign * viewportWidth * progress : 0,
-            targetX: isForward ? 0 : -travelSign * viewportWidth * (1 - progress),
-            shadowAlpha: 0.18 * (1 - abs(2 * progress - 1))
-        )
-    }
-
-    func render(progress: CGFloat) {
-        guard let hostView else { return }
-        let geometry = Self.geometry(
-            progress: progress,
-            viewportWidth: hostView.bounds.width,
-            isForward: isForward,
-            physicalCompletionDirection: physicalCompletionDirection
-        )
-        currentView.transform = CGAffineTransform(translationX: geometry.currentX, y: 0)
-        targetView.transform = CGAffineTransform(translationX: geometry.targetX, y: 0)
-        shadowView.alpha = geometry.shadowAlpha
-
-        let movingX = isForward ? geometry.currentX : geometry.targetX
-        let shadowX: CGFloat
-        switch (isForward, physicalCompletionDirection) {
-        case (true, .left), (false, .right):
-            shadowX = hostView.bounds.width - shadowView.bounds.width
-        case (true, .right), (false, .left):
-            shadowX = 0
-        }
-        shadowView.transform = CGAffineTransform(translationX: movingX + shadowX, y: 0)
-    }
-
-    func animate(to progress: CGFloat, duration: TimeInterval) async {
-        await withCheckedContinuation { continuation in
-            UIView.animate(
-                withDuration: duration,
-                delay: 0,
-                options: [.beginFromCurrentState, .curveEaseOut, .allowUserInteraction],
-                animations: { self.render(progress: progress) },
-                completion: { _ in continuation.resume() }
-            )
-        }
-    }
-
-    func remove() {
-        currentView.removeFromSuperview()
-        targetView.removeFromSuperview()
-        shadowView.removeFromSuperview()
-    }
-
-    private static func makeImageView(image: UIImage, frame: CGRect) -> UIImageView {
-        let view = UIImageView(image: image)
-        view.frame = frame
-        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        view.contentMode = .scaleAspectFill
-        view.clipsToBounds = true
-        view.isAccessibilityElement = false
-        view.accessibilityElementsHidden = true
-        view.isUserInteractionEnabled = false
-        return view
-    }
-}
-
-@MainActor
 final class EPUBPageTurnController {
     private enum State {
         case idle
         case tracking(PageTurnSession, progress: CGFloat)
+        case settling(PageTurnSession)
         case restoring(PageTurnSession)
         case committing(PageTurnSession)
 
@@ -301,7 +417,8 @@ final class EPUBPageTurnController {
             switch self {
             case .idle:
                 return nil
-            case let .tracking(session, _), let .restoring(session), let .committing(session):
+            case let .tracking(session, _), let .settling(session),
+                 let .restoring(session), let .committing(session):
                 return session
             }
         }
@@ -317,6 +434,17 @@ final class EPUBPageTurnController {
 
     var isIdle: Bool {
         state.session == nil
+    }
+
+    var activeSession: PageTurnSession? {
+        state.session
+    }
+
+    var isCommitting: Bool {
+        if case .committing = state {
+            return true
+        }
+        return false
     }
 
     func isTracking(_ session: PageTurnSession) -> Bool {
@@ -394,77 +522,53 @@ final class EPUBPageTurnController {
             await operation()
         }
         state = .committing(session)
-        return await task.value
+        let result = await task.value
+        if case let .committing(activeSession) = state,
+           activeSession.id == session.id {
+            _ = finish(session)
+        }
+        return result
     }
 
-    func turnProgrammatically(
-        _ session: PageTurnSession,
-        animate: @escaping @MainActor () async -> Void,
-        performPageTurn: @escaping @MainActor () async -> Bool,
-        publishCurrentLocation: @escaping @MainActor () async -> Void,
-        finish: @escaping @MainActor () -> Void
+    func restorePreparedPage(
+        inverse: @escaping @MainActor () async -> Bool,
+        validateOriginalLocation: @escaping @MainActor () async -> Bool,
+        originalLocation: @escaping @MainActor () async -> Bool
     ) async -> Bool {
-        await animate()
-        if Task.isCancelled {
-            if isTracking(session) {
-                finish()
-            }
-            return false
+        if await inverse(), await validateOriginalLocation() {
+            return true
         }
-        return await commit(session) {
-            let moved = await performPageTurn()
-            if moved {
-                await publishCurrentLocation()
-            }
-            finish()
-            return moved
-        }
+        guard await originalLocation() else { return false }
+        return await validateOriginalLocation()
     }
 
     func restoreCover(
         _ session: PageTurnSession,
-        rebound: @escaping @MainActor (PageTurnSession) async -> Void,
+        rebound: @escaping @MainActor (PageTurnSession) async -> Bool,
         cleanup: @escaping @MainActor () -> Void,
         finish: @escaping @MainActor (PageTurnSession) -> Void
     ) async -> Bool {
-        guard
-            case let .tracking(activeSession, _) = state,
-            activeSession.id == session.id
-        else {
+        let activeSession: PageTurnSession?
+        switch state {
+        case let .tracking(active, _), let .settling(active):
+            activeSession = active
+        case .idle, .restoring, .committing:
+            activeSession = nil
+        }
+        guard activeSession?.id == session.id else {
             return false
         }
         state = .restoring(session)
-        await rebound(session)
-        cleanup()
-        finish(session)
-        return true
-    }
-
-    func settleCover(
-        settleSnapshots: @escaping @MainActor () async -> Void = {},
-        rebound: @escaping @MainActor (PageTurnSession) async -> Void,
-        cleanup: @escaping @MainActor () -> Void,
-        finish: @escaping @MainActor (PageTurnSession) -> Void
-    ) async {
-        switch state {
-        case .idle:
-            await settleSnapshots()
-        case let .tracking(session, _):
-            state = .restoring(session)
-            Task { @MainActor in
-                await settleSnapshots()
-                await rebound(session)
+        for _ in 0 ..< 2 {
+            if await rebound(session) {
                 cleanup()
                 finish(session)
+                return true
             }
-            await waitUntilIdle()
-            await settleSnapshots()
-        case .restoring, .committing:
-            await waitUntilIdle()
-            await settleSnapshots()
         }
-
-        await refreshCurrentLocation()
+        // The caller owns the terminal recovery while the surface stays visible.
+        state = .tracking(session, progress: 0)
+        return false
     }
 
     @discardableResult
@@ -482,7 +586,7 @@ final class EPUBPageTurnController {
         switch state {
         case let .tracking(session, _):
             return finish(session) ? session : nil
-        case .idle, .restoring, .committing:
+        case .idle, .settling, .restoring, .committing:
             return nil
         }
     }
@@ -494,12 +598,12 @@ final class EPUBPageTurnController {
         case .idle:
             break
         case let .tracking(session, _):
-            state = .restoring(session)
-            Task { @MainActor in
-                await restore(session)
+            state = .settling(session)
+            await restore(session)
+            if isTracking(session) {
+                _ = finish(session)
             }
-            await waitUntilIdle()
-        case .restoring, .committing:
+        case .settling, .restoring, .committing:
             await waitUntilIdle()
         }
 

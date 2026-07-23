@@ -15,6 +15,8 @@ enum AccessibilityID: String {
     case runStressTest
     case stressTestCompleted
     case readerViewport
+    case pageTurnTopChrome
+    case pageTurnBottomChrome
     case testActions
     case navigationActions
     case captureActions
@@ -56,13 +58,15 @@ enum AccessibilityID: String {
     case captureSnapshotProbe
     case captureSnapshotSelectionProbe
     case captureSnapshotMediaProbe
-    case coverProbeMarker
+    case pageTurnProbeMarker
     case activeMediaMarker
+    case preparePushProbe
+    case prepareNoneProbe
     case prepareCoverProbe
-    case captureCoverProbe
-    case awaitCoverForwardReady
-    case awaitCoverBackwardReady
-    case prepareCoverCrossResource
+    case rearmPageTurnProbe
+    case capturePageTurnProbe
+    case prepareCrossResourceProbe
+    case armColdCoverCrossResource
     case startCoverMediaProbe
     case stopCoverMediaProbe
 }
