@@ -284,6 +284,9 @@ struct EPUBPageTurnControllerTests {
         root.addSubview(navigator.view)
         container.addSubview(root)
         delegate.pageTurnRootView = root
+        delegate.pageTurnSurfaceController = makePageTurnSurfaceController(
+            root: root
+        )
         delegate.resetLocationChanges()
         #expect(navigator.armColdForwardPageTurnTargetForTesting())
 
@@ -318,6 +321,49 @@ struct EPUBPageTurnControllerTests {
         #expect(delegate.locationChangeCount == 1)
         #expect(pageCurlViews(in: container).isEmpty)
         #expect(pageTurnSurfaces(in: container).isEmpty)
+    }
+
+    @Test("simulation requires one explicit live surface controller")
+    func simulationRequiresExplicitLiveSurfaceController() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(
+            pageTurnStyle: .simulation
+        )
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = UIView(frame: container.bounds)
+        navigator.view.frame = root.bounds
+        root.addSubview(navigator.view)
+        container.addSubview(root)
+        delegate.pageTurnRootView = root
+        let original = try #require(navigator.currentLocation)
+
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: -700
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .ended,
+            translationX: -300,
+            velocityX: -700
+        )
+        await navigator.settlePageTurn()
+        #expect(navigator.currentLocation == original)
+
+        delegate.pageTurnSurfaceController = makePageTurnSurfaceController(
+            root: root
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: -700
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .ended,
+            translationX: -300,
+            velocityX: -700
+        )
+        await navigator.settlePageTurn()
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-2.xhtml"))
     }
 
     @Test("interactive pointer IDs clear after target changes and remain isolated")
@@ -1429,6 +1475,9 @@ struct EPUBPageTurnControllerTests {
             root.addSubview(navigator.view)
             container.addSubview(root)
             delegate.pageTurnRootView = root
+            delegate.pageTurnSurfaceController = makePageTurnSurfaceController(
+                root: root
+            )
             delegate.resetLocationChanges()
             let link = try #require(navigator.publication.readingOrder.dropFirst().first)
             let target = try #require(await navigator.publication.locate(link))
@@ -1558,6 +1607,9 @@ struct EPUBPageTurnControllerTests {
             root.addSubview(navigator.view)
             container.addSubview(root)
             delegate.pageTurnRootView = root
+            delegate.pageTurnSurfaceController = makePageTurnSurfaceController(
+                root: root
+            )
             delegate.resetLocationChanges()
             let original = try #require(navigator.currentLocation)
             var scheduledFrameCount = 0
@@ -3443,8 +3495,16 @@ private final class SnapshotObservingView: UIView {
 }
 
 @MainActor
+private func makePageTurnSurfaceController(root: UIView) -> UIViewController {
+    let controller = UIViewController()
+    controller.view = root
+    return controller
+}
+
+@MainActor
 private final class Delegate: EPUBNavigatorDelegate {
     weak var pageTurnRootView: UIView?
+    var pageTurnSurfaceController: UIViewController?
     private(set) var presentationChangeCount = 0
     private(set) var locationChangeCount = 0
     private(set) var previewEndCount = 0
@@ -3453,6 +3513,18 @@ private final class Delegate: EPUBNavigatorDelegate {
 
     func pageTurnRootView(for navigator: EPUBNavigatorViewController) -> UIView? {
         pageTurnRootView
+    }
+
+    func pageTurnContainerViewController(
+        for navigator: EPUBNavigatorViewController
+    ) -> UIViewController? {
+        pageTurnSurfaceController
+    }
+
+    func pageTurnLiveSurfaceViewController(
+        for navigator: EPUBNavigatorViewController
+    ) -> UIViewController? {
+        pageTurnSurfaceController
     }
 
     func navigator(_ navigator: Navigator, locationDidChange locator: Locator) {

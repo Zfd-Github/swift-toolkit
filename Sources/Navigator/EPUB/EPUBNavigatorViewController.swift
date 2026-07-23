@@ -26,6 +26,16 @@ func pageTurnSnapshotsRequireInvalidationForPagesDidChange(
     /// Root view representing one complete reader page, including app chrome.
     func pageTurnRootView(for navigator: EPUBNavigatorViewController) -> UIView?
 
+    /// UIKit owner for a complete reader surface transaction.
+    func pageTurnContainerViewController(
+        for navigator: EPUBNavigatorViewController
+    ) -> UIViewController?
+
+    /// The complete live surface captured by a simulation transaction.
+    func pageTurnLiveSurfaceViewController(
+        for navigator: EPUBNavigatorViewController
+    ) -> UIViewController?
+
     /// Presents a temporary location while the live reader is hidden by a page surface.
     func navigator(
         _ navigator: EPUBNavigatorViewController,
@@ -40,6 +50,14 @@ func pageTurnSnapshotsRequireInvalidationForPagesDidChange(
 
 public extension EPUBNavigatorDelegate {
     func pageTurnRootView(for navigator: EPUBNavigatorViewController) -> UIView? { nil }
+
+    func pageTurnContainerViewController(
+        for navigator: EPUBNavigatorViewController
+    ) -> UIViewController? { nil }
+
+    func pageTurnLiveSurfaceViewController(
+        for navigator: EPUBNavigatorViewController
+    ) -> UIViewController? { nil }
 
     func navigator(
         _ navigator: EPUBNavigatorViewController,
@@ -1013,6 +1031,22 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return await Self.runPageTurnTransaction(transaction) { self }
     }
 
+    private func pageTurnRootView(for style: EPUBPageTurnStyle) -> UIView? {
+        guard style == .simulation else {
+            return delegate?.pageTurnRootView(for: self)
+        }
+        guard
+            let container = delegate?.pageTurnContainerViewController(for: self),
+            let liveSurface = delegate?.pageTurnLiveSurfaceViewController(for: self),
+            container === liveSurface,
+            let containerView = container.viewIfLoaded,
+            view.isDescendant(of: containerView)
+        else {
+            return nil
+        }
+        return containerView
+    }
+
     private func installPageTurnSurface(
         _ session: PageTurnSession,
         style: EPUBPageTurnStyle
@@ -1024,7 +1058,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             let animator = EPUBPageTurnSurfaceAnimator(
                 rootViewProvider: { [weak self] in
                     guard let self else { return nil }
-                    return self.delegate?.pageTurnRootView(for: self)
+                    return self.pageTurnRootView(for: style)
                 },
                 documentView: view,
                 style: style,
@@ -1644,7 +1678,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 previous = nil
                 continue
             }
-            guard let rootView = delegate?.pageTurnRootView(for: self) else {
+            guard let rootView = pageTurnRootView(
+                for: pageTurnTransaction?.style ?? currentEffectivePageTurnStyle()
+            ) else {
                 return false
             }
             rootView.layoutIfNeeded()
