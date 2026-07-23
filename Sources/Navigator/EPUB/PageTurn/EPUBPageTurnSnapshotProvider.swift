@@ -46,7 +46,6 @@ final class EPUBPageTurnSnapshotProvider {
 
     private var deferredReload: (() -> Void)?
     private var deferredPreferences: (() -> Void)?
-    private var deferredPageTurnStyle: (() -> Void)?
 
     var isIdle: Bool {
         !hasCaptureLease && leaseWaiters.isEmpty && !hasDeferredMutations
@@ -99,12 +98,6 @@ final class EPUBPageTurnSnapshotProvider {
 
     func deferPreferences(_ mutation: @escaping () -> Void) {
         deferredPreferences = mutation
-        cancelActiveCapture()
-        drainDeferredMutationsIfPossible()
-    }
-
-    func deferPageTurnStyle(_ mutation: @escaping () -> Void) {
-        deferredPageTurnStyle = mutation
         cancelActiveCapture()
         drainDeferredMutationsIfPossible()
     }
@@ -213,7 +206,7 @@ final class EPUBPageTurnSnapshotProvider {
     }
 
     private var hasDeferredMutations: Bool {
-        deferredReload != nil || deferredPreferences != nil || deferredPageTurnStyle != nil
+        deferredReload != nil || deferredPreferences != nil
     }
 
     private func acquireCaptureLease() async {
@@ -251,13 +244,10 @@ final class EPUBPageTurnSnapshotProvider {
     private func drainDeferredMutations() {
         let reload = deferredReload
         let preferences = deferredPreferences
-        let pageTurnStyle = deferredPageTurnStyle
         deferredReload = nil
         deferredPreferences = nil
-        deferredPageTurnStyle = nil
         reload?()
         preferences?()
-        pageTurnStyle?()
     }
 
     private func resumeWaitersIfIdle() {

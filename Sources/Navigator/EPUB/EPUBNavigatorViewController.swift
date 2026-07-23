@@ -311,13 +311,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         get { storedPageTurnStyle }
         set {
             guard storedPageTurnStyle != newValue || !snapshotProvider.isIdle else { return }
+            storedPageTurnStyle = newValue
             cancelActivePageTurn()
             snapshotProvider.invalidate()
-            snapshotProvider.deferPageTurnStyle { [weak self] in
-                guard let self else { return }
-                self.storedPageTurnStyle = newValue
-                self.updatePageTurnInteractionMode()
-            }
+            updatePageTurnInteractionMode()
         }
     }
     private let loadPositionsByReadingOrder: () async -> ReadResult<[[Locator]]>

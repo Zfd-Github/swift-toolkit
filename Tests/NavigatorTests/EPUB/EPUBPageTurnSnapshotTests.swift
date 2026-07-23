@@ -298,7 +298,7 @@ struct EPUBPageTurnSnapshotTests {
         #expect(spread.locationPublishCount == 0)
     }
 
-    @Test("named deferred slots drain reload preferences style then re-enable input")
+    @Test("named deferred slots drain reload then preferences and re-enable input")
     func namedDeferredMutationSlotsDrainInOrder() async throws {
         let provider = EPUBPageTurnSnapshotProvider()
         let spread = FakeSnapshotSpread(pageIndex: 1)
@@ -311,8 +311,6 @@ struct EPUBPageTurnSnapshotTests {
         provider.deferPreferences { spread.mutationEvents.append("preferences:last") }
         provider.deferReload { spread.mutationEvents.append("reload") }
         provider.deferReload { spread.mutationEvents.append("reload") }
-        provider.deferPageTurnStyle { spread.mutationEvents.append("style:cover") }
-        provider.deferPageTurnStyle { spread.mutationEvents.append("style:simulation") }
         #expect(!provider.isInputEnabled)
 
         let settleTask = Task { await provider.settle() }
@@ -325,7 +323,7 @@ struct EPUBPageTurnSnapshotTests {
         spread.allowedRestoreFrames = 2
         await settleTask.value
         _ = await captureTask.value
-        #expect(spread.mutationEvents == ["reload", "preferences:last", "style:simulation"])
+        #expect(spread.mutationEvents == ["reload", "preferences:last"])
         #expect(provider.isInputEnabled)
         #expect(provider.isIdle)
 
