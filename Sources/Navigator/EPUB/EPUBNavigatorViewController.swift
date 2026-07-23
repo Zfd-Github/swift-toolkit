@@ -630,7 +630,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         get async { await tableOfContentsTitleByHrefTask.value }
     }
 
-    private lazy var tableOfContentsTitleByHrefTask: Task<[AnyURL: String], Never> = Task {
+    private lazy var tableOfContentsTitleByHrefTask: Task<[AnyURL: String], Never> = Task { [publication] in
         func fulfill(linkList: [Link]) -> [AnyURL: String] {
             var result = [AnyURL: String]()
 
@@ -764,7 +764,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
     }
 
+    private struct PendingPageTurnGesture {
+        let direction: EPUBSpreadView.Direction
+        var translationX: CGFloat
+        var velocityX: CGFloat
+        var terminalState: UIGestureRecognizer.State?
+    }
+
     private var pageTurnTransaction: PageTurnTransaction?
+    private var pendingPageTurnGesture: PendingPageTurnGesture?
 
     private var pageTurnPanSession: PageTurnSession? {
         pageTurnTransaction?.session
@@ -810,6 +818,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         () async -> (Locator?, NavigatorViewport?)
     )?
     var pageTurnDisplayFrameWaiterForTesting: (() async -> Void)?
+    var pageTurnWillValidateCommitForTesting: (() -> Void)?
     private var coldPageTurnTargetIndexForTesting: Int?
     private var isColdPageTurnArmedForTesting = false
     private var didBeginWithColdTargetForTesting = false
@@ -1002,39 +1011,55 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return true
     }
 
-    private func calculatePageTurnPreview() async -> PageTurnPreview? {
-        let result = if let pageTurnPreviewCalculationForTesting {
-            await pageTurnPreviewCalculationForTesting()
-        } else {
-            await computeCurrentLocationAndViewport()
-        }
-        guard let location = result.0, let viewport = result.1 else {
-            return nil
-        }
-        return PageTurnPreview(location: location, viewport: viewport)
+    private func pageTurnPreviewCalculation() -> (
+        () async -> (Locator?, NavigatorViewport?)
+    ) {
+        pageTurnPreviewCalculationForTesting
+            ?? currentLocationCalculation()
     }
 
-    private func waitForPageTurnPreview() async -> PageTurnPreview? {
+    private static func waitForPageTurnPreview(
+        calculating: () async -> (Locator?, NavigatorViewport?),
+        displayFrameWaiter: (() async -> Void)?
+    ) async -> PageTurnPreview? {
         for _ in 0 ..< 60 {
-            if let preview = await calculatePageTurnPreview() {
-                return preview
+            guard !Task.isCancelled else { return nil }
+            let result = await calculating()
+            guard !Task.isCancelled else { return nil }
+            if let location = result.0, let viewport = result.1 {
+                return PageTurnPreview(location: location, viewport: viewport)
             }
-            await waitForPageTurnDisplayFrame()
+            await waitForPageTurnDisplayFrame(displayFrameWaiter)
         }
         return nil
     }
 
-    private func waitForPageTurnDisplayFrame() async {
-        if let pageTurnDisplayFrameWaiterForTesting {
-            await pageTurnDisplayFrameWaiterForTesting()
+    private static func waitForPageTurnDisplayFrame(
+        _ displayFrameWaiter: (() async -> Void)?
+    ) async {
+        if let displayFrameWaiter {
+            await displayFrameWaiter()
         } else {
             await PageTurnAnimationFrameWaiter.wait()
         }
     }
 
+    private func waitForPageTurnDisplayFrame() async {
+        await Self.waitForPageTurnDisplayFrame(
+            pageTurnDisplayFrameWaiterForTesting
+        )
+    }
+
     private func waitForPageTurnDisplayFrames() async {
         await waitForPageTurnDisplayFrame()
         await waitForPageTurnDisplayFrame()
+    }
+
+    private static func waitForPageTurnDisplayFrames(
+        _ displayFrameWaiter: (() async -> Void)?
+    ) async {
+        await waitForPageTurnDisplayFrame(displayFrameWaiter)
+        await waitForPageTurnDisplayFrame(displayFrameWaiter)
     }
 
     private func startPageTurnTransaction(
@@ -1058,7 +1083,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         _ transaction: PageTurnTransaction,
         navigator: @escaping @MainActor () -> EPUBNavigatorViewController?
     ) async -> Bool {
-        let prepared = if transaction.style == .none {
+        if Task.isCancelled {
+            transaction.resolve(.cancel)
+        }
+        let prepared = if transaction.terminalIntent == .cancel {
+            false
+        } else if transaction.style == .none {
             true
         } else {
             await preparePageTurnSurface(transaction, navigator: navigator)
@@ -1093,7 +1123,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
         } else if intent == .commit, transaction.isPrepared {
             result = await owner.commitPageTurnSurface(
-                transaction.session,
+                transaction,
                 progress: transaction.progress
             )
         } else {
@@ -1111,6 +1141,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         transaction.complete(with: result)
         if owner.pageTurnTransaction === transaction {
             owner.pageTurnTransaction = nil
+            owner.resumePendingPageTurnGesture()
         }
         return result
     }
@@ -1131,7 +1162,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         else {
             return false
         }
-        guard let originalPreview = await navigator()?.waitForPageTurnPreview() else {
+        guard
+            let originalCalculation = navigator()?.pageTurnPreviewCalculation(),
+            let originalPreview = await waitForPageTurnPreview(
+                calculating: originalCalculation,
+                displayFrameWaiter: navigator()?.pageTurnDisplayFrameWaiterForTesting
+            )
+        else {
             return false
         }
         navigator()?.pageTurnSurfaceOriginalPreview = originalPreview
@@ -1151,47 +1188,71 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 owner.paginationView?.loadedViews[coldTarget] == nil
         }
         let moved = await navigation()
+        navigator()?.pageTurnTransactionTask = nil
         guard
-            let owner = navigator(),
-            owner.pageTurnTransaction === transaction,
+            navigator()?.pageTurnTransaction === transaction,
             moved,
-            owner.pageTurnController.isTracking(session)
+            navigator()?.pageTurnController.isTracking(session) == true
         else {
             return false
         }
         transaction.didPrepareTarget = true
 
-        guard let targetPreview = await owner.waitForPageTurnPreview() else {
-            return false
-        }
-        if let coldTarget = owner.coldPageTurnTargetIndexForTesting {
-            owner.didNavigateColdTargetForTesting =
-                owner.didBeginWithColdTargetForTesting
-                && owner.paginationView?.currentIndex == coldTarget
-                && owner.paginationView?.loadedViews[coldTarget] != nil
-        }
-        owner.pageTurnSurfaceTargetPreview = targetPreview
-        owner.delegate?.navigator(
-            owner,
-            previewLocationDidChange: targetPreview.location,
-            viewport: targetPreview.viewport
-        )
-        await owner.waitForPageTurnDisplayFrames()
         guard
-            owner.pageTurnTransaction === transaction,
-            owner.pageTurnController.isTracking(session)
+            let targetCalculation = navigator()?.pageTurnPreviewCalculation(),
+            let targetPreview = await waitForPageTurnPreview(
+                calculating: targetCalculation,
+                displayFrameWaiter: navigator()?.pageTurnDisplayFrameWaiterForTesting
+            )
         else {
             return false
         }
-        guard owner.capturePageTurnTargetSurface() else { return false }
-        if owner.isColdPageTurnArmedForTesting {
+        if
+            let coldTarget = navigator()?.coldPageTurnTargetIndexForTesting,
+            let owner = navigator()
+        {
+            owner.didNavigateColdTargetForTesting =
+                owner.didBeginWithColdTargetForTesting
+                    && owner.paginationView?.currentIndex == coldTarget
+                    && owner.paginationView?.loadedViews[coldTarget] != nil
+        }
+        if let owner = navigator() {
+            owner.pageTurnSurfaceTargetPreview = targetPreview
+            owner.delegate?.navigator(
+                owner,
+                previewLocationDidChange: targetPreview.location,
+                viewport: targetPreview.viewport
+            )
+        }
+        await waitForPageTurnDisplayFrames(
+            navigator()?.pageTurnDisplayFrameWaiterForTesting
+        )
+        guard
+            navigator()?.pageTurnTransaction === transaction,
+            navigator()?.pageTurnController.isTracking(session) == true
+        else {
+            return false
+        }
+        guard navigator()?.capturePageTurnTargetSurface() == true else {
+            return false
+        }
+        if
+            navigator()?.isColdPageTurnArmedForTesting == true,
+            let owner = navigator()
+        {
             owner.didCaptureAfterColdNavigationForTesting =
                 owner.didNavigateColdTargetForTesting
-                && owner.pageTurnSurfaceAnimator?.hasTarget == true
+                    && owner.pageTurnSurfaceAnimator?.hasTarget == true
         }
-        await owner.waitForPageTurnDisplayFrames()
-        guard await owner.matchPageTurnSurfaceIdentities() else { return false }
-        owner.pageTurnSurfaceAnimator?.render(progress: transaction.progress)
+        await waitForPageTurnDisplayFrames(
+            navigator()?.pageTurnDisplayFrameWaiterForTesting
+        )
+        guard await matchPageTurnSurfaceIdentities(navigator: navigator) else {
+            return false
+        }
+        navigator()?.pageTurnSurfaceAnimator?.render(
+            progress: transaction.progress
+        )
         return true
     }
 
@@ -1205,6 +1266,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         guard let animator = pageTurnSurfaceAnimator else { return false }
         guard animator.hasMatchingCurrentRootIdentity else { return false }
         for _ in 0 ..< 3 {
+            guard !Task.isCancelled else { return false }
             guard !animator.hasMatchingTargetRootIdentity else { return true }
             guard animator.recaptureTarget() else { return false }
             await waitForPageTurnDisplayFrames()
@@ -1213,9 +1275,34 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return animator.hasMatchingTargetRootIdentity
     }
 
+    private static func matchPageTurnSurfaceIdentities(
+        navigator: @escaping @MainActor () -> EPUBNavigatorViewController?
+    ) async -> Bool {
+        guard navigator()?.pageTurnSurfaceAnimator?.hasMatchingCurrentRootIdentity == true else {
+            return false
+        }
+        for _ in 0 ..< 3 {
+            guard !Task.isCancelled else { return false }
+            guard navigator()?.pageTurnSurfaceAnimator?.hasMatchingTargetRootIdentity != true else {
+                return true
+            }
+            guard navigator()?.pageTurnSurfaceAnimator?.recaptureTarget() == true else {
+                return false
+            }
+            await waitForPageTurnDisplayFrames(
+                navigator()?.pageTurnDisplayFrameWaiterForTesting
+            )
+            guard navigator()?.pageTurnSurfaceAnimator?.hasMatchingCurrentRootIdentity == true else {
+                return false
+            }
+        }
+        return navigator()?.pageTurnSurfaceAnimator?.hasMatchingTargetRootIdentity == true
+    }
+
     private func matchCommittedPageTurnSurfaceIdentity() async -> Bool {
         guard let animator = pageTurnSurfaceAnimator else { return false }
         for _ in 0 ..< 3 {
+            guard !Task.isCancelled else { return false }
             guard !animator.hasMatchingTargetRootIdentity else { return true }
             guard animator.recaptureCommittedTarget() else { return false }
             await waitForPageTurnDisplayFrames()
@@ -1224,11 +1311,20 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func commitPageTurnSurface(
-        _ session: PageTurnSession,
+        _ transaction: PageTurnTransaction,
         progress: CGFloat
     ) async -> Bool {
+        let session = transaction.session
         guard let animator = pageTurnSurfaceAnimator else { return false }
+        pageTurnWillValidateCommitForTesting?()
         guard await matchPageTurnSurfaceIdentities() else {
+            return await cancelPageTurnSurface(session)
+        }
+        guard
+            pageTurnTransaction === transaction,
+            transaction.terminalIntent == .commit,
+            pageTurnController.isTracking(session)
+        else {
             return await cancelPageTurnSurface(session)
         }
         let remaining = 1 - min(max(progress, 0), 1)
@@ -2104,6 +2200,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         pageTurnController.isCommitting
     }
 
+    func recaptureCurrentPageTurnSurfaceForTesting() -> Bool {
+        pageTurnSurfaceAnimator?.recaptureCurrent() == true
+    }
+
     struct PageTurnSurfaceTransactionEvidenceForTesting {
         let isCold: Bool
         let hasPreparedTarget: Bool
@@ -2149,8 +2249,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         isInstallingPageTurnSurface
     }
 
-    func canBeginPageTurnPanForTesting() -> Bool {
-        shouldBeginPageTurnPan()
+    func canBeginPageTurnPanForTesting(
+        to direction: EPUBSpreadView.Direction = .right
+    ) -> Bool {
+        shouldBeginPageTurnPan(to: direction)
     }
 
     var isPageTurnSnapshotInputEnabledForTesting: Bool {
@@ -2335,14 +2437,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         )
     }
 
-    private func shouldBeginPageTurnPan() -> Bool {
+    private func shouldBeginPageTurnPan(
+        to direction: EPUBSpreadView.Direction
+    ) -> Bool {
         guard
             let paginationView,
             paginationView.axis == .horizontalPaged,
             currentEffectivePageTurnStyle() != .simulation,
-            pageTurnTransaction == nil,
-            state == .idle,
-            pageTurnController.isIdle,
             currentSelection == nil,
             !((paginationView.currentView as? EPUBSpreadView)?.hasActiveMedia ?? false),
             !((paginationView.currentView as? EPUBSpreadView)?.hasActiveInteractivePointer ?? false),
@@ -2351,14 +2452,32 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return false
         }
 
-        return true
+        if let transaction = pageTurnTransaction {
+            return !pageTurnController.isCommitting
+                && pendingPageTurnGesture == nil
+                && transaction.session.direction != direction
+        }
+        return state == .idle && pageTurnController.isIdle
     }
 
     private func beginPageTurnPan(
-        to direction: EPUBSpreadView.Direction
+        to direction: EPUBSpreadView.Direction,
+        velocityX: CGFloat = 0
     ) -> Bool {
+        guard shouldBeginPageTurnPan(to: direction) else {
+            return false
+        }
+        if let transaction = pageTurnTransaction {
+            pendingPageTurnGesture = PendingPageTurnGesture(
+                direction: direction,
+                translationX: 0,
+                velocityX: velocityX,
+                terminalState: nil
+            )
+            transaction.resolve(.cancel)
+            return true
+        }
         guard
-            shouldBeginPageTurnPan(),
             let session = beginPageTurn(to: direction)
         else {
             return false
@@ -2377,6 +2496,55 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
         startPageTurnTransaction(transaction)
         return true
+    }
+
+    private func updatePendingPageTurnGesture(
+        state: UIGestureRecognizer.State,
+        translationX: CGFloat,
+        velocityX: CGFloat
+    ) -> Bool {
+        guard var pending = pendingPageTurnGesture else { return false }
+        pending.translationX = translationX
+        pending.velocityX = velocityX
+        if state == .ended || state == .cancelled || state == .failed {
+            pending.terminalState = state
+        }
+        pendingPageTurnGesture = pending
+        return true
+    }
+
+    private func resumePendingPageTurnGesture() {
+        guard
+            pageTurnTransaction == nil,
+            let pending = pendingPageTurnGesture
+        else {
+            return
+        }
+        pendingPageTurnGesture = nil
+        guard
+            pending.terminalState != .cancelled,
+            pending.terminalState != .failed,
+            beginPageTurnPan(
+                to: pending.direction,
+                velocityX: pending.velocityX
+            )
+        else {
+            return
+        }
+        if pending.translationX != 0 {
+            handlePageTurnPan(
+                state: .changed,
+                translationX: pending.translationX,
+                velocityX: pending.velocityX
+            )
+        }
+        if let terminalState = pending.terminalState {
+            handlePageTurnPan(
+                state: terminalState,
+                translationX: pending.translationX,
+                velocityX: pending.velocityX
+            )
+        }
     }
 
     private func resolvePageTurnTransaction(
@@ -2409,9 +2577,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 EPUBPageTurnInteraction.coverDirection(for: velocity)
             }
             guard let direction else { return }
-            _ = beginPageTurnPan(to: direction)
+            _ = beginPageTurnPan(to: direction, velocityX: velocityX)
 
         case .changed:
+            if updatePendingPageTurnGesture(
+                state: state,
+                translationX: translationX,
+                velocityX: velocityX
+            ) {
+                return
+            }
             guard let session = pageTurnPanSession else { return }
             if pageTurnSurfaceStyle == EPUBPageTurnStyle.none {
                 _ = pageTurnController.track(
@@ -2429,6 +2604,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
 
         case .ended:
+            if updatePendingPageTurnGesture(
+                state: state,
+                translationX: translationX,
+                velocityX: velocityX
+            ) {
+                return
+            }
             guard let session = pageTurnPanSession else { return }
             let shouldCommit = if pageTurnSurfaceStyle == EPUBPageTurnStyle.none {
                 EPUBPageTurnInteraction.shouldCommit(
@@ -2448,6 +2630,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             resolvePageTurnTransaction(session, shouldCommit: shouldCommit)
 
         case .cancelled, .failed:
+            if updatePendingPageTurnGesture(
+                state: state,
+                translationX: translationX,
+                velocityX: velocityX
+            ) {
+                return
+            }
             guard let session = pageTurnPanSession else { return }
             resolvePageTurnTransaction(session, shouldCommit: false)
 
@@ -2476,20 +2665,22 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         )
     }
 
-    private func computeCurrentLocationAndViewport() async -> (Locator?, NavigatorViewport?) {
+    private func currentLocationCalculation() -> (
+        () async -> (Locator?, NavigatorViewport?)
+    ) {
         if case .initializing = state {
             assertionFailure("Cannot update current location when initializing the navigator")
-            return (nil, nil)
+            return { (nil, nil) }
         }
 
         // Returns any pending locator to prevent returning invalid locations
         // while loading it.
         if let pendingLocator = state.pendingLocator {
-            return (pendingLocator, nil)
+            return { (pendingLocator, nil) }
         }
 
         guard let paginationView else {
-            return (nil, nil)
+            return { (nil, nil) }
         }
 
         if paginationView.axis == .verticalContinuous {
@@ -2513,32 +2704,49 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 let firstIndex = progressions.keys.min(),
                 let lastIndex = progressions.keys.max()
             else {
-                return (nil, nil)
+                return { (nil, nil) }
             }
 
-            return await EPUBViewportAndLocationCalculator.compute(
-                readingOrderIndices: firstIndex ... lastIndex,
-                progression: { progressions[$0] ?? 0 ... 0 },
-                readingOrder: readingOrder,
-                positionsByReadingOrder: positionsByReadingOrder,
-                tableOfContentsTitleByHref: tableOfContentsTitleByHref,
-                fallbackLocator: { [publication] in await publication.locate($0) }
-            )
+            let readingOrder = readingOrder
+            let positionsByReadingOrder = positionsByReadingOrder
+            let tableOfContentsTitleByHrefTask = tableOfContentsTitleByHrefTask
+            return { [publication] in
+                let tableOfContentsTitleByHref =
+                    await tableOfContentsTitleByHrefTask.value
+                return await EPUBViewportAndLocationCalculator.compute(
+                    readingOrderIndices: firstIndex ... lastIndex,
+                    progression: { progressions[$0] ?? 0 ... 0 },
+                    readingOrder: readingOrder,
+                    positionsByReadingOrder: positionsByReadingOrder,
+                    tableOfContentsTitleByHref: tableOfContentsTitleByHref,
+                    fallbackLocator: { await publication.locate($0) }
+                )
+            }
         }
 
         guard let spreadView = paginationView.currentView as? EPUBSpreadView else {
-            return (nil, nil)
+            return { (nil, nil) }
         }
 
-        let (locator, viewport) = await EPUBViewportAndLocationCalculator.compute(
-            readingOrderIndices: spreadView.spread.readingOrderIndices,
-            progression: { spreadView.progression(in: $0) },
-            readingOrder: readingOrder,
-            positionsByReadingOrder: positionsByReadingOrder,
-            tableOfContentsTitleByHref: tableOfContentsTitleByHref,
-            fallbackLocator: { [publication] in await publication.locate($0) }
-        )
-        return (locator, viewport)
+        let readingOrder = readingOrder
+        let positionsByReadingOrder = positionsByReadingOrder
+        let tableOfContentsTitleByHrefTask = tableOfContentsTitleByHrefTask
+        return { [publication] in
+            let tableOfContentsTitleByHref =
+                await tableOfContentsTitleByHrefTask.value
+            return await EPUBViewportAndLocationCalculator.compute(
+                readingOrderIndices: spreadView.spread.readingOrderIndices,
+                progression: { spreadView.progression(in: $0) },
+                readingOrder: readingOrder,
+                positionsByReadingOrder: positionsByReadingOrder,
+                tableOfContentsTitleByHref: tableOfContentsTitleByHref,
+                fallbackLocator: { await publication.locate($0) }
+            )
+        }
+    }
+
+    private func computeCurrentLocationAndViewport() async -> (Locator?, NavigatorViewport?) {
+        await currentLocationCalculation()()
     }
 
     public func firstVisibleElementLocator() async -> Locator? {
@@ -2642,13 +2850,21 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func settlePageTurn() async {
-        if
-            !pageTurnController.isCommitting,
-            pageTurnTransaction?.terminalIntent == nil
-        {
-            cancelActivePageTurn()
-        }
-        if let transaction = pageTurnTransaction, transaction.isRunning {
+        var waitedSessionIDs = Set<UUID>()
+        for _ in 0 ..< 2 {
+            guard
+                let transaction = pageTurnTransaction,
+                transaction.isRunning,
+                waitedSessionIDs.insert(transaction.session.id).inserted
+            else {
+                break
+            }
+            if
+                !pageTurnController.isCommitting,
+                transaction.terminalIntent == nil
+            {
+                cancelActivePageTurn()
+            }
             _ = await transaction.waitForCompletion()
         }
         await pageTurnController.settle { [weak self] session in
@@ -3345,7 +3561,7 @@ extension EPUBNavigatorViewController: UIGestureRecognizerDelegate {
         } else {
             EPUBPageTurnInteraction.coverDirection(for: velocity)
         }
-        return direction != nil && shouldBeginPageTurnPan()
+        return direction.map(shouldBeginPageTurnPan(to:)) ?? false
     }
 }
 
