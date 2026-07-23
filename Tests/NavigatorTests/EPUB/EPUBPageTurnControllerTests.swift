@@ -36,7 +36,7 @@ struct EPUBPageTurnControllerTests {
         #expect(delegate.errorCount == 0)
     }
 
-    @Test("capture-time page turn style assignments are last-wins even when returning to the applied value")
+    @Test("capture-time page turn style assignments immediately route with the requested style")
     func captureTimePageTurnStyleIsLastWins() async throws {
         let publication = Publication(
             manifest: Manifest(metadata: Metadata(title: "Test"))
@@ -74,8 +74,31 @@ struct EPUBPageTurnControllerTests {
         }
         #expect(await waitUntil { didStartCapture })
 
-        navigator.pageTurnStyle = .none
+        navigator.pageTurnStyle = .simulation
+
+        // A capture lease may postpone cache cleanup, but it must never make
+        // the next navigation transaction read the previous user selection.
+        #expect(navigator.pageTurnStyle == .simulation)
+        var routedOptions: [NavigatorGoOptions] = []
+        let routed = await navigator.routePageTurn(
+            to: .right,
+            options: .init(animated: true),
+            axis: .horizontalPaged,
+            isReduceMotionEnabled: false,
+            isVoiceOverRunning: false,
+            usingExistingPath: { _, _ in false },
+            usingPageTurn: { _, options in
+                routedOptions.append(options)
+                return true
+            },
+            usingCover: { _, _ in false }
+        )
+        #expect(routed)
+        #expect(routedOptions.count == 1)
+        #expect(routedOptions.first?.animated == false)
+
         navigator.pageTurnStyle = .push
+        #expect(navigator.pageTurnStyle == .push)
         canFinishCapture = true
         _ = await captureTask.value
 
