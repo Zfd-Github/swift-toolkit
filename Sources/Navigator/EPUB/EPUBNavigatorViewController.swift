@@ -958,6 +958,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             defer { finishPageTurn(session) }
             let moved = await performPageTurn(session, options: options)
             guard moved else { return false }
+            if
+                let transaction = pageTurnTransaction,
+                transaction.session.id == session.id,
+                transaction.style == .none
+            {
+                await waitForPageTurnDisplayFrames()
+            }
             return await publishCurrentLocation()
         }
     }
@@ -1236,7 +1243,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
         guard
             let targetCalculation = navigator()?.pageTurnPreviewCalculation(),
-            let targetPreview = await waitForPageTurnPreview(
+            var targetPreview = await waitForPageTurnPreview(
                 calculating: targetCalculation,
                 displayFrameWaiter: navigator()?.pageTurnDisplayFrameWaiterForTesting
             )
@@ -1252,17 +1259,33 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                     && owner.paginationView?.currentIndex == coldTarget
                     && owner.paginationView?.loadedViews[coldTarget] != nil
         }
-        if let owner = navigator() {
-            owner.pageTurnSurfaceTargetPreview = targetPreview
-            owner.delegate?.navigator(
-                owner,
-                previewLocationDidChange: targetPreview.location,
-                viewport: targetPreview.viewport
+        var isTargetPreviewStable = false
+        for _ in 0 ..< 3 {
+            guard publishPageTurnTargetPreview(
+                targetPreview,
+                navigator: navigator
+            ) else {
+                return false
+            }
+            await waitForPageTurnDisplayFrames(
+                navigator()?.pageTurnDisplayFrameWaiterForTesting
             )
+            guard
+                let refreshedCalculation = navigator()?.pageTurnPreviewCalculation(),
+                let refreshedPreview = await waitForPageTurnPreview(
+                    calculating: refreshedCalculation,
+                    displayFrameWaiter: navigator()?.pageTurnDisplayFrameWaiterForTesting
+                )
+            else {
+                return false
+            }
+            if refreshedPreview == targetPreview {
+                isTargetPreviewStable = true
+                break
+            }
+            targetPreview = refreshedPreview
         }
-        await waitForPageTurnDisplayFrames(
-            navigator()?.pageTurnDisplayFrameWaiterForTesting
-        )
+        guard isTargetPreviewStable else { return false }
         guard
             navigator()?.pageTurnTransaction === transaction,
             navigator()?.pageTurnController.isTracking(session) == true,
@@ -1294,6 +1317,20 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
         navigator()?.pageTurnSurfaceAnimator?.render(
             progress: transaction.progress
+        )
+        return true
+    }
+
+    private static func publishPageTurnTargetPreview(
+        _ preview: PageTurnPreview,
+        navigator: @escaping @MainActor () -> EPUBNavigatorViewController?
+    ) -> Bool {
+        guard let owner = navigator() else { return false }
+        owner.pageTurnSurfaceTargetPreview = preview
+        owner.delegate?.navigator(
+            owner,
+            previewLocationDidChange: preview.location,
+            viewport: preview.viewport
         )
         return true
     }
@@ -1742,6 +1779,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 await goUsingExistingPath(to: direction, options: options)
             },
             usingPageTurn: { [self] direction, options in
+                if style == .none {
+                    return await turnWithPageSurface(to: direction, style: .none)
+                }
                 if style == .push, options.animated {
                     return await turnWithPageSurface(to: direction, style: .push)
                 }
@@ -3622,6 +3662,7 @@ extension EPUBNavigatorViewController: UIGestureRecognizerDelegate {
             return false
         }
         guard gestureRecognizer === pageTurnPanGestureRecognizer else { return false }
+        updatePageTurnInteractionMode()
         let velocity = panGestureRecognizer.velocity(in: view)
         let direction = if currentEffectivePageTurnStyle() == .none {
             EPUBPageTurnInteraction.direction(

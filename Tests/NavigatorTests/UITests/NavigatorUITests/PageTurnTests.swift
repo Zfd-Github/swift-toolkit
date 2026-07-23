@@ -309,6 +309,75 @@ final class PageTurnTests: XCTestCase {
         }
     }
 
+    func testPageTurnSwipeRecognizerMatrix() throws {
+        for style in [
+            (name: "none", prepare: AccessibilityID.prepareNoneProbe),
+            (name: "push", prepare: AccessibilityID.preparePushProbe),
+            (name: "cover", prepare: AccessibilityID.prepareCoverProbe),
+        ] {
+            let reader = app.open(.pageTurnProbeLTR, waitUntilReady: true)
+            let location = app.staticTexts[.locationRevisionMarker].firstMatch
+            reader.runAction(style.prepare, completionPrefix: style.prepare.rawValue)
+            try committedSwipe(
+                reader,
+                location: location,
+                forward: true,
+                isRTL: false,
+                expectedMarker: "PAGE-B",
+                style: style.name
+            )
+            reader.close(assertMemoryDeallocated: true)
+        }
+    }
+
+    func testRTLNoneSwipeAfterCrossResourceRearm() throws {
+        let reader = app.open(.pageTurnProbeRTL, waitUntilReady: true)
+        let location = app.staticTexts[.locationRevisionMarker].firstMatch
+
+        reader.runAction(
+            .prepareNoneProbe,
+            completionPrefix: AccessibilityID.prepareNoneProbe.rawValue
+        )
+        reader.runAction(
+            .prepareCrossResourceProbe,
+            completionPrefix: "prepareCrossResourceProbe"
+        )
+        try committedTap(
+            reader,
+            location: location,
+            forward: true,
+            isRTL: true,
+            expectedMarker: "RESOURCE-2",
+            style: "none"
+        )
+
+        reader.runAction(
+            .prepareNoneProbe,
+            completionPrefix: AccessibilityID.prepareNoneProbe.rawValue
+        )
+        try committedSwipe(
+            reader,
+            location: location,
+            forward: true,
+            isRTL: true,
+            expectedMarker: "PAGE-B",
+            style: "none"
+        )
+        reader.runAction(
+            .rearmPageTurnProbe,
+            completionPrefix: "rearmPageTurnProbe"
+        )
+        try committedSwipe(
+            reader,
+            location: location,
+            forward: false,
+            isRTL: true,
+            expectedMarker: "PAGE-A",
+            style: "none"
+        )
+        reader.close(assertMemoryDeallocated: true)
+    }
+
     func testCover() throws {
         for fixture in [PublicationFixture.pageTurnProbeLTR, .pageTurnProbeRTL] {
             let isRTL = fixture == .pageTurnProbeRTL
@@ -418,6 +487,8 @@ final class PageTurnTests: XCTestCase {
         XCTAssertTrue(marker.contains("overlayCount=0"), marker)
         XCTAssertTrue(marker.contains("locationDelta=\(committed ? 1 : 0)"), marker)
         XCTAssertTrue(marker.contains("violation=none"), marker)
+        XCTAssertTrue(marker.contains("transactionObserved=true"), marker)
+        XCTAssertTrue(marker.contains("samplerTerminalStop=true"), marker)
         if style == "none" {
             XCTAssertTrue(marker.contains("overlaySamples=0"), marker)
             XCTAssertTrue(marker.contains("styleGeometry=true"), marker)
@@ -429,9 +500,8 @@ final class PageTurnTests: XCTestCase {
             XCTAssertFalse(marker.contains("overlaySamples=0"), marker)
             XCTAssertTrue(marker.contains("fullSurface=true"), marker)
             XCTAssertTrue(marker.contains("threeZones=true"), marker)
-            XCTAssertTrue(marker.contains("progressed=true"), marker)
             XCTAssertTrue(marker.contains("currentBlocksMatch=true"), marker)
-            XCTAssertTrue(marker.contains("targetBlocksMatch=true"), marker)
+            XCTAssertTrue(marker.contains("progressed=true"), marker)
             XCTAssertTrue(marker.contains("styleGeometry=true"), marker)
             if style == "push" {
                 if let expectedPushDirection {
@@ -443,6 +513,7 @@ final class PageTurnTests: XCTestCase {
             }
             if committed {
                 XCTAssertTrue(marker.contains("zonesTogether=true"), marker)
+                XCTAssertTrue(marker.contains("targetBlocksMatch=true"), marker)
                 if style == "push" {
                     XCTAssertTrue(marker.contains("equalPushVelocity=true"), marker)
                 }
@@ -451,6 +522,12 @@ final class PageTurnTests: XCTestCase {
         }
         if requiresTracking {
             XCTAssertTrue(marker.contains("tracked=true"), marker)
+            XCTAssertTrue(marker.contains("customPanInstalled=true"), marker)
+            XCTAssertTrue(marker.contains("customPanBegan=true"), marker)
+            XCTAssertTrue(marker.contains("customPanChanged=true"), marker)
+            XCTAssertTrue(marker.contains("nativePanSampled=true"), marker)
+            XCTAssertTrue(marker.contains("paginationNativePan=false"), marker)
+            XCTAssertTrue(marker.contains("webNativePan=false"), marker)
         }
         if requiresColdBegin {
             XCTAssertTrue(marker.contains("coldArmed=true"), marker)
@@ -487,9 +564,14 @@ final class PageTurnTests: XCTestCase {
     ) throws {
         let before = try revision(in: location.label)
         performSwipe(reader.viewport, forward: forward, isRTL: isRTL)
-        XCTAssertTrue(location.waitUntil(timeout: 20) {
+        let didMove = location.waitUntil(timeout: 20) {
             (try? self.revision(in: location.label)) == before + 1
-        }, location.label)
+        }
+        if !didMove {
+            reader.runAction(.capturePageTurnProbe, completionPrefix: "capturePageTurnProbe")
+            XCTFail(reader.marker(.pageTurnProbeMarker))
+            return
+        }
         assertPageTurnState(
             reader,
             marker: expectedMarker,
@@ -508,12 +590,12 @@ final class PageTurnTests: XCTestCase {
     }
 
     private func performSwipe(_ viewport: XCUIElement, forward: Bool, isRTL: Bool) {
-        let swipesLeft = forward != isRTL
-        if swipesLeft {
-            viewport.swipeLeft()
-        } else {
-            viewport.swipeRight()
-        }
+        let movesLeft = forward != isRTL
+        drag(
+            viewport,
+            from: CGVector(dx: movesLeft ? 0.9 : 0.1, dy: 0.5),
+            to: CGVector(dx: movesLeft ? 0.1 : 0.9, dy: 0.5)
+        )
     }
 
     private func physicalDirection(forward: Bool, isRTL: Bool) -> String {

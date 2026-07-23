@@ -191,11 +191,11 @@ struct EPUBPageTurnControllerTests {
         #expect(EPUBPageTurnInteraction.direction(
             for: CGPoint(x: -1, y: 0),
             readingProgression: .rtl
-        ) == .left)
+        ) == .right)
         #expect(EPUBPageTurnInteraction.direction(
             for: CGPoint(x: 1, y: 0),
             readingProgression: .rtl
-        ) == .right)
+        ) == .left)
         #expect(EPUBPageTurnInteraction.direction(
             for: CGPoint(x: 10, y: 11),
             readingProgression: .ltr
@@ -272,8 +272,8 @@ struct EPUBPageTurnControllerTests {
         let cases: [(ReadiumNavigator.ReadingProgression, EPUBSpreadView.Direction, CGFloat)] = [
             (.ltr, .right, 1),
             (.ltr, .left, -1),
-            (.rtl, .right, -1),
-            (.rtl, .left, 1),
+            (.rtl, .right, 1),
+            (.rtl, .left, -1),
         ]
 
         for (readingProgression, direction, reverseSign) in cases {
@@ -785,6 +785,27 @@ struct EPUBPageTurnControllerTests {
 
             #expect(!spreadView.scrollView.panGestureRecognizer.isEnabled)
         }
+    }
+
+    @Test("reflowable native pan guard rearms across style changes and WebKit re-enable")
+    func reflowableNativePanGuardRearms() async throws {
+        let navigator = try await makeMountedNavigator(pageTurnStyle: .none)
+        let paginationView = try #require(currentPaginationView(in: navigator))
+        let spreadView = try #require(paginationView.currentView as? EPUBReflowableSpreadView)
+
+        spreadView.scrollView.panGestureRecognizer.isEnabled = true
+        #expect(!spreadView.scrollView.panGestureRecognizer.isEnabled)
+
+        navigator.pageTurnStyle = .push
+        navigator.pageTurnStyle = .none
+        spreadView.scrollView.panGestureRecognizer.isEnabled = true
+        #expect(!spreadView.scrollView.panGestureRecognizer.isEnabled)
+
+        spreadView.allowsNativeHorizontalPaging = true
+        #expect(spreadView.scrollView.panGestureRecognizer.isEnabled)
+        spreadView.allowsNativeHorizontalPaging = false
+        spreadView.scrollView.panGestureRecognizer.isEnabled = true
+        #expect(!spreadView.scrollView.panGestureRecognizer.isEnabled)
     }
 
     @Test("fixed WebView navigation reapplies none pan policy without blocking zoomed content pan")
@@ -2302,6 +2323,51 @@ struct EPUBPageTurnControllerTests {
         #expect(navigator.isPageTurnIdleForTesting)
     }
 
+    @Test("target preview settles to the live page identity before capture")
+    func targetPreviewSettlesBeforeCapture() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .cover)
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = SnapshotObservingView(frame: container.bounds)
+        navigator.view.frame = root.bounds
+        root.addSubview(navigator.view)
+        container.addSubview(root)
+        delegate.pageTurnRootView = root
+        delegate.resetLocationChanges()
+        let original = try #require(navigator.currentLocation)
+        let originalViewport = try #require(navigator.viewport)
+        let earlyTarget = makeLocator(href: "chapter-2.xhtml", progression: 0)
+        let settledTarget = makeLocator(href: "chapter-2.xhtml", progression: 0.2)
+        let targetViewport = NavigatorViewport(
+            resources: [
+                .init(href: settledTarget.href, progression: 0.2 ... 0.4)
+            ],
+            progression: 0.2 ... 0.4
+        )
+        var calculationCount = 0
+        navigator.pageTurnPreviewCalculationForTesting = {
+            calculationCount += 1
+            switch calculationCount {
+            case 1:
+                return (original, originalViewport)
+            case 2:
+                return (earlyTarget, targetViewport)
+            default:
+                return (settledTarget, targetViewport)
+            }
+        }
+        navigator.pageTurnNavigationForTesting = { _, _ in true }
+        navigator.pageTurnLocationCalculationForTesting = {
+            (settledTarget, targetViewport)
+        }
+
+        #expect(await navigator.goForward(options: .animated))
+
+        #expect(calculationCount >= 4)
+        #expect(delegate.previews.contains { $0.0 == settledTarget })
+        #expect(navigator.currentLocation == settledTarget)
+        #expect(pageTurnSurfaces(in: container).isEmpty)
+    }
+
     @Test("a missing target preview prevents target capture and commit")
     func missingTargetPreviewRejectsSurfaceCommit() async throws {
         let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .cover)
@@ -2370,7 +2436,7 @@ struct EPUBPageTurnControllerTests {
         }
         var recapturedAfterOriginalPreview = false
         root.onSnapshot = {
-            if root.snapshotCount >= 3 {
+            if root.snapshotCount >= 2 {
                 recapturedAfterOriginalPreview =
                     delegate.previews.last?.0 == original
             }
@@ -2386,7 +2452,7 @@ struct EPUBPageTurnControllerTests {
         #expect(!(await turn.value))
         await navigator.settlePageTurn()
 
-        #expect(frameCount >= 6)
+        #expect(frameCount >= 4)
         #expect(delegate.previews.count >= 3)
         #expect(delegate.previews.dropLast().last?.0 == original)
         #expect(delegate.previews.last?.0 == nil)

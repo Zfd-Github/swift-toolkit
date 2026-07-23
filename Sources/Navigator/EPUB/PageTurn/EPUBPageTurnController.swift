@@ -44,18 +44,12 @@ enum EPUBPageTurnInteraction {
 
     static func direction(
         for velocity: CGPoint,
-        readingProgression: ReadingProgression
+        readingProgression _: ReadingProgression
     ) -> EPUBSpreadView.Direction? {
         guard abs(velocity.x) > abs(velocity.y) * 1.2, velocity.x != 0 else {
             return nil
         }
-
-        switch (velocity.x < 0, readingProgression) {
-        case (true, .ltr), (false, .rtl):
-            return .right
-        case (false, .ltr), (true, .rtl):
-            return .left
-        }
+        return velocity.x < 0 ? .right : .left
     }
 
     static func progress(
@@ -102,7 +96,7 @@ enum EPUBPageTurnInteraction {
         session: PageTurnSession
     ) -> CGFloat {
         guard viewportWidth > 0 else { return 0 }
-        return coverSignedHorizontalValue(
+        return signedHorizontalValue(
             translationX,
             session: session
         ) / viewportWidth
@@ -119,25 +113,13 @@ enum EPUBPageTurnInteraction {
             viewportWidth: viewportWidth,
             session: session
         ) >= 0.22
-            || coverSignedHorizontalValue(
+            || signedHorizontalValue(
                 velocityX,
                 session: session
             ) >= 650
     }
 
     private static func signedHorizontalValue(
-        _ value: CGFloat,
-        session: PageTurnSession
-    ) -> CGFloat {
-        switch (session.direction, session.readingProgression) {
-        case (.left, .ltr), (.right, .rtl):
-            return value
-        case (.right, .ltr), (.left, .rtl):
-            return -value
-        }
-    }
-
-    private static func coverSignedHorizontalValue(
         _ value: CGFloat,
         session: PageTurnSession
     ) -> CGFloat {
