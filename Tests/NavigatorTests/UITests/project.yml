@@ -30,6 +30,9 @@ targets:
       - package: Readium
         product: ReadiumNavigator
     settings:
+      PRODUCT_NAME: NavigatorTestHost
+      SWIFT_VERSION: 5.0
+      ONLY_ACTIVE_ARCH: YES
       INFOPLIST_FILE: NavigatorTestHost/Info.plist
       PRODUCT_BUNDLE_IDENTIFIER: org.readium.test.NavigatorTestHost
 
@@ -44,6 +47,9 @@ targets:
     dependencies:
       - target: NavigatorTestHost
     settings:
+      PRODUCT_NAME: NavigatorUITests
+      SWIFT_VERSION: 5.0
+      ONLY_ACTIVE_ARCH: YES
       INFOPLIST_FILE: NavigatorUITests/Info.plist
       PRODUCT_BUNDLE_IDENTIFIER: org.readium.test.NavigatorUITests
       TEST_TARGET_NAME: NavigatorTestHost

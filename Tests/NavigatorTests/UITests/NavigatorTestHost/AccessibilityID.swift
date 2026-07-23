@@ -63,6 +63,7 @@ enum AccessibilityID: String {
     case preparePushProbe
     case prepareNoneProbe
     case prepareCoverProbe
+    case prepareSimulationProbe
     case rearmPageTurnProbe
     case capturePageTurnProbe
     case prepareCrossResourceProbe

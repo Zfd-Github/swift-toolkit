@@ -982,9 +982,11 @@ final class PageTurnAnimationFrameWaiter: NSObject {
     static func wait(
         scheduleDisplayFrame: @MainActor (PageTurnAnimationFrameWaiter) -> Void = {
             $0.scheduleDisplayFrame()
-        }
+        },
+        registerWaiter: @MainActor (PageTurnAnimationFrameWaiter) -> Void = { _ in }
     ) async {
         let waiter = PageTurnAnimationFrameWaiter()
+        registerWaiter(waiter)
         await withTaskCancellationHandler {
             await waiter.waitForFrame(scheduleDisplayFrame)
         } onCancel: {
@@ -1022,6 +1024,10 @@ final class PageTurnAnimationFrameWaiter: NSObject {
     }
 
     @objc private func frameDidDisplay() {
+        finish()
+    }
+
+    func cancel() {
         finish()
     }
 

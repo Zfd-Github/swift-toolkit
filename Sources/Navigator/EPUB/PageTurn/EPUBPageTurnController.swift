@@ -145,6 +145,7 @@ final class EPUBPageTurnSurfaceAnimator {
     private var currentRootIdentity: RootIdentity
     private var targetView: UIView?
     private var targetRootIdentity: RootIdentity?
+    private var pageCurlController: EPUBPageCurlController?
     private let style: EPUBPageTurnStyle
     private let physicalCompletionDirection: EPUBSpreadView.Direction
     private var progress: CGFloat = 0
@@ -176,6 +177,26 @@ final class EPUBPageTurnSurfaceAnimator {
         else {
             return nil
         }
+        let pageCurlController: EPUBPageCurlController?
+        if style == .simulation {
+            guard
+                let image = EPUBPageCurlController.rasterize(rootView)?.cgImage,
+                let controller = EPUBPageCurlController(
+                    currentImage: image,
+                    paperColor: (
+                        rootView.backgroundColor
+                            ?? parentView.backgroundColor
+                            ?? .systemBackground
+                    ).resolvedColor(with: rootView.traitCollection),
+                    physicalCompletionDirection: physicalCompletionDirection
+                )
+            else {
+                return nil
+            }
+            pageCurlController = controller
+        } else {
+            pageCurlController = nil
+        }
         self.rootViewProvider = rootViewProvider
         self.documentView = documentView ?? rootView
         self.currentView = currentView
@@ -185,6 +206,7 @@ final class EPUBPageTurnSurfaceAnimator {
         )
         self.style = style
         self.physicalCompletionDirection = physicalCompletionDirection
+        self.pageCurlController = pageCurlController
         configure(currentView, role: "current", frame: rootView.frame)
         parentView.insertSubview(currentView, aboveSubview: rootView)
     }
@@ -197,7 +219,9 @@ final class EPUBPageTurnSurfaceAnimator {
     /// installed for this transaction remains mounted. A transient removal of
     /// both snapshots must not be treated as a completed animation.
     var hasMountedSurface: Bool {
-        currentView.superview != nil || targetView?.superview != nil
+        currentView.superview != nil
+            || targetView?.superview != nil
+            || pageCurlController?.view.superview != nil
     }
 
     var hasMatchingCurrentRootIdentity: Bool {
@@ -224,12 +248,16 @@ final class EPUBPageTurnSurfaceAnimator {
 
     @discardableResult
     func captureTarget() -> Bool {
+        guard let rootView = rootViewProvider() else { return false }
+        let curlImage = style == .simulation
+            ? EPUBPageCurlController.rasterize(rootView)?.cgImage
+            : nil
         guard
             targetView == nil,
-            let rootView = rootViewProvider(),
             let parentView = rootView.superview,
             currentView.superview === parentView,
-            let targetView = rootView.snapshotView(afterScreenUpdates: true)
+            let targetView = rootView.snapshotView(afterScreenUpdates: true),
+            style != .simulation || curlImage != nil
         else {
             return false
         }
@@ -241,12 +269,29 @@ final class EPUBPageTurnSurfaceAnimator {
             rootView: rootView,
             documentView: documentView ?? rootView
         )
+        if
+            style == .simulation,
+            let image = curlImage,
+            let pageCurlController
+        {
+            pageCurlController.setTargetImage(image)
+            let renderView = pageCurlController.view
+            renderView.frame = rootView.frame
+            renderView.autoresizingMask = []
+            renderView.isAccessibilityElement = false
+            renderView.accessibilityElementsHidden = true
+            renderView.accessibilityIdentifier = "readium.page-turn.curl"
+            renderView.isUserInteractionEnabled = false
+            parentView.insertSubview(renderView, aboveSubview: currentView)
+        }
         render(progress: progress)
         return true
     }
 
     @discardableResult
     func recaptureTarget() -> Bool {
+        pageCurlController?.view.removeFromSuperview()
+        currentView.isHidden = false
         targetView?.removeFromSuperview()
         targetView = nil
         targetRootIdentity = nil
@@ -271,6 +316,15 @@ final class EPUBPageTurnSurfaceAnimator {
             rootView: rootView,
             documentView: documentView
         )
+        if
+            style == .simulation,
+            let image = EPUBPageCurlController.rasterize(rootView)?.cgImage,
+            let pageCurlController
+        {
+            pageCurlController.setTargetImage(image)
+            pageCurlController.view.frame = rootView.frame
+            parentView.insertSubview(pageCurlController.view, aboveSubview: currentView)
+        }
         render(progress: progress)
         return true
     }
@@ -293,6 +347,12 @@ final class EPUBPageTurnSurfaceAnimator {
             rootView: rootView,
             documentView: documentView
         )
+        if
+            style == .simulation,
+            let image = EPUBPageCurlController.rasterize(rootView)?.cgImage
+        {
+            pageCurlController?.setCurrentImage(image)
+        }
         if let targetView, targetView.superview === parentView {
             parentView.bringSubviewToFront(targetView)
             parentView.bringSubviewToFront(currentView)
@@ -323,7 +383,11 @@ final class EPUBPageTurnSurfaceAnimator {
                 y: 0
             )
             targetView.transform = .identity
-        case .none, .simulation:
+        case .simulation:
+            pageCurlController?.render(progress: progress)
+            currentView.transform = .identity
+            targetView.transform = .identity
+        case .none:
             currentView.transform = .identity
             targetView.transform = .identity
         }
@@ -341,10 +405,32 @@ final class EPUBPageTurnSurfaceAnimator {
         currentView.transform = .identity
         currentView.frame = rootView.frame
         targetView?.isHidden = true
-        currentView.superview?.bringSubviewToFront(currentView)
+        if style == .simulation {
+            pageCurlController?.render(progress: 0)
+            if let renderView = pageCurlController?.view {
+                renderView.isHidden = false
+                renderView.superview?.bringSubviewToFront(renderView)
+            }
+        } else {
+            currentView.superview?.bringSubviewToFront(currentView)
+        }
     }
 
-    func animate(to progress: CGFloat, duration: TimeInterval) async {
+    func animate(
+        to progress: CGFloat,
+        duration: TimeInterval,
+        scheduleDisplayFrame: (@MainActor (PageTurnAnimationFrameWaiter) -> Void)? = nil,
+        shouldContinue: @MainActor @escaping () -> Bool = { true }
+    ) async -> Bool {
+        if style == .simulation, let pageCurlController {
+            self.progress = min(max(progress, 0), 1)
+            return await pageCurlController.animate(
+                to: progress,
+                duration: duration,
+                scheduleDisplayFrame: scheduleDisplayFrame,
+                shouldContinue: shouldContinue
+            )
+        }
         await withCheckedContinuation { continuation in
             UIView.animate(
                 withDuration: duration,
@@ -354,6 +440,11 @@ final class EPUBPageTurnSurfaceAnimator {
                 completion: { _ in continuation.resume() }
             )
         }
+        return shouldContinue()
+    }
+
+    func cancelAnimation() {
+        pageCurlController?.cancelAnimation()
     }
 
     func remove() {
@@ -361,6 +452,7 @@ final class EPUBPageTurnSurfaceAnimator {
         targetView?.layer.removeAllAnimations()
         currentView.removeFromSuperview()
         targetView?.removeFromSuperview()
+        pageCurlController?.view.removeFromSuperview()
         targetView = nil
         targetRootIdentity = nil
     }
