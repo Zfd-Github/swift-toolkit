@@ -175,11 +175,22 @@ final class PageTurnTests: XCTestCase {
     }
 
     func testPageTurnStyleMatrix() throws {
-        let styles: [(name: String, prepare: AccessibilityID)] = [
+        try runPageTurnStyleMatrix(styles: [
             ("push", .preparePushProbe),
             ("none", .prepareNoneProbe),
             ("cover", .prepareCoverProbe),
-        ]
+        ])
+    }
+
+    func testSimulationPageTurnStyleMatrix() throws {
+        try runPageTurnStyleMatrix(styles: [
+            ("simulation", .prepareSimulationProbe),
+        ])
+    }
+
+    private func runPageTurnStyleMatrix(
+        styles: [(name: String, prepare: AccessibilityID)]
+    ) throws {
         for fixture in [PublicationFixture.pageTurnProbeLTR, .pageTurnProbeRTL] {
             let isRTL = fixture == .pageTurnProbeRTL
             for style in styles {
@@ -240,7 +251,7 @@ final class PageTurnTests: XCTestCase {
                     .prepareCrossResourceProbe,
                     completionPrefix: "prepareCrossResourceProbe"
                 )
-                if style.name == "cover" {
+                if style.name == "cover" || style.name == "simulation" {
                     let before = try revision(in: location.label)
                     reader.runAction(
                         .armColdCoverCrossResource,
@@ -314,6 +325,7 @@ final class PageTurnTests: XCTestCase {
             (name: "none", prepare: AccessibilityID.prepareNoneProbe),
             (name: "push", prepare: AccessibilityID.preparePushProbe),
             (name: "cover", prepare: AccessibilityID.prepareCoverProbe),
+            (name: "simulation", prepare: AccessibilityID.prepareSimulationProbe),
         ] {
             let reader = app.open(.pageTurnProbeLTR, waitUntilReady: true)
             let location = app.staticTexts[.locationRevisionMarker].firstMatch
@@ -487,9 +499,16 @@ final class PageTurnTests: XCTestCase {
         XCTAssertTrue(marker.contains("overlayCount=0"), marker)
         XCTAssertTrue(marker.contains("locationDelta=\(committed ? 1 : 0)"), marker)
         XCTAssertTrue(marker.contains("violation=none"), marker)
-        XCTAssertTrue(marker.contains("transactionObserved=true"), marker)
-        XCTAssertTrue(marker.contains("samplerTerminalStop=true"), marker)
-        if style == "none" {
+        let isInstantSimulation = style == "simulation" && !requiresTracking
+        if !isInstantSimulation {
+            XCTAssertTrue(marker.contains("transactionObserved=true"), marker)
+            XCTAssertTrue(marker.contains("samplerTerminalStop=true"), marker)
+        }
+        if isInstantSimulation {
+            XCTAssertTrue(marker.contains("overlaySamples=0"), marker)
+            XCTAssertTrue(marker.contains("styleGeometry=false"), marker)
+            XCTAssertTrue(marker.contains("curlBackend=none"), marker)
+        } else if style == "none" {
             XCTAssertTrue(marker.contains("overlaySamples=0"), marker)
             XCTAssertTrue(marker.contains("styleGeometry=true"), marker)
             if requiresTracking {
@@ -503,6 +522,9 @@ final class PageTurnTests: XCTestCase {
             XCTAssertTrue(marker.contains("currentBlocksMatch=true"), marker)
             XCTAssertTrue(marker.contains("progressed=true"), marker)
             XCTAssertTrue(marker.contains("styleGeometry=true"), marker)
+            if style == "simulation" {
+                XCTAssertTrue(marker.contains("curlBackend=coreImage"), marker)
+            }
             if style == "push" {
                 if let expectedPushDirection {
                     XCTAssertTrue(

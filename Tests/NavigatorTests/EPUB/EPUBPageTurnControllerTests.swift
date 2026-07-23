@@ -210,6 +210,116 @@ struct EPUBPageTurnControllerTests {
         ) == .right)
     }
 
+    @Test("simulation keeps the first swipe progress while the target raster is prepared")
+    func simulationRetainsColdTargetProgress() throws {
+        let image = try #require(
+            UIGraphicsImageRenderer(size: CGSize(width: 30, height: 90))
+                .image { _ in UIColor.black.setFill() }
+                .cgImage
+        )
+        let controller = try #require(EPUBPageCurlController(
+            currentImage: image,
+            paperColor: .black,
+            physicalCompletionDirection: .left
+        ))
+
+        controller.render(progress: 0.41)
+        #expect(!controller.hasTarget)
+        controller.setTargetImage(image)
+
+        #expect(controller.hasTarget)
+        #expect(controller.progress == 0.41)
+    }
+
+    @Test("simulation maps both physical completion directions to opposite curl angles")
+    func simulationDirectionMapping() {
+        #expect(
+            EPUBPageCurlRenderView.angle(for: .left) == 0
+        )
+        #expect(
+            EPUBPageCurlRenderView.angle(for: .right) == .pi
+        )
+
+        let ltrForward = PageTurnSession(
+            direction: .right,
+            readingProgression: .ltr
+        )
+        let rtlForward = PageTurnSession(
+            direction: .left,
+            readingProgression: .rtl
+        )
+        #expect(ltrForward.physicalCompletionDirection == .left)
+        #expect(rtlForward.physicalCompletionDirection == .right)
+    }
+
+    @Test("simulation rasterizes top, document, and bottom as one reader surface")
+    func simulationRasterizesWholeReaderSurface() throws {
+        let root = UIView(frame: CGRect(x: 0, y: 0, width: 30, height: 90))
+        for (color, y) in [(UIColor.red, 0), (.green, 30), (.blue, 60)] {
+            let block = UIView(frame: CGRect(x: 0, y: y, width: 30, height: 30))
+            block.backgroundColor = color
+            root.addSubview(block)
+        }
+
+        let image = try #require(EPUBPageCurlController.rasterize(root))
+        let blocks = [15, 45, 75].compactMap {
+            image.cgImage?.pixelBytes(at: CGPoint(
+                x: 15 * image.scale,
+                y: CGFloat($0) * image.scale
+            ))
+        }
+
+        #expect(blocks.count == 3)
+        #expect(Set(blocks).count == 3)
+    }
+
+    @Test("simulation completes the first cold cross-resource swipe with one publish")
+    func simulationCompletesColdCrossResourceSwipe() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(
+            pageTurnStyle: .simulation
+        )
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = UIView(frame: container.bounds)
+        navigator.view.frame = root.bounds
+        root.addSubview(navigator.view)
+        container.addSubview(root)
+        delegate.pageTurnRootView = root
+        delegate.resetLocationChanges()
+        #expect(navigator.armColdForwardPageTurnTargetForTesting())
+
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: -700
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .changed,
+            translationX: -100,
+            velocityX: -700
+        )
+
+        #expect(await waitUntil {
+            ((self.pageCurlViews(in: container).first as? EPUBPageCurlRenderView)?
+                .progress ?? 0) > 0.22
+        })
+        let renderView = try #require(
+            pageCurlViews(in: container).first as? EPUBPageCurlRenderView
+        )
+        #expect(renderView.progress > 0.22)
+
+        navigator.handlePageTurnPanForTesting(
+            state: .ended,
+            translationX: -100,
+            velocityX: -700
+        )
+        await navigator.settlePageTurn()
+
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-2.xhtml"))
+        #expect(delegate.locationChangeCount == 1)
+        #expect(pageCurlViews(in: container).isEmpty)
+        #expect(pageTurnSurfaces(in: container).isEmpty)
+    }
+
     @Test("interactive pointer IDs clear after target changes and remain isolated")
     func interactivePointerPolicy() async throws {
         let navigator = try await makeMountedNavigator(pageTurnStyle: .none)
@@ -727,7 +837,7 @@ struct EPUBPageTurnControllerTests {
         #expect(pageTurnSurfaces(in: container).isEmpty)
     }
 
-    @Test("mounted navigator keeps one transaction recognizer across push none and cover")
+    @Test("mounted navigator keeps one transaction recognizer across every page-turn style")
     func mountedRuntimeInteractionPolicy() async throws {
         let navigator = try await makeMountedNavigator(pageTurnStyle: .push)
         let paginationView = try #require(currentPaginationView(in: navigator))
@@ -754,8 +864,7 @@ struct EPUBPageTurnControllerTests {
         navigator.pageTurnStyle = .simulation
         #expect(!outerScrollView.panGestureRecognizer.isEnabled)
         #expect(!spreadView.scrollView.panGestureRecognizer.isEnabled)
-        #expect(rootPanRecognizers(in: navigator).isEmpty)
-        #expect(transactionPan.view == nil)
+        #expect(rootPanRecognizers(in: navigator).first === transactionPan)
 
         navigator.pageTurnStyle = .cover
         #expect(rootPanRecognizers(in: navigator).first === transactionPan)
@@ -873,7 +982,7 @@ struct EPUBPageTurnControllerTests {
         #expect(status.wereAllReadsOnMainThread)
 
         navigator.pageTurnStyle = .simulation
-        #expect(rootPanRecognizers(in: navigator).isEmpty)
+        #expect(rootPanRecognizers(in: navigator).count == 1)
     }
 
     @Test("accessibility changes cancel pre-commit sessions and reject late commits")
@@ -1050,9 +1159,9 @@ struct EPUBPageTurnControllerTests {
         navigator.handlePageTurnPanForTesting(state: .cancelled, translationX: 0, velocityX: 0)
     }
 
-    @Test("push none and cover disable native paging for the shared transaction")
+    @Test("every page-turn style disables native paging for the shared transaction")
     func nativePanPolicy() {
-        for style in [EPUBPageTurnStyle.push, .none, .cover] {
+        for style in [EPUBPageTurnStyle.push, .none, .cover, .simulation] {
             let policy = EPUBPageTurnInteraction.policy(
                 axis: .horizontalPaged,
                 style: style
@@ -1393,6 +1502,93 @@ struct EPUBPageTurnControllerTests {
         #expect(delegate.locationChangeCount == 0)
         #expect(navigator.isPageTurnIdleForTesting)
         #expect(pageTurnSurfaces(in: container).isEmpty)
+    }
+
+    @Test("simulation commit cancellation is bounded without a display-link callback or late publish")
+    func simulationCommitCancellationIsBoundedWithoutLatePublish() async throws {
+        enum Cancellation {
+            case background
+            case style
+            case reduceMotion
+        }
+
+        for cancellation in [Cancellation.background, .style, .reduceMotion] {
+            let notificationCenter = NotificationCenter()
+            let status = AccessibilityStatusBox()
+            let (navigator, delegate) = try await makeLoadedNavigator(
+                pageTurnStyle: .simulation,
+                notificationCenter: notificationCenter,
+                accessibilityStatus: status
+            )
+            let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+            let root = SnapshotObservingView(frame: container.bounds)
+            navigator.view.frame = root.bounds
+            root.addSubview(navigator.view)
+            container.addSubview(root)
+            delegate.pageTurnRootView = root
+            delegate.resetLocationChanges()
+            let original = try #require(navigator.currentLocation)
+            var scheduledFrameCount = 0
+            navigator.pageTurnDisplayFrameSchedulerForTesting = { waiter in
+                scheduledFrameCount += 1
+                if scheduledFrameCount > 1 {
+                    waiter.cancel()
+                }
+            }
+            let commitTranslation: CGFloat = if case .background = cancellation {
+                -390
+            } else {
+                -100
+            }
+
+            navigator.handlePageTurnPanForTesting(
+                state: .began,
+                translationX: 0,
+                velocityX: -700
+            )
+            navigator.handlePageTurnPanForTesting(
+                state: .ended,
+                translationX: commitTranslation,
+                velocityX: -700
+            )
+            #expect(await waitUntil {
+                navigator.isPageTurnCommittingForTesting
+                    && scheduledFrameCount > 0
+            })
+
+            switch cancellation {
+            case .background:
+                notificationCenter.post(
+                    name: UIApplication.willResignActiveNotification,
+                    object: nil
+                )
+            case .style:
+                navigator.pageTurnStyle = .none
+            case .reduceMotion:
+                status.isReduceMotionEnabled = true
+                notificationCenter.post(
+                    name: UIAccessibility.reduceMotionStatusDidChangeNotification,
+                    object: nil
+                )
+            }
+
+            #expect(await waitUntil { navigator.isPageTurnIdleForTesting })
+            await navigator.settlePageTurn()
+            if case .background = cancellation {
+                notificationCenter.post(
+                    name: UIApplication.didBecomeActiveNotification,
+                    object: nil
+                )
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+
+            #expect(navigator.currentLocation == original)
+            #expect(delegate.locationChangeCount == 0)
+            #expect(delegate.errorCount == 0)
+            #expect(pageTurnSurfaces(in: container).isEmpty)
+            #expect(pageCurlViews(in: container).isEmpty)
+            #expect(navigator.isPageTurnIdleForTesting)
+        }
     }
 
     @Test("cover swipe is not gated by an unrelated body snapshot capture")
@@ -3005,6 +3201,15 @@ struct EPUBPageTurnControllerTests {
         }
     }
 
+    private func pageCurlViews(in view: UIView) -> [UIView] {
+        view.subviews.flatMap { child in
+            let descendants = pageCurlViews(in: child)
+            return child.accessibilityIdentifier == "readium.page-turn.curl"
+                ? [child] + descendants
+                : descendants
+        }
+    }
+
     private func makeLoadedNavigator(
         pageTurnStyle: EPUBPageTurnStyle = .push,
         notificationCenter: NotificationCenter? = nil,
@@ -3149,6 +3354,25 @@ private final class ThreadSafeFlag: @unchecked Sendable {
         lock.withLock {
             storedValue = true
         }
+    }
+}
+
+private extension CGImage {
+    func pixelBytes(at point: CGPoint) -> [UInt8]? {
+        guard
+            bitsPerComponent == 8,
+            bitsPerPixel == 32,
+            let data = dataProvider?.data,
+            point.x >= 0,
+            point.y >= 0,
+            point.x < CGFloat(width),
+            point.y < CGFloat(height)
+        else {
+            return nil
+        }
+        let offset = Int(point.y) * bytesPerRow + Int(point.x) * 4
+        let bytes = CFDataGetBytePtr(data)!
+        return Array(UnsafeBufferPointer(start: bytes + offset, count: 4))
     }
 }
 

@@ -227,6 +227,11 @@ struct ReaderView: View {
                                         id: .prepareCoverProbe
                                     )
                                     testAction(
+                                        "Prepare Simulation Probe",
+                                        .prepareSimulationProbe,
+                                        id: .prepareSimulationProbe
+                                    )
+                                    testAction(
                                         "Re-arm Page Turn Probe",
                                         .rearmPageTurnProbe,
                                         id: .rearmPageTurnProbe
@@ -304,6 +309,7 @@ enum ReaderTestAction: String {
     case preparePushProbe
     case prepareNoneProbe
     case prepareCoverProbe
+    case prepareSimulationProbe
     case rearmPageTurnProbe
     case capturePageTurnProbe
     case prepareCrossResourceProbe
@@ -385,6 +391,7 @@ enum ReaderTestAction: String {
     private var didMatchCurrentZoneBlocks = false
     private var didMatchTargetZoneBlocks = false
     private var didObserveStyleGeometry = false
+    private var didObservePageCurlRenderView = false
     private var didObserveEqualPushVelocity = false
     private var didStopPageTurnSamplerAtTerminal = false
     private var pushVelocityDetails = "none"
@@ -1076,10 +1083,13 @@ enum ReaderTestAction: String {
                 generation: generation
             )
 
-        case .preparePushProbe, .prepareNoneProbe, .prepareCoverProbe:
+        case .preparePushProbe, .prepareNoneProbe, .prepareCoverProbe,
+             .prepareSimulationProbe:
             let style: EPUBPageTurnStyle = action == .preparePushProbe
                 ? .push
-                : action == .prepareNoneProbe ? .none : .cover
+                : action == .prepareNoneProbe
+                    ? .none
+                    : action == .prepareCoverProbe ? .cover : .simulation
             await preparePageTurnProbe(
                 in: navigator,
                 action: action,
@@ -1207,9 +1217,8 @@ enum ReaderTestAction: String {
         action: ReaderTestAction,
         generation: Int
     ) async {
-        navigator.pageTurnStyle = .cover
         navigator.snapshotProvider.invalidate()
-        resetPageTurnEvidence(style: .cover, in: navigator)
+        resetPageTurnEvidence(style: navigator.pageTurnStyle, in: navigator)
         didArmColdCover = navigator.armColdForwardPageTurnTargetForTesting()
         let initialBeginCount = pageTurnBeginCount
         let deadline = ProcessInfo.processInfo.systemUptime + 20
@@ -1295,6 +1304,7 @@ enum ReaderTestAction: String {
             "currentBlocksMatch=\(didMatchCurrentZoneBlocks)",
             "targetBlocksMatch=\(didMatchTargetZoneBlocks)",
             "styleGeometry=\(didObserveStyleGeometry)",
+            "curlBackend=\(didObservePageCurlRenderView ? "coreImage" : "none")",
             "equalPushVelocity=\(didObserveEqualPushVelocity)",
             "pushDirection=\(observedPushPhysicalDirection ?? "none")",
             "stillWhileTracking=\(didRemainStillWhileTracking)",
@@ -1362,6 +1372,7 @@ enum ReaderTestAction: String {
         didMatchCurrentZoneBlocks = false
         didMatchTargetZoneBlocks = false
         didObserveStyleGeometry = false
+        didObservePageCurlRenderView = false
         didObserveEqualPushVelocity = false
         didStopPageTurnSamplerAtTerminal = false
         pushVelocityDetails = "none"
@@ -1713,9 +1724,31 @@ enum ReaderTestAction: String {
                 pageTurnSurfaceContractViolation = "cover-role-geometry"
             }
 
-        case .none, .simulation:
+        case .simulation:
+            guard pageCurlRenderViews().count == 1 else {
+                pageTurnSurfaceContractViolation = "simulation-render-view"
+                return
+            }
+            didObservePageCurlRenderView = true
+            didProgressPageTurn = true
+            didObserveStyleGeometry = true
+            didMoveZonesTogether = didRenderThreeDistinctZones
+
+        case .none:
             pageTurnSurfaceContractViolation = "unexpected-style-surfaces"
         }
+    }
+
+    private func pageCurlRenderViews() -> [UIView] {
+        func collect(in view: UIView) -> [UIView] {
+            view.subviews.flatMap { child in
+                let descendants = collect(in: child)
+                return child.accessibilityIdentifier == "readium.page-turn.curl"
+                    ? [child] + descendants
+                    : descendants
+            }
+        }
+        return collect(in: pageTurnRootView?.superview ?? pageTurnRootView ?? UIView())
     }
 
     private func pageTurnSurfaceSnapshot(
