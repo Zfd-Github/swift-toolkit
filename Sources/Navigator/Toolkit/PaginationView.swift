@@ -150,6 +150,19 @@ final class PaginationView: UIView, Loggable {
         loadedViews[currentIndex]
     }
 
+    func discardLoadedAdjacentViewForTesting(at index: Int) -> Bool {
+        guard
+            axis == .horizontalPaged,
+            abs(index - currentIndex) == 1
+        else {
+            return false
+        }
+        cancelPageLoading(clearQueue: false)
+        loadingIndexQueue.removeAll { $0.index == index }
+        loadedViews.removeValue(forKey: index)?.removeFromSuperview()
+        return loadedViews[index] == nil
+    }
+
     func readyAdjacentView(at index: Int) -> (UIView & PageView)? {
         guard
             axis == .horizontalPaged,
