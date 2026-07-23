@@ -1387,6 +1387,38 @@ struct EPUBPageTurnControllerTests {
         #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-2.xhtml"))
     }
 
+    @Test("simulation keeps discrete horizontal locator navigation instant")
+    func simulationDiscreteLocatorNavigationIsInstant() {
+        let options = NavigatorGoOptions(
+            animated: true,
+            otherOptions: [
+                "readium.epub.pageTurnDirection": .string("forward"),
+                "probe": .string("preserved"),
+            ]
+        )
+
+        let simulation = EPUBPageTurnInteraction.discreteNavigationOptions(
+            options,
+            axis: .horizontalPaged,
+            style: .simulation
+        )
+        let push = EPUBPageTurnInteraction.discreteNavigationOptions(
+            options,
+            axis: .horizontalPaged,
+            style: .push
+        )
+        let continuous = EPUBPageTurnInteraction.discreteNavigationOptions(
+            options,
+            axis: .verticalContinuous,
+            style: .simulation
+        )
+
+        #expect(!simulation.animated)
+        #expect(simulation.otherOptions == options.otherOptions)
+        #expect(push == options)
+        #expect(continuous == options)
+    }
+
     @Test("programmatic chapter targets use whole-reader push and cover transactions")
     func programmaticChapterTargetsUsePageTurnSurfaces() async throws {
         for style in [EPUBPageTurnStyle.push, .cover] {

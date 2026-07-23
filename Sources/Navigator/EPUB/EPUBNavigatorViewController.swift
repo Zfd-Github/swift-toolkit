@@ -3077,6 +3077,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         await snapshotProvider.settle()
         snapshotProvider.invalidate()
         let locator = publication.normalizeLocator(locator)
+        let options = EPUBPageTurnInteraction.discreteNavigationOptions(
+            options,
+            axis: paginationView?.axis,
+            style: currentEffectivePageTurnStyle()
+        )
 
         if options.animated,
            paginationView?.axis == .horizontalPaged,

@@ -42,6 +42,19 @@ enum EPUBPageTurnInteraction {
         return Policy(allowsNativeHorizontalPaging: false)
     }
 
+    static func discreteNavigationOptions(
+        _ options: NavigatorGoOptions,
+        axis: PaginationView.Axis?,
+        style: EPUBPageTurnStyle
+    ) -> NavigatorGoOptions {
+        guard axis == .horizontalPaged, style == .simulation else {
+            return options
+        }
+        var options = options
+        options.animated = false
+        return options
+    }
+
     static func direction(
         for velocity: CGPoint,
         readingProgression _: ReadingProgression
