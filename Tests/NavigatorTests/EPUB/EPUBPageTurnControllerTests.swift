@@ -768,6 +768,49 @@ struct EPUBPageTurnControllerTests {
         #expect(pageTurnSurfaces(in: container).isEmpty)
     }
 
+    @Test("style interaction mode waits for a cancelling surface transaction to finish")
+    func styleInteractionModeWaitsForCancelledSurfaceTransaction() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .cover)
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = SnapshotObservingView(frame: container.bounds)
+        navigator.view.frame = root.bounds
+        root.addSubview(navigator.view)
+        container.addSubview(root)
+        delegate.pageTurnRootView = root
+
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: -700
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .changed,
+            translationX: -100,
+            velocityX: -700
+        )
+        #expect(await waitUntil { pageTurnSurfaces(in: container).count == 2 })
+
+        let restoreGate = Gate()
+        var isRestoring = false
+        navigator.pageTurnPreparedPageRestoreForTesting = {
+            isRestoring = true
+            await restoreGate.wait()
+            return true
+        }
+        let updateCount = navigator.pageTurnInteractionModeUpdateCountForTesting
+
+        navigator.pageTurnStyle = .none
+
+        #expect(await waitUntil { isRestoring })
+        #expect(navigator.pageTurnInteractionModeUpdateCountForTesting == updateCount)
+
+        restoreGate.open()
+        await navigator.settlePageTurn()
+
+        #expect(navigator.pageTurnInteractionModeUpdateCountForTesting == updateCount + 1)
+        #expect(navigator.isPageTurnIdleForTesting)
+    }
+
     @Test("external cancellation clears a queued none gesture before the next pan")
     func noneCancellationDoesNotLeaveQueuedGesture() async throws {
         let navigator = try await makeMountedNavigator(pageTurnStyle: .none)

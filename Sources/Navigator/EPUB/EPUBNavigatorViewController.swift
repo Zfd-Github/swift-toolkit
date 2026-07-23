@@ -312,10 +312,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         set {
             guard storedPageTurnStyle != newValue || !snapshotProvider.isIdle else { return }
             storedPageTurnStyle = newValue
+            hasDeferredPageTurnInteractionModeUpdate = true
             cancelActivePageTurn()
             snapshotProvider.invalidate()
             snapshotProvider.deferPageTurnInteraction { [weak self] in
-                self?.updatePageTurnInteractionMode()
+                self?.applyDeferredPageTurnInteractionMode()
             }
         }
     }
@@ -808,6 +809,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private var pageTurnTransaction: PageTurnTransaction?
     private var pendingPageTurnGesture: PendingPageTurnGesture?
+    private var hasDeferredPageTurnInteractionModeUpdate = false
 
     private var pageTurnPanSession: PageTurnSession? {
         pageTurnTransaction?.session
@@ -860,6 +862,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     var pageTurnWillValidateCommitForTesting: (() -> Void)?
     var pageTurnPreparedPageRestoreForTesting: (() async -> Bool)?
     var pageTurnOriginalLocationRestoreForTesting: (() async -> Bool)?
+    private(set) var pageTurnInteractionModeUpdateCountForTesting = 0
     private var coldPageTurnTargetIndexForTesting: Int?
     private var isColdPageTurnArmedForTesting = false
     private var didBeginWithColdTargetForTesting = false
@@ -975,6 +978,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         if didMove {
             on(.moved)
         }
+        applyDeferredPageTurnInteractionMode()
     }
 
     private func commitPageTurn(
@@ -1225,6 +1229,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             owner.pageTurnController.isIdle
         {
             owner.pageTurnTransaction = nil
+            owner.applyDeferredPageTurnInteractionMode()
             owner.resumePendingPageTurnGesture()
         }
         return result
@@ -1743,6 +1748,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             pageTurnTransactionTask?.cancel()
             pageTurnTransactionTask = nil
             pageTurnTransaction = nil
+            applyDeferredPageTurnInteractionMode()
             on(.moved)
             return
         }
@@ -2611,6 +2617,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func updatePageTurnInteractionMode() {
+        guard
+            !hasDeferredPageTurnInteractionModeUpdate
+                || (pageTurnTransaction == nil && pageTurnController.isIdle)
+        else {
+            return
+        }
+        pageTurnInteractionModeUpdateCountForTesting += 1
         guard let paginationView else { return }
         let policy = pageTurnInteractionPolicy(for: paginationView.axis)
         paginationView.allowsNativeHorizontalPaging = policy.allowsNativeHorizontalPaging
@@ -2628,6 +2641,21 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 view.removeGestureRecognizer(pageTurnPanGestureRecognizer)
             }
         }
+    }
+
+    /// A style change must not reconfigure UIKit recognizers until the page
+    /// transaction has restored its captured hierarchy and reached its own
+    /// terminal state.
+    private func applyDeferredPageTurnInteractionMode() {
+        guard
+            hasDeferredPageTurnInteractionModeUpdate,
+            pageTurnTransaction == nil,
+            pageTurnController.isIdle
+        else {
+            return
+        }
+        hasDeferredPageTurnInteractionModeUpdate = false
+        updatePageTurnInteractionMode()
     }
 
     private func currentEffectivePageTurnStyle() -> EPUBPageTurnStyle {
