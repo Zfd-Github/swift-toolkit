@@ -940,7 +940,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         else {
             return false
         }
-        guard let originalPreview = await navigator()?.calculatePageTurnPreview() else {
+        guard let originalPreview = await navigator()?.waitForPageTurnPreview() else {
             return false
         }
         navigator()?.pageTurnSurfaceOriginalPreview = originalPreview

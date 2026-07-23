@@ -1823,6 +1823,51 @@ struct EPUBPageTurnControllerTests {
         #expect(navigator.isPageTurnIdleForTesting)
     }
 
+    @Test("surface preparation waits for a transiently unavailable exact original preview")
+    func transientOriginalPreviewDoesNotDropPageTurn() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .cover)
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = SnapshotObservingView(frame: container.bounds)
+        navigator.view.frame = root.bounds
+        root.addSubview(navigator.view)
+        container.addSubview(root)
+        delegate.pageTurnRootView = root
+        delegate.resetLocationChanges()
+        let original = try #require(navigator.currentLocation)
+        let originalViewport = try #require(navigator.viewport)
+        let target = makeLocator(href: "chapter-2.xhtml", progression: 0)
+        let targetViewport = NavigatorViewport(
+            resources: [
+                .init(href: target.href, progression: 0 ... 0.25)
+            ],
+            progression: 0.5 ... 0.75
+        )
+        var calculationCount = 0
+        navigator.pageTurnPreviewCalculationForTesting = {
+            calculationCount += 1
+            switch calculationCount {
+            case 1:
+                return (nil, nil)
+            case 2:
+                return (original, originalViewport)
+            default:
+                return (target, targetViewport)
+            }
+        }
+        navigator.pageTurnNavigationForTesting = { _, _ in true }
+        navigator.pageTurnLocationCalculationForTesting = {
+            (target, targetViewport)
+        }
+
+        #expect(await navigator.goForward(options: .animated))
+
+        #expect(calculationCount >= 3)
+        #expect(delegate.previews.contains { $0.0 == target })
+        #expect(delegate.previewEndCount == 1)
+        #expect(pageTurnSurfaces(in: container).isEmpty)
+        #expect(navigator.isPageTurnIdleForTesting)
+    }
+
     @Test("a missing target preview prevents target capture and commit")
     func missingTargetPreviewRejectsSurfaceCommit() async throws {
         let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .cover)
