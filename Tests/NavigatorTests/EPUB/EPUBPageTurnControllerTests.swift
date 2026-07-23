@@ -422,6 +422,40 @@ struct EPUBPageTurnControllerTests {
         #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-1.xhtml"))
     }
 
+    @Test("animated pan keeps preparation ownership when end reenters during surface capture")
+    func animatedPanEndDuringSurfaceCaptureRetainsPreparation() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .push)
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = SnapshotObservingView(frame: container.bounds)
+        navigator.view.frame = root.bounds
+        root.addSubview(navigator.view)
+        container.addSubview(root)
+        delegate.pageTurnRootView = root
+
+        root.onSnapshot = {
+            root.onSnapshot = nil
+            navigator.handlePageTurnPanForTesting(
+                state: .ended,
+                translationX: -100,
+                velocityX: -700
+            )
+        }
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: -700
+        )
+
+        #expect(await waitUntil {
+            self.currentPaginationView(in: navigator)?.currentIndex == 1
+        })
+        await navigator.settlePageTurn()
+
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-2.xhtml"))
+        #expect(navigator.isPageTurnIdleForTesting)
+        #expect(pageTurnSurfaces(in: container).isEmpty)
+    }
+
     @Test("mounted navigator keeps one transaction recognizer across push none and cover")
     func mountedRuntimeInteractionPolicy() async throws {
         let navigator = try await makeMountedNavigator(pageTurnStyle: .push)

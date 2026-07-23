@@ -2145,14 +2145,19 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         let style = currentEffectivePageTurnStyle()
         pageTurnPanSession = session
         pageTurnSurfaceStyle = style
-        guard style == .none || beginPageTurnSurface(session, style: style) else {
-            finishPageTurn(session)
-            return false
-        }
-        if style != .none {
-            pageTurnPreparationTask = Task { @MainActor [weak self] in
+        let preparation: Task<Bool, Never>? = if style == .none {
+            nil
+        } else {
+            Task { @MainActor [weak self] in
                 await Self.preparePageTurnSurface(session) { [weak self] in self }
             }
+        }
+        pageTurnPreparationTask = preparation
+        guard style == .none || beginPageTurnSurface(session, style: style) else {
+            preparation?.cancel()
+            pageTurnPreparationTask = nil
+            finishPageTurn(session)
+            return false
         }
         return true
     }
