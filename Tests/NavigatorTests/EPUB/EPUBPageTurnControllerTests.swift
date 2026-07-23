@@ -530,6 +530,108 @@ struct EPUBPageTurnControllerTests {
         #expect(pageTurnSurfaces(in: container).isEmpty)
     }
 
+    @Test("external cancellation discards an immediate reverse gesture")
+    func externalCancellationDiscardsQueuedReverseGesture() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(
+            pageTurnStyle: .push,
+            chapterCount: 3
+        )
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = SnapshotObservingView(frame: container.bounds)
+        navigator.view.frame = root.bounds
+        root.addSubview(navigator.view)
+        container.addSubview(root)
+        delegate.pageTurnRootView = root
+        #expect(await navigator.goForward(options: .none))
+        await navigator.settlePageTurn()
+        let original = try #require(navigator.currentLocation)
+        delegate.resetLocationChanges()
+        let displayFrameGate = Gate()
+        var isWaitingForDisplayFrame = false
+        navigator.pageTurnDisplayFrameWaiterForTesting = {
+            guard !isWaitingForDisplayFrame else { return }
+            isWaitingForDisplayFrame = true
+            await displayFrameGate.wait()
+        }
+
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: 700
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .ended,
+            translationX: 100,
+            velocityX: 700
+        )
+        #expect(await waitUntil {
+            currentPaginationView(in: navigator)?.currentIndex == 0
+                && isWaitingForDisplayFrame
+        })
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: -700
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .ended,
+            translationX: -100,
+            velocityX: -700
+        )
+
+        navigator.didReceiveMemoryWarning()
+        displayFrameGate.open()
+        await navigator.settlePageTurn()
+
+        #expect(navigator.currentLocation == original)
+        #expect(delegate.locationChangeCount == 0)
+        #expect(navigator.isPageTurnIdleForTesting)
+        #expect(pageTurnSurfaces(in: container).isEmpty)
+    }
+
+    @Test("external cancellation clears a queued none gesture before the next pan")
+    func noneCancellationDoesNotLeaveQueuedGesture() async throws {
+        let navigator = try await makeMountedNavigator(pageTurnStyle: .none)
+        var navigationCount = 0
+        navigator.pageTurnNavigationForTesting = { _, _ in
+            navigationCount += 1
+            return true
+        }
+
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: -700
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .ended,
+            translationX: -100,
+            velocityX: -700
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: 700
+        )
+        navigator.pageTurnStyle = .simulation
+        navigator.pageTurnStyle = .none
+
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: -700
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .ended,
+            translationX: -100,
+            velocityX: -700
+        )
+        await navigator.settlePageTurn()
+
+        #expect(navigationCount == 1)
+        #expect(navigator.isPageTurnIdleForTesting)
+    }
+
     @Test("a queued accessibility cancel bypasses stalled preparation")
     func queuedAccessibilityCancelKeepsSettleLive() async throws {
         let notificationCenter = NotificationCenter()
@@ -2293,8 +2395,8 @@ struct EPUBPageTurnControllerTests {
         #expect(pageTurnSurfaces(in: container).isEmpty)
     }
 
-    @Test("gesture restoration exhaustion reaches terminal recovery and permits the next gesture")
-    func gestureRestoreFailureDoesNotRemainTracking() async throws {
+    @Test("gesture restoration exhaustion never publishes the cancelled target")
+    func gestureRestoreFailureDoesNotPublishTarget() async throws {
         let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .cover)
         let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
         let root = SnapshotObservingView(frame: container.bounds)
@@ -2338,7 +2440,8 @@ struct EPUBPageTurnControllerTests {
 
         #expect(await waitUntil { navigator.isPageTurnIdleForTesting })
         #expect(navigationCount == 3)
-        #expect(delegate.locationChangeCount == 1)
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-1.xhtml"))
+        #expect(delegate.locationChangeCount == 0)
         #expect(pageTurnSurfaces(in: container).isEmpty)
 
         navigator.handlePageTurnPanForTesting(
