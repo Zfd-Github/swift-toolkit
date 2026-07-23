@@ -1517,6 +1517,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func cancelActivePageTurn() {
+        pendingPageTurnGesture = nil
         guard !pageTurnController.isCommitting else { return }
         guard let transaction = pageTurnTransaction else {
             guard
@@ -1547,61 +1548,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private func releaseFailedPageTurnRestore(_ session: PageTurnSession) async {
         guard pageTurnController.isTracking(session) else { return }
-        guard
+        if
             pageTurnSurfaceDidPrepareTarget,
             let animator = pageTurnSurfaceAnimator,
-            let targetPreview = pageTurnSurfaceTargetPreview
-        else {
-            if
-                pageTurnSurfaceDidPrepareTarget,
-                let animator = pageTurnSurfaceAnimator,
-                !(await recoverOriginalPageTurnAfterCommitFailure(animator))
-            {
-                animator.render(progress: 0)
-                finishPageTurn(session)
-                return
-            }
-            await waitForPageTurnDisplayFrames()
-            cleanupPageTurnSurface(session)
-            finishPageTurn(session)
-            return
+            !(await recoverOriginalPageTurnAfterCommitFailure(animator))
+        {
+            animator.render(progress: 0)
         }
-        _ = await pageTurnController.commit(session) { [self] in
-            var canCleanup = false
-            defer {
-                if canCleanup {
-                    cleanupPageTurnSurface(session)
-                }
-                finishPageTurn(session)
-            }
-            await animator.animate(to: 1, duration: 0.18)
-            delegate?.navigator(
-                self,
-                previewLocationDidChange: targetPreview.location,
-                viewport: targetPreview.viewport
-            )
-            await waitForPageTurnDisplayFrames()
-            guard await matchCommittedPageTurnSurfaceIdentity() else {
-                log(.error, "Failed to recover the target page-turn surface identity.")
-                return false
-            }
-            let published = await publishPageTurnLocation()
-            guard published else {
-                log(.error, "Failed to publish the recovered page-turn location.")
-                canCleanup = await recoverOriginalPageTurnAfterCommitFailure(animator)
-                return false
-            }
-            if let target = pageTurnSurfaceTargetLocator {
-                delegate?.navigator(self, didJumpTo: target)
-            }
-            await waitForPageTurnDisplayFrames()
-            guard await matchCommittedPageTurnSurfaceIdentity() else {
-                log(.error, "Recovered page-turn identity changed before cleanup.")
-                return false
-            }
-            canCleanup = true
-            return true
-        }
+        await waitForPageTurnDisplayFrames()
+        cleanupPageTurnSurface(session)
+        finishPageTurn(session)
     }
 
     private func cleanupPageTurnSurface(_ session: PageTurnSession) {
