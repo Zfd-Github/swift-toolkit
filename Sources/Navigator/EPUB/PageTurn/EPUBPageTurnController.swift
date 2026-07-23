@@ -211,6 +211,13 @@ final class EPUBPageTurnSurfaceAnimator {
         targetView != nil
     }
 
+    /// A surface is only safe while at least one of the snapshots which was
+    /// installed for this transaction remains mounted. A transient removal of
+    /// both snapshots must not be treated as a completed animation.
+    var hasMountedSurface: Bool {
+        currentView.superview != nil || targetView?.superview != nil
+    }
+
     var hasMatchingCurrentRootIdentity: Bool {
         guard let rootView = rootViewProvider(), let documentView else { return false }
         return currentRootIdentity == Self.rootIdentity(

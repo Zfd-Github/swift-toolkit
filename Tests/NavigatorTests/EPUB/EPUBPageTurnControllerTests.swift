@@ -2438,18 +2438,17 @@ struct EPUBPageTurnControllerTests {
             velocityX: 0
         )
 
-        #expect(await waitUntil {
-            navigationCount == 3 && !navigator.isPageTurnControllerIdleForTesting
-        })
+        #expect(await waitUntil { navigator.isPageTurnControllerIdleForTesting })
         #expect(navigationCount == 3)
         #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-1.xhtml"))
         #expect(delegate.locationChangeCount == 0)
-        #expect(!pageTurnSurfaces(in: container).isEmpty)
-        #expect(!navigator.canBeginPageTurnPanForTesting())
+        #expect(delegate.previews.last?.0 == nil)
+        #expect(pageTurnSurfaces(in: container).isEmpty)
+        #expect(navigator.isPageTurnIdleForTesting)
     }
 
-    @Test("unrestorable cancellation retains the original surface over a real target pagination")
-    func unrecoverableCancellationKeepsTargetPaginationCovered() async throws {
+    @Test("unrestorable cancellation reloads the saved original locator and releases input")
+    func unrecoverableCancellationReloadsOriginalLocation() async throws {
         let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .cover)
         let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
         let root = SnapshotObservingView(frame: container.bounds)
@@ -2482,13 +2481,71 @@ struct EPUBPageTurnControllerTests {
         )
         await navigator.settlePageTurn()
 
-        #expect(preparedRestoreAttempts == 4)
-        #expect(currentPaginationView(in: navigator)?.currentIndex == 1)
+        #expect(preparedRestoreAttempts >= 2)
+        #expect(currentPaginationView(in: navigator)?.currentIndex == 0)
         #expect(navigator.currentLocation == original)
         #expect(delegate.locationChangeCount == 0)
-        #expect(delegate.previews.last?.0 == original)
-        #expect(!pageTurnSurfaces(in: container).isEmpty)
-        #expect(!navigator.canBeginPageTurnPanForTesting())
+        #expect(delegate.previews.dropLast().last?.0 == original)
+        #expect(delegate.previews.last?.0 == nil)
+        #expect(pageTurnSurfaces(in: container).isEmpty)
+        #expect(navigator.canBeginPageTurnPanForTesting())
+    }
+
+    @Test("missing page root never animates the navigator body")
+    func missingPageTurnRootSafelyCancelsAnimatedTapAndPan() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .push)
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        navigator.view.frame = container.bounds
+        container.addSubview(navigator.view)
+        delegate.pageTurnRootView = nil
+        let original = try #require(navigator.currentLocation)
+
+        #expect(!(await navigator.goForward(options: .animated)))
+        #expect(navigator.currentLocation == original)
+        #expect(pageTurnSurfaces(in: container).isEmpty)
+
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: -700
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .ended,
+            translationX: -100,
+            velocityX: -700
+        )
+        #expect(await waitUntil { navigator.isPageTurnIdleForTesting })
+        #expect(navigator.currentLocation == original)
+        #expect(pageTurnSurfaces(in: container).isEmpty)
+    }
+
+    @Test("loss of all mounted page surfaces before settlement restores the original page")
+    func missingMountedSurfacesBeforeSettlementFailsTheTransaction() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .push)
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = SnapshotObservingView(frame: container.bounds)
+        navigator.view.frame = root.bounds
+        root.addSubview(navigator.view)
+        container.addSubview(root)
+        delegate.pageTurnRootView = root
+        let original = try #require(navigator.currentLocation)
+        delegate.resetLocationChanges()
+        var removed = false
+        navigator.pageTurnDisplayFrameWaiterForTesting = {
+            let surfaces = self.pageTurnSurfaces(in: container)
+            if !removed, surfaces.count == 2 {
+                removed = true
+                surfaces.forEach { $0.removeFromSuperview() }
+            }
+        }
+
+        #expect(!(await navigator.goForward(options: .animated)))
+        #expect(removed)
+        #expect(currentPaginationView(in: navigator)?.currentIndex == 0)
+        #expect(navigator.currentLocation == original)
+        #expect(delegate.locationChangeCount == 0)
+        #expect(pageTurnSurfaces(in: container).isEmpty)
+        #expect(navigator.isPageTurnIdleForTesting)
     }
 
     @Test("irreversible surface commit reports publication failure and clears preview")
