@@ -180,6 +180,32 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     // MARK: - Location and progression
 
+    /// Leading-edge progression for a horizontal resource, matching the JS
+    /// definition in `Scripts/src/utils.js` (`abs(scrollX) / scrollWidth`).
+    ///
+    /// Prefer this (or `leadingProgression`) over ad-hoc
+    /// `contentOffset / (contentSize - bounds)` math — that overestimates
+    /// non-zero positions and breaks cancel-restore validation.
+    static func leadingProgression(
+        contentOffsetX: CGFloat,
+        contentWidth: CGFloat
+    ) -> Double {
+        guard contentWidth > 0 else { return 0 }
+        return min(max(Double(abs(contentOffsetX) / contentWidth), 0), 1)
+    }
+
+    /// Live leading progression for the current viewport from scroll geometry.
+    ///
+    /// Always derived from the scroll view with the JS formula so callers can
+    /// validate immediately after programmatic `go` without waiting on a
+    /// `progressionChanged` message (which can lag or be suppressed).
+    var leadingProgression: Double {
+        Self.leadingProgression(
+            contentOffsetX: scrollView.contentOffset.x,
+            contentWidth: scrollView.contentSize.width
+        )
+    }
+
     override func progression(in index: ReadingOrder.Index) -> ClosedRange<Double> {
         guard
             spread.first.index == index,

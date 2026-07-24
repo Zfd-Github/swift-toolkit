@@ -5,6 +5,7 @@
 //
 
 import Foundation
+import QuartzCore
 import UIKit
 
 public enum EPUBPageTurnStyle: Sendable, Equatable {
@@ -32,10 +33,9 @@ enum EPUBPageTurnInteraction {
         let allowsNativeHorizontalPaging: Bool
     }
 
-    static func policy(
-        axis: PaginationView.Axis,
-        style: EPUBPageTurnStyle
-    ) -> Policy {
+    /// Horizontal page-turn styles share one pan policy: native paging is off
+    /// so the navigator owns the gesture. Continuous axes keep native paging.
+    static func policy(axis: PaginationView.Axis) -> Policy {
         guard axis == .horizontalPaged else {
             return Policy(allowsNativeHorizontalPaging: true)
         }
@@ -63,10 +63,9 @@ enum EPUBPageTurnInteraction {
         return options
     }
 
-    static func direction(
-        for velocity: CGPoint,
-        readingProgression _: ReadingProgression
-    ) -> EPUBSpreadView.Direction? {
+    /// Maps a primarily horizontal velocity to a spread direction.
+    /// Reading progression is applied later via `PageTurnSession.isForward`.
+    static func direction(for velocity: CGPoint) -> EPUBSpreadView.Direction? {
         guard abs(velocity.x) > abs(velocity.y) * 1.2, velocity.x != 0 else {
             return nil
         }
@@ -158,6 +157,9 @@ final class EPUBPageTurnSurfaceAnimator {
         let bounds: CGRect
         let documentFrame: CGRect
         let scale: CGFloat
+        /// Color appearance / contrast so theme flips invalidate captured surfaces.
+        let userInterfaceStyle: Int
+        let accessibilityContrast: Int
     }
 
     private let rootViewProvider: () -> UIView?
@@ -167,6 +169,7 @@ final class EPUBPageTurnSurfaceAnimator {
     private var targetView: UIView?
     private var targetRootIdentity: RootIdentity?
     private var pageCurlController: EPUBPageCurlController?
+    private var activeFrameWaiter: PageTurnAnimationFrameWaiter?
     private let style: EPUBPageTurnStyle
     private let physicalCompletionDirection: EPUBSpreadView.Direction
     private var progress: CGFloat = 0
@@ -438,37 +441,77 @@ final class EPUBPageTurnSurfaceAnimator {
     }
 
     func animate(
-        to progress: CGFloat,
+        to targetProgress: CGFloat,
         duration: TimeInterval,
         scheduleDisplayFrame: (@MainActor (PageTurnAnimationFrameWaiter) -> Void)? = nil,
         shouldContinue: @MainActor @escaping () -> Bool = { true }
     ) async -> Bool {
         if style == .simulation, let pageCurlController {
-            self.progress = min(max(progress, 0), 1)
+            progress = min(max(targetProgress, 0), 1)
             return await pageCurlController.animate(
-                to: progress,
+                to: targetProgress,
                 duration: duration,
                 scheduleDisplayFrame: scheduleDisplayFrame,
                 shouldContinue: shouldContinue
             )
         }
-        await withCheckedContinuation { continuation in
-            UIView.animate(
-                withDuration: duration,
-                delay: 0,
-                options: [.beginFromCurrentState, .curveEaseOut, .allowUserInteraction],
-                animations: { self.render(progress: progress) },
-                completion: { _ in continuation.resume() }
-            )
+        // Frame-driven interpolation so reduce-motion / background cancel can
+        // interrupt push/cover mid-flight (UIView.animate is not cancellable).
+        let startProgress = progress
+        let endProgress = min(max(targetProgress, 0), 1)
+        guard duration > 0 else {
+            guard shouldContinue() else { return false }
+            render(progress: endProgress)
+            return true
         }
-        return shouldContinue()
+        // A cancelled parent Task makes PageTurnAnimationFrameWaiter return
+        // immediately. Snap to the end state instead of busy-waiting for
+        // wall-clock duration on the main actor (restore after prepare cancel).
+        if Task.isCancelled {
+            render(progress: endProgress)
+            return shouldContinue()
+        }
+        let startTime = CACurrentMediaTime()
+        var elapsed: TimeInterval = 0
+        while elapsed < duration {
+            guard shouldContinue() else { return false }
+            if Task.isCancelled {
+                render(progress: endProgress)
+                return shouldContinue()
+            }
+            if let scheduleDisplayFrame {
+                await PageTurnAnimationFrameWaiter.wait(
+                    scheduleDisplayFrame: scheduleDisplayFrame,
+                    registerWaiter: { self.activeFrameWaiter = $0 }
+                )
+            } else {
+                await PageTurnAnimationFrameWaiter.wait(
+                    registerWaiter: { self.activeFrameWaiter = $0 }
+                )
+            }
+            activeFrameWaiter = nil
+            if Task.isCancelled {
+                render(progress: endProgress)
+                return shouldContinue()
+            }
+            guard shouldContinue() else { return false }
+            elapsed = CACurrentMediaTime() - startTime
+            let fraction = min(max(elapsed / duration, 0), 1)
+            let eased = 1 - pow(1 - fraction, 3)
+            render(progress: startProgress + (endProgress - startProgress) * eased)
+        }
+        render(progress: endProgress)
+        return true
     }
 
     func cancelAnimation() {
         pageCurlController?.cancelAnimation()
+        activeFrameWaiter?.cancel()
+        activeFrameWaiter = nil
     }
 
     func remove() {
+        cancelAnimation()
         currentView.layer.removeAllAnimations()
         targetView?.layer.removeAllAnimations()
         currentView.removeFromSuperview()
@@ -490,6 +533,7 @@ final class EPUBPageTurnSurfaceAnimator {
     private static func rootIdentity(rootView: UIView, documentView: UIView) -> RootIdentity {
         rootView.layoutIfNeeded()
         documentView.layoutIfNeeded()
+        let traits = rootView.traitCollection
         return RootIdentity(
             root: ObjectIdentifier(rootView),
             parent: rootView.superview.map(ObjectIdentifier.init),
@@ -497,7 +541,9 @@ final class EPUBPageTurnSurfaceAnimator {
             frame: rootView.frame,
             bounds: rootView.bounds,
             documentFrame: documentView.convert(documentView.bounds, to: rootView),
-            scale: rootView.window?.screen.scale ?? rootView.traitCollection.displayScale
+            scale: rootView.window?.screen.scale ?? traits.displayScale,
+            userInterfaceStyle: traits.userInterfaceStyle.rawValue,
+            accessibilityContrast: traits.accessibilityContrast.rawValue
         )
     }
 }
