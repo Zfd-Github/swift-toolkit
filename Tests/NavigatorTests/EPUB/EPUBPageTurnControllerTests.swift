@@ -5,6 +5,7 @@
 //
 
 @testable import ReadiumNavigator
+import CoreImage
 import ReadiumShared
 import Testing
 import UIKit
@@ -95,7 +96,7 @@ struct EPUBPageTurnControllerTests {
         )
         #expect(routed)
         #expect(routedOptions.count == 1)
-        #expect(routedOptions.first?.animated == false)
+        #expect(routedOptions.first == .init(animated: true))
 
         navigator.pageTurnStyle = .push
         #expect(navigator.pageTurnStyle == .push)
@@ -254,13 +255,13 @@ struct EPUBPageTurnControllerTests {
         #expect(controller.progress == 0.41)
     }
 
-    @Test("simulation maps both physical completion directions to opposite curl angles")
+    @Test("simulation maps physical completion directions to their matching curl angles")
     func simulationDirectionMapping() {
         #expect(
-            EPUBPageCurlRenderView.angle(for: .left) == 0
+            EPUBPageCurlRenderView.angle(for: .left) == .pi
         )
         #expect(
-            EPUBPageCurlRenderView.angle(for: .right) == .pi
+            EPUBPageCurlRenderView.angle(for: .right) == 0
         )
 
         let ltrForward = PageTurnSession(
@@ -273,6 +274,135 @@ struct EPUBPageTurnControllerTests {
         )
         #expect(ltrForward.physicalCompletionDirection == .left)
         #expect(rtlForward.physicalCompletionDirection == .right)
+    }
+
+    @Test("simulation uses a mirrored current surface for the curl backside")
+    func simulationMirrorsCurrentSurfaceForBackside() throws {
+        let current = makeSideBySideImage(
+            left: .red,
+            right: .blue
+        )
+        let view = try #require(EPUBPageCurlRenderView(
+            currentImage: current,
+            paperColor: .black,
+            physicalCompletionDirection: .left
+        ))
+
+        let backside = try #require(renderedCGImage(view.backsideImageForRendering()))
+        let renderedCurrent = try #require(renderedCGImage(CIImage(cgImage: current)))
+        let leftBackside = try #require(backside.pixelBytes(at: CGPoint(
+            x: CGFloat(backside.width) * 0.05,
+            y: CGFloat(backside.height) * 0.5
+        )))
+        let rightCurrent = try #require(renderedCurrent.pixelBytes(at: CGPoint(
+            x: CGFloat(renderedCurrent.width) * 0.95,
+            y: CGFloat(renderedCurrent.height) * 0.5
+        )))
+
+        #expect(leftBackside == rightCurrent)
+    }
+
+    @Test("simulation refreshes the mirrored backside after recapturing the current surface")
+    func simulationRefreshesBacksideAfterRecapture() throws {
+        let initial = makeSideBySideImage(left: .red, right: .blue)
+        let recaptured = makeSideBySideImage(left: .green, right: .yellow)
+        let view = try #require(EPUBPageCurlRenderView(
+            currentImage: initial,
+            paperColor: .black,
+            physicalCompletionDirection: .left
+        ))
+        let initialBackside = try #require(renderedCGImage(view.backsideImageForRendering()))
+        let initialLeft = try #require(initialBackside.pixelBytes(at: CGPoint(
+            x: CGFloat(initialBackside.width) * 0.05,
+            y: CGFloat(initialBackside.height) * 0.5
+        )))
+
+        view.setCurrentImage(recaptured)
+
+        let recapturedBackside = try #require(renderedCGImage(view.backsideImageForRendering()))
+        let recapturedCurrent = try #require(renderedCGImage(CIImage(cgImage: recaptured)))
+        let recapturedLeft = try #require(recapturedBackside.pixelBytes(at: CGPoint(
+            x: CGFloat(recapturedBackside.width) * 0.05,
+            y: CGFloat(recapturedBackside.height) * 0.5
+        )))
+        let recapturedRight = try #require(recapturedCurrent.pixelBytes(at: CGPoint(
+            x: CGFloat(recapturedCurrent.width) * 0.95,
+            y: CGFloat(recapturedCurrent.height) * 0.5
+        )))
+
+        #expect(recapturedLeft == recapturedRight)
+        #expect(recapturedLeft != initialLeft)
+    }
+
+    @Test("simulation curl output keeps top document and bottom surface content on the page")
+    func simulationCurlOutputKeepsWholeSurfaceContent() throws {
+        let current = makeBandedImage(colors: [.red, .green, .blue])
+        let target = makeBandedImage(colors: [.cyan, .magenta, .yellow])
+        let view = try #require(EPUBPageCurlRenderView(
+            currentImage: current,
+            paperColor: .black,
+            physicalCompletionDirection: .left
+        ))
+        view.setTargetImage(target)
+        view.progress = 0.5
+
+        let backside = try #require(renderedCGImage(view.backsideImageForRendering()))
+        let backsideBands = try [CGFloat(1.0 / 6), 0.5, 5.0 / 6].map {
+            try #require(backside.pixelBytes(at: CGPoint(
+                x: CGFloat(backside.width) * 0.44,
+                y: CGFloat(backside.height) * $0
+            )))
+        }
+        let output = try #require(renderedCGImage(view.outputImage()))
+        let bands = try [CGFloat(1.0 / 6), 0.5, 5.0 / 6].map {
+            try #require(output.pixelBytes(at: CGPoint(
+                x: CGFloat(output.width) * 0.44,
+                y: CGFloat(output.height) * $0
+            )))
+        }
+
+        #expect(backsideBands[0] != backsideBands[1])
+        #expect(backsideBands[1] != backsideBands[2])
+        #expect(bands[0] != bands[1])
+        #expect(bands[1] != bands[2])
+        #expect(bands.allSatisfy { $0.contains { $0 > 32 } })
+    }
+
+    @Test("simulation curl output follows the physical turn direction")
+    func simulationCurlOutputFollowsPhysicalDirection() throws {
+        let current = makeSolidImage(.red)
+        let target = makeSolidImage(.green)
+
+        let samples: [(EPUBSpreadView.Direction, CGFloat, CGFloat)] = [
+            (EPUBSpreadView.Direction.left, 1.0 / 3, 2.0 / 3),
+            (.right, 5.0 / 9, 2.0 / 9),
+        ]
+        for (direction, currentX, targetX) in samples {
+            let view = try #require(EPUBPageCurlRenderView(
+                currentImage: current,
+                paperColor: .black,
+                physicalCompletionDirection: direction
+            ))
+            view.setTargetImage(target)
+            view.progress = 0.5
+
+            let output = try #require(renderedCGImage(view.outputImage()))
+            let outgoing = try #require(
+                output.pixelBytes(at: CGPoint(
+                    x: CGFloat(output.width) * currentX,
+                    y: CGFloat(output.height) * 0.5
+                ))
+            )
+            let incoming = try #require(
+                output.pixelBytes(at: CGPoint(
+                    x: CGFloat(output.width) * targetX,
+                    y: CGFloat(output.height) * 0.5
+                ))
+            )
+
+            #expect(isPredominantlyRed(outgoing))
+            #expect(isPredominantlyGreen(incoming))
+        }
     }
 
     @Test("simulation rasterizes top, document, and bottom as one reader surface")
@@ -1499,41 +1629,51 @@ struct EPUBPageTurnControllerTests {
         #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-2.xhtml"))
     }
 
-    @Test("simulation keeps discrete horizontal locator navigation instant")
-    func simulationDiscreteLocatorNavigationIsInstant() {
-        let options = NavigatorGoOptions(
+    @Test("simulation keeps only directed sequential navigation animated")
+    func simulationDiscreteNavigationDistinguishesSequentialTurnsFromDirectJumps() {
+        let sequentialOptions = NavigatorGoOptions(
             animated: true,
             otherOptions: [
                 "readium.epub.pageTurnDirection": .string("forward"),
                 "probe": .string("preserved"),
             ]
         )
+        let directJumpOptions = NavigatorGoOptions(
+            animated: true,
+            otherOptions: ["probe": .string("preserved")]
+        )
 
         let simulation = EPUBPageTurnInteraction.discreteNavigationOptions(
-            options,
+            sequentialOptions,
+            axis: .horizontalPaged,
+            style: .simulation
+        )
+        let directJump = EPUBPageTurnInteraction.discreteNavigationOptions(
+            directJumpOptions,
             axis: .horizontalPaged,
             style: .simulation
         )
         let push = EPUBPageTurnInteraction.discreteNavigationOptions(
-            options,
+            directJumpOptions,
             axis: .horizontalPaged,
             style: .push
         )
         let continuous = EPUBPageTurnInteraction.discreteNavigationOptions(
-            options,
+            directJumpOptions,
             axis: .verticalContinuous,
             style: .simulation
         )
 
-        #expect(!simulation.animated)
-        #expect(simulation.otherOptions == options.otherOptions)
-        #expect(push == options)
-        #expect(continuous == options)
+        #expect(simulation == sequentialOptions)
+        #expect(directJump.animated == false)
+        #expect(directJump.otherOptions == directJumpOptions.otherOptions)
+        #expect(push == directJumpOptions)
+        #expect(continuous == directJumpOptions)
     }
 
-    @Test("programmatic chapter targets use whole-reader push and cover transactions")
+    @Test("sequential chapter targets use whole-reader page-turn transactions")
     func programmaticChapterTargetsUsePageTurnSurfaces() async throws {
-        for style in [EPUBPageTurnStyle.push, .cover] {
+        for style in [EPUBPageTurnStyle.push, .cover, .simulation] {
             let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: style)
             let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
             let root = SnapshotObservingView(frame: container.bounds)
@@ -1566,6 +1706,35 @@ struct EPUBPageTurnControllerTests {
             #expect(root.snapshotCount >= 2)
             #expect(pageTurnSurfaces(in: container).isEmpty)
         }
+    }
+
+    @Test("simulation uses a curl transaction for next-page actions but not direct jumps")
+    func simulationSequentialActionsCurlAndDirectJumpsStayInstant() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .simulation)
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = SnapshotObservingView(frame: container.bounds)
+        navigator.view.frame = root.bounds
+        root.addSubview(navigator.view)
+        container.addSubview(root)
+        delegate.pageTurnRootView = root
+        delegate.pageTurnSurfaceController = makePageTurnSurfaceController(root: root)
+
+        let turn = Task { @MainActor in
+            await navigator.goForward(options: .animated)
+        }
+        #expect(await waitUntil { !pageCurlViews(in: container).isEmpty })
+        #expect(await turn.value)
+        await navigator.settlePageTurn()
+        #expect(root.snapshotCount >= 2)
+
+        let link = try #require(navigator.publication.readingOrder.first)
+        let target = try #require(await navigator.publication.locate(link))
+        let snapshotCount = root.snapshotCount
+        #expect(await navigator.go(to: target, options: .animated))
+        await navigator.settlePageTurn()
+
+        #expect(root.snapshotCount == snapshotCount)
+        #expect(pageTurnSurfaces(in: container).isEmpty)
     }
 
     @Test("an identity recapture failure after commit never publishes or exposes a stale target")
@@ -3524,6 +3693,46 @@ private extension CGImage {
         let bytes = CFDataGetBytePtr(data)!
         return Array(UnsafeBufferPointer(start: bytes + offset, count: 4))
     }
+}
+
+private func makeBandedImage(colors: [UIColor]) -> CGImage {
+    let renderer = UIGraphicsImageRenderer(size: CGSize(width: 90, height: 90))
+    return renderer.image { context in
+        for (index, color) in colors.enumerated() {
+            color.setFill()
+            context.fill(CGRect(x: 0, y: index * 30, width: 90, height: 30))
+        }
+    }.cgImage!
+}
+
+private func makeSideBySideImage(left: UIColor, right: UIColor) -> CGImage {
+    let renderer = UIGraphicsImageRenderer(size: CGSize(width: 90, height: 30))
+    return renderer.image { context in
+        left.setFill()
+        context.fill(CGRect(x: 0, y: 0, width: 45, height: 30))
+        right.setFill()
+        context.fill(CGRect(x: 45, y: 0, width: 45, height: 30))
+    }.cgImage!
+}
+
+private func makeSolidImage(_ color: UIColor) -> CGImage {
+    let renderer = UIGraphicsImageRenderer(size: CGSize(width: 90, height: 90))
+    return renderer.image { context in
+        color.setFill()
+        context.fill(CGRect(x: 0, y: 0, width: 90, height: 90))
+    }.cgImage!
+}
+
+private func renderedCGImage(_ image: CIImage) -> CGImage? {
+    CIContext(options: nil).createCGImage(image, from: image.extent)
+}
+
+private func isPredominantlyRed(_ pixel: [UInt8]) -> Bool {
+    pixel[0] > 200 && pixel[1] < 60 && pixel[2] < 60
+}
+
+private func isPredominantlyGreen(_ pixel: [UInt8]) -> Bool {
+    pixel[0] < 60 && pixel[1] > 200 && pixel[2] < 60
 }
 
 @MainActor

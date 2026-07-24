@@ -16,7 +16,7 @@ final class EPUBPageCurlRenderView: MTKView, MTKViewDelegate {
     private let filter: CIFilter
     private var currentImage: CIImage
     private var targetImage: CIImage?
-    private let backsideImage: CIImage
+    private var backsideImage: CIImage
     private let imageExtent: CGRect
     private let curlAngle: CGFloat
 
@@ -50,7 +50,7 @@ final class EPUBPageCurlRenderView: MTKView, MTKViewDelegate {
         context = CIContext(mtlDevice: device)
         self.filter = filter
         self.currentImage = CIImage(cgImage: currentImage)
-        backsideImage = CIImage(color: CIColor(color: paperColor)).cropped(to: extent)
+        backsideImage = Self.mirroredBacksideImage(from: self.currentImage)
         imageExtent = extent
         curlAngle = Self.angle(for: physicalCompletionDirection)
 
@@ -85,17 +85,40 @@ final class EPUBPageCurlRenderView: MTKView, MTKViewDelegate {
     static func angle(
         for physicalCompletionDirection: EPUBSpreadView.Direction
     ) -> CGFloat {
-        physicalCompletionDirection == .left ? 0 : .pi
+        physicalCompletionDirection == .left ? .pi : 0
     }
 
     func setCurrentImage(_ image: CGImage) {
         currentImage = CIImage(cgImage: image)
+        backsideImage = Self.mirroredBacksideImage(from: currentImage)
         setNeedsDisplay()
     }
 
     func setTargetImage(_ image: CGImage) {
         targetImage = CIImage(cgImage: image)
         setNeedsDisplay()
+    }
+
+    func outputImage() -> CIImage {
+        guard let targetImage else {
+            return currentImage
+        }
+        filter.setValue(currentImage, forKey: kCIInputImageKey)
+        filter.setValue(targetImage, forKey: kCIInputTargetImageKey)
+        filter.setValue(backsideImage, forKey: "inputBacksideImage")
+        filter.setValue(CIVector(cgRect: imageExtent), forKey: kCIInputExtentKey)
+        filter.setValue(progress, forKey: kCIInputTimeKey)
+        filter.setValue(curlAngle, forKey: kCIInputAngleKey)
+        filter.setValue(max(12, imageExtent.width * 0.04), forKey: kCIInputRadiusKey)
+        return filter.outputImage?.cropped(to: imageExtent) ?? currentImage
+    }
+
+    func backsideImageForRendering() -> CIImage {
+        backsideImage
+    }
+
+    private static func mirroredBacksideImage(from image: CIImage) -> CIImage {
+        image.oriented(.upMirrored).cropped(to: image.extent)
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -108,22 +131,8 @@ final class EPUBPageCurlRenderView: MTKView, MTKViewDelegate {
             return
         }
 
-        let output: CIImage
-        if let targetImage {
-            filter.setValue(currentImage, forKey: kCIInputImageKey)
-            filter.setValue(targetImage, forKey: kCIInputTargetImageKey)
-            filter.setValue(backsideImage, forKey: "inputBacksideImage")
-            filter.setValue(CIVector(cgRect: imageExtent), forKey: kCIInputExtentKey)
-            filter.setValue(progress, forKey: kCIInputTimeKey)
-            filter.setValue(curlAngle, forKey: kCIInputAngleKey)
-            filter.setValue(max(12, imageExtent.width * 0.04), forKey: kCIInputRadiusKey)
-            output = filter.outputImage?.cropped(to: imageExtent) ?? currentImage
-        } else {
-            output = currentImage
-        }
-
         context.render(
-            output,
+            outputImage(),
             to: drawable.texture,
             commandBuffer: commandBuffer,
             bounds: imageExtent,
