@@ -1886,6 +1886,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 if style == .none {
                     return await turnWithPageSurface(to: direction, style: .none)
                 }
+                if style == .simulation, options.animated {
+                    return await turnWithPageSurface(to: direction, style: .simulation)
+                }
                 if style == .push, options.animated {
                     return await turnWithPageSurface(to: direction, style: .push)
                 }
@@ -1927,7 +1930,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         switch style {
         case .push:
             return await usingPageTurn(direction, routedOptions)
-        case .none, .simulation:
+        case .simulation:
+            return await usingPageTurn(direction, routedOptions)
+        case .none:
             return await usingPageTurn(direction, .none)
         case .cover:
             return await usingCover(direction, routedOptions)
@@ -3162,7 +3167,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                     style: .cover,
                     target: locator
                 )
-            case .none, .simulation:
+            case .simulation:
+                return await turnWithPageSurface(
+                    to: direction,
+                    style: .simulation,
+                    target: locator
+                )
+            case .none:
                 break
             }
         }

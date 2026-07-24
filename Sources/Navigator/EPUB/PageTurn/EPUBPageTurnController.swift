@@ -47,11 +47,19 @@ enum EPUBPageTurnInteraction {
         axis: PaginationView.Axis?,
         style: EPUBPageTurnStyle
     ) -> NavigatorGoOptions {
-        guard axis == .horizontalPaged, style == .simulation else {
+        guard
+            axis == .horizontalPaged,
+            style == .simulation,
+            case let .string(direction)? = options.otherOptions["readium.epub.pageTurnDirection"],
+            direction == "forward" || direction == "backward"
+        else {
+            guard axis == .horizontalPaged, style == .simulation else {
+                return options
+            }
+            var options = options
+            options.animated = false
             return options
         }
-        var options = options
-        options.animated = false
         return options
     }
 
