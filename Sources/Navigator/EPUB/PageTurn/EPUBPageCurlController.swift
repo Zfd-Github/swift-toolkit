@@ -79,10 +79,20 @@ final class EPUBPageCurlController {
             render(progress: targetProgress)
             return true
         }
+        // Cancelled tasks make frame waits return immediately; snap instead of
+        // spinning on the main actor until wall-clock duration elapses.
+        if Task.isCancelled {
+            render(progress: targetProgress)
+            return shouldContinue()
+        }
         let startTime = CACurrentMediaTime()
         var elapsed: TimeInterval = 0
         while elapsed < duration {
             guard shouldContinue() else { return false }
+            if Task.isCancelled {
+                render(progress: targetProgress)
+                return shouldContinue()
+            }
             if let scheduleDisplayFrame {
                 await PageTurnAnimationFrameWaiter.wait(
                     scheduleDisplayFrame: scheduleDisplayFrame,
@@ -94,6 +104,10 @@ final class EPUBPageCurlController {
                 )
             }
             activeFrameWaiter = nil
+            if Task.isCancelled {
+                render(progress: targetProgress)
+                return shouldContinue()
+            }
             guard shouldContinue() else { return false }
             elapsed = CACurrentMediaTime() - startTime
             let fraction = min(max(elapsed / duration, 0), 1)
