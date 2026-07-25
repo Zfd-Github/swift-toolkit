@@ -621,6 +621,36 @@ final class PaginationView: UIView, Loggable {
             : scrollView.bounds.width * CGFloat(index)
     }
 
+    /// Snaps outer horizontal paging to a whole resource page after an
+    /// interrupted page-turn snapshot exposure leaves contentOffset mid-way.
+    func snapToNearestHorizontalPage() {
+        guard
+            axis == .horizontalPaged,
+            !isAnimatingContentOffset,
+            scrollView.bounds.width > 0,
+            pageCount > 0
+        else {
+            return
+        }
+        let width = scrollView.bounds.width
+        let rawIndex: Int
+        if readingProgression == .rtl {
+            let fromTrailing =
+                scrollView.contentSize.width - (scrollView.contentOffset.x + width)
+            rawIndex = Int((fromTrailing / width).rounded())
+        } else {
+            rawIndex = Int((scrollView.contentOffset.x / width).rounded())
+        }
+        let index = min(max(0, rawIndex), pageCount - 1)
+        let targetX = xOffsetForIndex(index)
+        guard abs(scrollView.contentOffset.x - targetX) > 0.5 else { return }
+        scrollView.contentOffset = CGPoint(
+            x: targetX,
+            y: scrollView.contentOffset.y
+        )
+        setCurrentIndex(index)
+    }
+
     /// Reloads the pagination with the given total number of pages and current index.
     ///
     /// - Parameters:

@@ -656,6 +656,10 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         0
     }
 
+    /// Snaps in-resource horizontal paging to a whole page after selection or
+    /// an interrupted page-turn leaves `contentOffset` between pages.
+    func snapToNearestHorizontalPage() {}
+
     func beginPageTurnSnapshotCapture(
         at targetOffset: CGPoint
     ) -> EPUBPageTurnSnapshotCaptureContext? {
@@ -940,6 +944,19 @@ extension EPUBSpreadView: UIScrollViewDelegate {
 
     func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
         webView.clearSelection()
+    }
+
+    func scrollViewDidEndDragging(
+        _ scrollView: UIScrollView,
+        willDecelerate decelerate: Bool
+    ) {
+        if !decelerate {
+            snapToNearestHorizontalPage()
+        }
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        snapToNearestHorizontalPage()
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
