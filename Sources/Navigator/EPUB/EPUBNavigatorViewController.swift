@@ -927,6 +927,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private func beginPageTurn(
         to direction: EPUBSpreadView.Direction
     ) -> PageTurnSession? {
+        // Recover from selection-interrupted stuck presentation for every style
+        // so the user does not need to leave the book to get a clean page again.
+        if hasInFlightPageTurnWork, pageTurnTransaction?.isRunning != true {
+            hardAbortInFlightPageTurn(restorePreparedLocation: true)
+        }
         guard on(.move(direction)) else { return nil }
         guard let session = pageTurnController.begin(
             to: direction,
@@ -1497,13 +1502,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         _ session: PageTurnSession,
         style: EPUBPageTurnStyle
     ) async -> Bool {
-        // A previous hard-failure path may have left an orphan surface after
-        // the controller returned to idle. Never block the next turn on it.
+        // A previous hard-failure / selection-interrupt path may have left an
+        // orphan surface (any style). Never block the next turn on it — and do
+        // not require the controller to already be idle (stuck half-page).
         if pageTurnSurfaceAnimator != nil {
-            guard pageTurnController.isIdle || pageTurnTransaction == nil else {
+            if pageTurnTransaction?.isRunning == true {
                 return false
             }
-            forceReleaseOrphanPageTurnSurface()
+            hardAbortInFlightPageTurn(restorePreparedLocation: false)
         }
         for _ in 0 ..< 3 {
             guard !Task.isCancelled else { return false }
@@ -2303,11 +2309,20 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         pageTurnTransactionTask?.cancel()
     }
 
-    /// Hard-stop a page turn when text selection starts, updates, or clears.
-    /// Soft `cancelActivePageTurn` alone can leave push/cover snapshot views
-    /// mid-transform (half previous / half next) if the async restore path is
-    /// interrupted by selection UI.
-    private func abortPageTurnInterruptedBySelection() {
+    /// Hard-stop any in-flight page turn (simulation / cover / push / none).
+    /// Soft `cancelActivePageTurn` alone can leave snapshot or curl surfaces
+    /// mid-transform (half previous / half next) when selection UI interrupts.
+    private func hardAbortInFlightPageTurn(
+        restorePreparedLocation: Bool
+    ) {
+        let originalLocator = pageTurnTransaction?.originalLocator
+            ?? pageTurnSurfaceOriginalPreview?.location
+        let needsLocationRestore = restorePreparedLocation
+            && (
+                pageTurnSurfaceDidPrepareTarget
+                    || pageTurnTransaction?.didPrepareTarget == true
+            )
+
         cancelActivePageTurn()
         pageTurnDisplayFrameWaiter?.cancel()
         pageTurnDisplayFrameWaiter = nil
@@ -2321,6 +2336,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
         pendingPageTurnGesture = nil
         pageTurnSurfaceAnimator?.cancelAnimation()
+        // Covers push/cover snapshot pairs and simulation curl render views.
         forceReleaseOrphanPageTurnSurface()
         pageTurnSurfaceProgress = 0
         pageTurnSurfaceDidPrepareTarget = false
@@ -2329,6 +2345,19 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
         releasePageTurnNavigatorNavigationLock()
         applyDeferredPageTurnInteractionMode()
+
+        if needsLocationRestore, let originalLocator {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard self.pageTurnTransaction == nil else { return }
+                _ = await self.restorePageTurnLocator(originalLocator)
+            }
+        }
+    }
+
+    private func abortPageTurnInterruptedBySelection() {
+        hardAbortInFlightPageTurn(restorePreparedLocation: true)
+        updatePageTurnInteractionMode()
     }
 
     private var hasInFlightPageTurnWork: Bool {
@@ -3230,6 +3259,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             if pageTurnPanGestureRecognizer.view == nil {
                 view.addGestureRecognizer(pageTurnPanGestureRecognizer)
             }
+            // Shared by simulation / cover / push / none. Keep it off while a
+            // native text selection exists so handle drags cannot start a turn.
+            pageTurnPanGestureRecognizer.isEnabled = currentSelection == nil
         } else {
             cancelActivePageTurn()
             if pageTurnPanGestureRecognizer.view != nil {
@@ -4415,10 +4447,13 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
             viewModel.editingActions.selection = nil
         }
         // Long-press selection / handle drag can steal or race the page-turn
-        // pan. Starting, updating, or clearing selection must hard-abort any
-        // in-flight turn so push/cover surfaces cannot stick half-drawn.
+        // pan for every style (simulation, cover, push, none). Hard-abort any
+        // in-flight turn so surfaces cannot stick half-drawn, and disable pan
+        // for the duration of the selection.
         if hasInFlightPageTurnWork {
             abortPageTurnInterruptedBySelection()
+        } else {
+            updatePageTurnInteractionMode()
         }
     }
 
