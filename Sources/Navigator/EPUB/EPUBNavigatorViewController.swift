@@ -2303,6 +2303,41 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         pageTurnTransactionTask?.cancel()
     }
 
+    /// Hard-stop a page turn when text selection starts, updates, or clears.
+    /// Soft `cancelActivePageTurn` alone can leave push/cover snapshot views
+    /// mid-transform (half previous / half next) if the async restore path is
+    /// interrupted by selection UI.
+    private func abortPageTurnInterruptedBySelection() {
+        cancelActivePageTurn()
+        pageTurnDisplayFrameWaiter?.cancel()
+        pageTurnDisplayFrameWaiter = nil
+        pageTurnTransactionTask?.cancel()
+        pageTurnTransactionTask = nil
+        if let transaction = pageTurnTransaction {
+            transaction.invalidate()
+            transaction.resolve(.cancel)
+            transaction.complete(with: false)
+            pageTurnTransaction = nil
+        }
+        pendingPageTurnGesture = nil
+        pageTurnSurfaceAnimator?.cancelAnimation()
+        forceReleaseOrphanPageTurnSurface()
+        pageTurnSurfaceProgress = 0
+        pageTurnSurfaceDidPrepareTarget = false
+        if let session = pageTurnController.activeSession {
+            _ = pageTurnController.finish(session)
+        }
+        releasePageTurnNavigatorNavigationLock()
+        applyDeferredPageTurnInteractionMode()
+    }
+
+    private var hasInFlightPageTurnWork: Bool {
+        pageTurnTransaction != nil
+            || !pageTurnController.isIdle
+            || pageTurnSurfaceAnimator != nil
+            || pendingPageTurnGesture != nil
+    }
+
     private func releaseFailedPageTurnRestore(_ session: PageTurnSession) async -> Bool {
         guard pageTurnController.isTracking(session) else { return false }
         if
@@ -3419,6 +3454,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         translationX: CGFloat,
         velocityX: CGFloat
     ) {
+        // Selection handle drags can look like horizontal pans. Never keep a
+        // page-turn in flight while a native selection is active.
+        if currentSelection != nil {
+            if hasInFlightPageTurnWork {
+                abortPageTurnInterruptedBySelection()
+            }
+            return
+        }
+
         switch state {
         case .began:
             let velocity = CGPoint(x: velocityX, y: 0)
@@ -4362,14 +4406,20 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange locator: Locator?, frame: CGRect) {
-        guard let locator else {
+        if let locator {
+            viewModel.editingActions.selection = Selection(
+                locator: locator,
+                frame: view.convert(frame, from: spreadView)
+            )
+        } else {
             viewModel.editingActions.selection = nil
-            return
         }
-        viewModel.editingActions.selection = Selection(
-            locator: locator,
-            frame: view.convert(frame, from: spreadView)
-        )
+        // Long-press selection / handle drag can steal or race the page-turn
+        // pan. Starting, updating, or clearing selection must hard-abort any
+        // in-flight turn so push/cover surfaces cannot stick half-drawn.
+        if hasInFlightPageTurnWork {
+            abortPageTurnInterruptedBySelection()
+        }
     }
 
     func spreadViewPagesDidChange(_ spreadView: EPUBSpreadView) {
@@ -4435,6 +4485,18 @@ extension EPUBNavigatorViewController: UIGestureRecognizerDelegate {
             EPUBPageTurnInteraction.coverDirection(for: velocity)
         }
         return direction.map(shouldBeginPageTurnPan(to:)) ?? false
+    }
+
+    public func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldReceive touch: UITouch
+    ) -> Bool {
+        guard gestureRecognizer === pageTurnPanGestureRecognizer else {
+            return true
+        }
+        // Do not start a page-turn pan while native text selection is active
+        // (including selection-handle drags that report selection slightly late).
+        return currentSelection == nil
     }
 }
 
