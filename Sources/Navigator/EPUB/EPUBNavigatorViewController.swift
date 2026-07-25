@@ -2343,6 +2343,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         if let session = pageTurnController.activeSession {
             _ = pageTurnController.finish(session)
         }
+        // Snap web/pagination offsets even when no surface remains — selection
+        // handle drags leave mid-page contentOffset for every page-turn style.
+        snapVisibleDocumentToPageBoundaries()
         releasePageTurnNavigatorNavigationLock()
         applyDeferredPageTurnInteractionMode()
 
@@ -2351,13 +2354,27 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 guard let self else { return }
                 guard self.pageTurnTransaction == nil else { return }
                 _ = await self.restorePageTurnLocator(originalLocator)
+                self.snapVisibleDocumentToPageBoundaries()
             }
         }
     }
 
     private func abortPageTurnInterruptedBySelection() {
         hardAbortInFlightPageTurn(restorePreparedLocation: true)
+        snapVisibleDocumentToPageBoundaries()
         updatePageTurnInteractionMode()
+    }
+
+    /// Fixes half/half presentation after selection or a cancelled surface turn.
+    /// Outer chrome stays full-width because it is outside the navigator; the
+    /// split is almost always a mid-page `contentOffset` on the reflowable
+    /// web scroll view (or outer pagination).
+    private func snapVisibleDocumentToPageBoundaries() {
+        paginationView?.snapToNearestHorizontalPage()
+        guard let loadedViews = paginationView?.loadedViews.values else { return }
+        for view in loadedViews {
+            (view as? EPUBSpreadView)?.snapToNearestHorizontalPage()
+        }
     }
 
     private var hasInFlightPageTurnWork: Bool {
@@ -4443,16 +4460,23 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
                 locator: locator,
                 frame: view.convert(frame, from: spreadView)
             )
-        } else {
-            viewModel.editingActions.selection = nil
+            // Abort any turn that started under the selection gesture, but do
+            // not snap mid-drag (that would fight the selection handles).
+            if hasInFlightPageTurnWork {
+                abortPageTurnInterruptedBySelection()
+            } else {
+                updatePageTurnInteractionMode()
+            }
+            return
         }
-        // Long-press selection / handle drag can steal or race the page-turn
-        // pan for every style (simulation, cover, push, none). Hard-abort any
-        // in-flight turn so surfaces cannot stick half-drawn, and disable pan
-        // for the duration of the selection.
+
+        viewModel.editingActions.selection = nil
+        // Selection cleared: hard-abort leftover turns and snap mid-page
+        // web/pagination offsets back to whole pages for every style.
         if hasInFlightPageTurnWork {
             abortPageTurnInterruptedBySelection()
         } else {
+            snapVisibleDocumentToPageBoundaries()
             updatePageTurnInteractionMode()
         }
     }

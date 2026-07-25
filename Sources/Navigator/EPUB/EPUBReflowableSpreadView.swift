@@ -456,6 +456,30 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         return Int(round(offset.x / scrollView.bounds.width))
     }
 
+    /// Selection-handle drags and interrupted page-turns can leave the web
+    /// scroll view mid-page (half previous / half next) while outer chrome
+    /// stays full-width. Snap back to a whole column/page.
+    override func snapToNearestHorizontalPage() {
+        guard
+            !viewModel.scroll,
+            !isCapturingPageTurnSnapshot,
+            isSpreadLoaded,
+            !isTerminated
+        else {
+            return
+        }
+        let width = scrollView.bounds.width
+        guard width > 0, width.isFinite else { return }
+        let maximumX = max(0, scrollView.contentSize.width - width)
+        let page = (scrollView.contentOffset.x / width).rounded()
+        let targetX = min(max(0, page * width), maximumX)
+        guard abs(scrollView.contentOffset.x - targetX) > 0.5 else { return }
+        scrollView.setContentOffset(
+            CGPoint(x: targetX, y: scrollView.contentOffset.y),
+            animated: false
+        )
+    }
+
     static func pageTurnScrollBehavior(options: NavigatorGoOptions) -> String {
         options.animated ? "smooth" : "instant"
     }
