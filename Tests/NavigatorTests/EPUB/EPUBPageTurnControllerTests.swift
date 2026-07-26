@@ -221,7 +221,7 @@ struct EPUBPageTurnControllerTests {
         let controller = try #require(EPUBPageCurlController(
             currentImage: image,
             paperColor: .black,
-            physicalCompletionDirection: .left
+            isForward: true
         ))
 
         controller.render(progress: 0.41)
@@ -232,23 +232,26 @@ struct EPUBPageTurnControllerTests {
         #expect(controller.progress == 0.41)
     }
 
-    @Test("simulation maps physical completion directions to their matching curl angles")
+    @Test("simulation always uses a left hinge for forward peel and reverse uncurl")
     func simulationDirectionMapping() {
-        #expect(
-            EPUBPageCurlRenderView.angle(for: .left) == .pi
-        )
-        #expect(
-            EPUBPageCurlRenderView.angle(for: .right) == 0
-        )
+        #expect(EPUBPageCurlRenderView.angle(isForward: true) == .pi)
+        #expect(EPUBPageCurlRenderView.angle(isForward: false) == .pi)
+        #expect(EPUBPageCurlRenderView.leftHingeAngle == .pi)
 
         let ltrForward = PageTurnSession(
             direction: .right,
+            readingProgression: .ltr
+        )
+        let ltrBackward = PageTurnSession(
+            direction: .left,
             readingProgression: .ltr
         )
         let rtlForward = PageTurnSession(
             direction: .left,
             readingProgression: .rtl
         )
+        #expect(ltrForward.isForward)
+        #expect(!ltrBackward.isForward)
         #expect(ltrForward.physicalCompletionDirection == .left)
         #expect(rtlForward.physicalCompletionDirection == .right)
     }
@@ -262,7 +265,7 @@ struct EPUBPageTurnControllerTests {
         let view = try #require(EPUBPageCurlRenderView(
             currentImage: current,
             paperColor: .black,
-            physicalCompletionDirection: .left
+            isForward: true
         ))
 
         let backside = try #require(renderedCGImage(view.backsideImageForRendering()))
@@ -286,7 +289,7 @@ struct EPUBPageTurnControllerTests {
         let view = try #require(EPUBPageCurlRenderView(
             currentImage: initial,
             paperColor: .black,
-            physicalCompletionDirection: .left
+            isForward: true
         ))
         let initialBackside = try #require(renderedCGImage(view.backsideImageForRendering()))
         let initialLeft = try #require(initialBackside.pixelBytes(at: CGPoint(
@@ -318,7 +321,7 @@ struct EPUBPageTurnControllerTests {
         let view = try #require(EPUBPageCurlRenderView(
             currentImage: current,
             paperColor: .black,
-            physicalCompletionDirection: .left
+            isForward: true
         ))
         view.setTargetImage(target)
         view.progress = 0.5
@@ -345,41 +348,56 @@ struct EPUBPageTurnControllerTests {
         #expect(bands.allSatisfy { $0.contains { $0 > 32 } })
     }
 
-    @Test("simulation curl output follows the physical turn direction")
-    func simulationCurlOutputFollowsPhysicalDirection() throws {
+    @Test("simulation curl peels forward and uncurls backward with a left hinge")
+    func simulationCurlOutputFollowsTurnDirection() throws {
         let current = makeSolidImage(.red)
         let target = makeSolidImage(.green)
 
-        let samples: [(EPUBSpreadView.Direction, CGFloat, CGFloat)] = [
-            (EPUBSpreadView.Direction.left, 1.0 / 3, 2.0 / 3),
-            (.right, 5.0 / 9, 2.0 / 9),
-        ]
-        for (direction, currentX, targetX) in samples {
-            let view = try #require(EPUBPageCurlRenderView(
-                currentImage: current,
-                paperColor: .black,
-                physicalCompletionDirection: direction
+        let forward = try #require(EPUBPageCurlRenderView(
+            currentImage: current,
+            paperColor: .black,
+            isForward: true
+        ))
+        forward.setTargetImage(target)
+        forward.progress = 0.5
+        let forwardOutput = try #require(renderedCGImage(forward.outputImage()))
+        let forwardOutgoing = try #require(
+            forwardOutput.pixelBytes(at: CGPoint(
+                x: CGFloat(forwardOutput.width) * (1.0 / 3),
+                y: CGFloat(forwardOutput.height) * 0.5
             ))
-            view.setTargetImage(target)
-            view.progress = 0.5
+        )
+        let forwardIncoming = try #require(
+            forwardOutput.pixelBytes(at: CGPoint(
+                x: CGFloat(forwardOutput.width) * (2.0 / 3),
+                y: CGFloat(forwardOutput.height) * 0.5
+            ))
+        )
+        #expect(isPredominantlyRed(forwardOutgoing))
+        #expect(isPredominantlyGreen(forwardIncoming))
 
-            let output = try #require(renderedCGImage(view.outputImage()))
-            let outgoing = try #require(
-                output.pixelBytes(at: CGPoint(
-                    x: CGFloat(output.width) * currentX,
-                    y: CGFloat(output.height) * 0.5
-                ))
-            )
-            let incoming = try #require(
-                output.pixelBytes(at: CGPoint(
-                    x: CGFloat(output.width) * targetX,
-                    y: CGFloat(output.height) * 0.5
-                ))
-            )
-
-            #expect(isPredominantlyRed(outgoing))
-            #expect(isPredominantlyGreen(incoming))
-        }
+        let backward = try #require(EPUBPageCurlRenderView(
+            currentImage: current,
+            paperColor: .black,
+            isForward: false
+        ))
+        backward.setTargetImage(target)
+        backward.progress = 0.5
+        let backwardOutput = try #require(renderedCGImage(backward.outputImage()))
+        let covered = try #require(
+            backwardOutput.pixelBytes(at: CGPoint(
+                x: CGFloat(backwardOutput.width) * (1.0 / 3),
+                y: CGFloat(backwardOutput.height) * 0.5
+            ))
+        )
+        let stillCurrent = try #require(
+            backwardOutput.pixelBytes(at: CGPoint(
+                x: CGFloat(backwardOutput.width) * (2.0 / 3),
+                y: CGFloat(backwardOutput.height) * 0.5
+            ))
+        )
+        #expect(isPredominantlyGreen(covered))
+        #expect(isPredominantlyRed(stillCurrent))
     }
 
     @Test("simulation rasterizes top, document, and bottom as one reader surface")
@@ -2407,7 +2425,77 @@ struct EPUBPageTurnControllerTests {
         ))
     }
 
-    @Test("whole-reader cover keeps its target still in both physical directions")
+    @Test("prepare shield covers the live root until dismissed after target capture")
+    func prepareShieldCoversUntilDismissed() {
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 200, height: 400))
+        container.backgroundColor = .white
+        let root = UIView(frame: container.bounds)
+        root.backgroundColor = .red
+        container.addSubview(root)
+        let animator = EPUBPageTurnSurfaceAnimator(
+            rootView: root,
+            style: .push,
+            physicalCompletionDirection: .left,
+            isForward: true
+        )
+        #expect(animator != nil)
+        let shield = container.subviews.first {
+            $0.accessibilityIdentifier == "readium.page-turn.prepare-shield"
+        }
+        #expect(shield != nil)
+        #expect(shield?.isOpaque == true)
+        #expect(shield?.isUserInteractionEnabled == false)
+        // Must not use surface.* so UI probes do not treat the freeze as a turn surface.
+        #expect(shield?.accessibilityIdentifier?.hasPrefix("readium.page-turn.surface.") != true)
+        #expect(container.subviews.last === shield)
+
+        root.backgroundColor = .green
+        #expect(animator?.captureTarget() == true)
+        #expect(container.subviews.last?.accessibilityIdentifier == "readium.page-turn.prepare-shield")
+
+        animator?.dismissPrepareShield()
+        #expect(container.subviews.contains {
+            $0.accessibilityIdentifier == "readium.page-turn.prepare-shield"
+        } == false)
+        animator?.remove()
+    }
+
+    @Test("prepare shield frame tracks root size through recapture after layout change")
+    func prepareShieldTracksRootSizeOnRecapture() throws {
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 200, height: 400))
+        container.backgroundColor = .white
+        let root = UIView(frame: container.bounds)
+        root.backgroundColor = .red
+        container.addSubview(root)
+        let animator = try #require(EPUBPageTurnSurfaceAnimator(
+            rootView: root,
+            style: .push,
+            physicalCompletionDirection: .left,
+            isForward: true
+        ))
+        let shield = try #require(container.subviews.first {
+            $0.accessibilityIdentifier == "readium.page-turn.prepare-shield"
+        })
+        #expect(shield.frame == root.frame)
+
+        // Simulate rotation / split-view resize mid-prepare. Without a frame
+        // sync on recapture, the freeze would leave uncovered edges and the
+        // live next page could flash through.
+        let resized = CGRect(x: 0, y: 0, width: 320, height: 480)
+        container.frame = resized
+        root.frame = resized
+        // Force a stale shield geometry (autoresizing may already have grown
+        // it with the parent; pin it back so the recapture path is exercised).
+        shield.frame = CGRect(x: 0, y: 0, width: 200, height: 400)
+        #expect(shield.frame != root.frame)
+
+        #expect(animator.recaptureCurrent())
+        #expect(shield.frame == root.frame)
+        #expect(container.subviews.last === shield)
+        animator.remove()
+    }
+
+    @Test("whole-reader cover peels current forward and covers with target backward")
     func coverGeometry() {
         for direction in [EPUBSpreadView.Direction.left, .right] {
             let container = UIView(frame: CGRect(x: 0, y: 0, width: 200, height: 400))
@@ -2416,7 +2504,8 @@ struct EPUBPageTurnControllerTests {
             let animator = EPUBPageTurnSurfaceAnimator(
                 rootView: root,
                 style: .cover,
-                physicalCompletionDirection: direction
+                physicalCompletionDirection: direction,
+                isForward: true
             )
             #expect(animator != nil)
             #expect(animator?.captureTarget() == true)
@@ -2433,6 +2522,35 @@ struct EPUBPageTurnControllerTests {
             #expect(target?.transform == .identity)
             animator?.remove()
         }
+
+        for direction in [EPUBSpreadView.Direction.left, .right] {
+            let container = UIView(frame: CGRect(x: 0, y: 0, width: 200, height: 400))
+            let root = UIView(frame: container.bounds)
+            container.addSubview(root)
+            let animator = EPUBPageTurnSurfaceAnimator(
+                rootView: root,
+                style: .cover,
+                physicalCompletionDirection: direction,
+                isForward: false
+            )
+            #expect(animator != nil)
+            #expect(animator?.captureTarget() == true)
+            animator?.render(progress: 0.5)
+
+            let current = pageTurnSurfaces(in: container).first {
+                $0.accessibilityIdentifier == "readium.page-turn.surface.current"
+            }
+            let target = pageTurnSurfaces(in: container).first {
+                $0.accessibilityIdentifier == "readium.page-turn.surface.target"
+            }
+            let expectedTargetX: CGFloat = direction == .left ? 100 : -100
+            #expect(current?.transform == .identity)
+            #expect(target?.transform.tx == expectedTargetX)
+            if let current, let target, let parent = current.superview {
+                #expect(parent.subviews.firstIndex(of: target)! > parent.subviews.firstIndex(of: current)!)
+            }
+            animator?.remove()
+        }
     }
 
     @Test("target surface identity is invalidated when the document frame changes")
@@ -2446,7 +2564,8 @@ struct EPUBPageTurnControllerTests {
             rootView: root,
             documentView: document,
             style: .cover,
-            physicalCompletionDirection: .left
+            physicalCompletionDirection: .left,
+            isForward: true
         )
 
         #expect(animator?.captureTarget() == true)
@@ -2471,7 +2590,8 @@ struct EPUBPageTurnControllerTests {
             rootViewProvider: { activeRoot },
             documentView: document,
             style: .cover,
-            physicalCompletionDirection: .left
+            physicalCompletionDirection: .left,
+            isForward: true
         ))
 
         #expect(animator.captureTarget())
@@ -2512,7 +2632,8 @@ struct EPUBPageTurnControllerTests {
             rootView: root,
             documentView: document,
             style: .cover,
-            physicalCompletionDirection: .left
+            physicalCompletionDirection: .left,
+            isForward: true
         ))
         #expect(animator.hasMatchingCurrentRootIdentity)
 
@@ -2540,7 +2661,8 @@ struct EPUBPageTurnControllerTests {
             rootView: root,
             documentView: document,
             style: .cover,
-            physicalCompletionDirection: .left
+            physicalCompletionDirection: .left,
+            isForward: true
         )
 
         #expect(animator?.hasMatchingCurrentRootIdentity == true)

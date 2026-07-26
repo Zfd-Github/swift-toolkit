@@ -1521,7 +1521,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 },
                 documentView: view,
                 style: style,
-                physicalCompletionDirection: session.physicalCompletionDirection
+                physicalCompletionDirection: session.physicalCompletionDirection,
+                isForward: session.isForward
             )
             isInstallingPageTurnSurface = false
             if let animator {
@@ -1915,6 +1916,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         navigator()?.pageTurnSurfaceAnimator?.render(
             progress: transaction.progress
         )
+        // Prepare finished: drop the opaque freeze so swipe tracking / discrete
+        // animation can use the real turn surfaces. Live content remains under
+        // current/target snapshots until cleanup.
+        navigator()?.pageTurnSurfaceAnimator?.dismissPrepareShield()
         return true
     }
 
@@ -3012,7 +3017,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 rootView: rootView,
                 documentView: view,
                 style: .cover,
-                physicalCompletionDirection: session.physicalCompletionDirection
+                physicalCompletionDirection: session.physicalCompletionDirection,
+                isForward: session.isForward
               )
         else {
             pageTurnTransaction = nil
