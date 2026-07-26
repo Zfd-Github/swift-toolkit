@@ -617,11 +617,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     override open func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
         super.traitCollectionDidChange(previousTraitCollection)
         // `snapshotView(afterScreenUpdates:)` can synchronously re-enter with
-        // non-appearance trait echoes while installing/restoring surfaces.
-        // Those must not drop a queued reverse. Real color-appearance or
-        // contrast changes, however, must cancel mid-turn so we never commit
-        // snapshots captured under the previous theme.
-        if isInstallingPageTurnSurface {
+        // non-appearance trait echoes while installing/restoring surfaces or
+        // while prepare is still capturing original/target previews. Those must
+        // not cancel the in-flight turn. Real color-appearance or contrast
+        // changes, however, must cancel mid-turn so we never commit snapshots
+        // captured under the previous theme.
+        if isInstallingPageTurnSurface || isPreparingPageTurnSurface {
             snapshotProvider.invalidate()
             updatePaginationContentInset()
             return
@@ -746,6 +747,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         /// True when this transaction was started by replaying a queued reverse
         /// gesture after the previous turn cancelled.
         var isResumedPendingGesture = false
+        /// True when `.commit` was resolved before surface prepare began
+        /// (discrete edge/keyboard turns). Used to degrade animation rather
+        /// than swallow the navigation when prepare fails.
+        var didResolveCommitBeforePrepare = false
         var originalLocator: Locator?
         var didObserveSurface = false
         private(set) var isInvalidated = false
@@ -874,6 +879,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private var isInstallingPageTurnSurface = false
+    /// True for the whole `preparePageTurnSurface` body (not only install/capture).
+    /// Snapshot-driven trait re-entry during preview must not cancel the turn.
+    private var isPreparingPageTurnSurface = false
     private var pageTurnTransactionTask: Task<Bool, Never>?
     var pageTurnNavigationForTesting: ((
         PageTurnSession,
@@ -1478,6 +1486,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         )
         pageTurnTransaction = transaction
         transaction.start()
+        // Discrete path: user intent is already a full page turn. Resolve
+        // commit before prepare so a failed surface overlay still navigates.
+        transaction.didResolveCommitBeforePrepare = true
         transaction.resolve(.commit)
         return await Self.runPageTurnTransaction(transaction) { self }
     }
@@ -1640,6 +1651,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             transaction.resolve(.cancel)
         }
         let prepared = if transaction.terminalIntent == .cancel {
+            // Preserve a diagnostic when cancel won before prepare could run.
+            if navigator()?.pageTurnLastPrepareFailureForTesting == nil {
+                navigator()?.pageTurnLastPrepareFailureForTesting =
+                    "terminal-cancel-before-prepare"
+            }
             false
         } else if transaction.style == .none {
             true
@@ -1680,9 +1696,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 progress: transaction.progress
             )
         } else if intent == .commit, transaction.isResumedPendingGesture {
-            // Only queued reverse replays fall back to instant commit when
-            // surface prepare fails. Ordinary prepare failures stay fail-closed
-            // (restore / no navigation).
+            // Queued reverse replays fall back to instant commit when surface
+            // prepare fails.
+            result = await owner.commitPageTurnAfterFailedSurfacePrepare(
+                transaction
+            )
+        } else if intent == .commit, transaction.didResolveCommitBeforePrepare {
+            // Discrete edge/keyboard turns resolve `.commit` before prepare. If
+            // surface prepare fails, still honour the input with instant
+            // navigation instead of swallowing a deliberate page-turn tap.
             result = await owner.commitPageTurnAfterFailedSurfacePrepare(
                 transaction
             )
@@ -1730,9 +1752,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         navigator: @escaping @MainActor () -> EPUBNavigatorViewController?
     ) async -> Bool {
         let session = transaction.session
+        navigator()?.isPreparingPageTurnSurface = true
+        defer { navigator()?.isPreparingPageTurnSurface = false }
         func fail(_ stage: String) -> Bool {
             navigator()?.pageTurnLastPrepareFailureForTesting = stage
             return false
+        }
+        if Task.isCancelled {
+            return fail("task-cancelled-before-prepare")
         }
         guard
             isPageTurnPrepareActive(transaction),
@@ -2264,6 +2291,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private func cancelActivePageTurn() {
         pendingPageTurnGesture = nil
+        if pageTurnTransaction != nil || !pageTurnController.isIdle {
+            // Leave an existing prepare stage if set; otherwise tag the cancel.
+            if pageTurnLastPrepareFailureForTesting == nil {
+                pageTurnLastPrepareFailureForTesting = "cancelActivePageTurn"
+            }
+        }
         if pageTurnController.isCommitting {
             // Surface styles interrupt via cancelAnimation + isInvalidated;
             // `.none` interrupts via isInvalidated checks in commitPageTurn.
