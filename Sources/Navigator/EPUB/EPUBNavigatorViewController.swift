@@ -2407,6 +2407,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func abortPageTurnInterruptedBySelection() {
+        // Discrete edge taps often land on selectable text. WebKit can arm a
+        // native selection on the same touch that started a commit-before-prepare
+        // turn. Hard-aborting that turn swallows the deliberate page-turn input
+        // (first-tap cancel / second-tap works). Keep preparing the discrete
+        // turn; selection UI is cleared when the turn finishes if needed.
+        if isPreparingPageTurnSurface,
+           pageTurnTransaction?.didResolveCommitBeforePrepare == true
+        {
+            pageTurnLastPrepareFailureForTesting = "selection-ignored-during-discrete-prepare"
+            return
+        }
         hardAbortInFlightPageTurn(
             restorePreparedLocation: true,
             reason: "selection-interrupt"
