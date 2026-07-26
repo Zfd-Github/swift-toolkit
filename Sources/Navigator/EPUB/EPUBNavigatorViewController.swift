@@ -1650,17 +1650,21 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         if Task.isCancelled {
             transaction.resolve(.cancel)
         }
-        let prepared = if transaction.terminalIntent == .cancel {
+        let prepared: Bool
+        if transaction.terminalIntent == .cancel {
             // Preserve a diagnostic when cancel won before prepare could run.
             if navigator()?.pageTurnLastPrepareFailureForTesting == nil {
                 navigator()?.pageTurnLastPrepareFailureForTesting =
                     "terminal-cancel-before-prepare"
             }
-            false
+            prepared = false
         } else if transaction.style == .none {
-            true
+            prepared = true
         } else {
-            await preparePageTurnSurface(transaction, navigator: navigator)
+            prepared = await preparePageTurnSurface(
+                transaction,
+                navigator: navigator
+            )
         }
         transaction.preparationState = prepared ? .ready : .failed
         if Task.isCancelled {
