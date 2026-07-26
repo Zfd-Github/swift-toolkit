@@ -313,7 +313,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             guard storedPageTurnStyle != newValue || !snapshotProvider.isIdle else { return }
             storedPageTurnStyle = newValue
             hasDeferredPageTurnInteractionModeUpdate = true
-            cancelActivePageTurn()
+            cancelActivePageTurn(reason: "pageTurnStyle-set")
             snapshotProvider.invalidate()
             snapshotProvider.deferPageTurnInteraction { [weak self] in
                 self?.applyDeferredPageTurnInteractionMode()
@@ -536,7 +536,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     @objc private func willResignActive() {
         isActive = false
-        cancelActivePageTurn()
+        cancelActivePageTurn(reason: "willResignActive")
         snapshotProvider.invalidate()
     }
 
@@ -636,14 +636,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         } ?? false
 
         if appearanceChanged || contrastChanged {
-            cancelActivePageTurn()
+            cancelActivePageTurn(reason: "trait-appearance")
         } else if
             pageTurnTransaction == nil
                 && pageTurnController.isIdle
                 && pendingPageTurnGesture == nil
         {
             // Preserve idle-path cancellation for other trait noise.
-            cancelActivePageTurn()
+            cancelActivePageTurn(reason: "trait-idle")
         }
 
         snapshotProvider.invalidate()
@@ -654,14 +654,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         super.viewWillTransition(to: size, with: coordinator)
 
         if isActive {
-            cancelActivePageTurn()
+            cancelActivePageTurn(reason: "viewWillTransition")
             deferViewSizeChangeUntilSnapshotRestored(size)
         }
     }
 
     override open func didReceiveMemoryWarning() {
         super.didReceiveMemoryWarning()
-        cancelActivePageTurn()
+        cancelActivePageTurn(reason: "memoryWarning")
         snapshotProvider.invalidate()
     }
 
@@ -2293,13 +2293,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return false
     }
 
-    private func cancelActivePageTurn() {
+    private func cancelActivePageTurn(reason: String = "cancelActivePageTurn") {
         pendingPageTurnGesture = nil
         if pageTurnTransaction != nil || !pageTurnController.isIdle {
-            // Leave an existing prepare stage if set; otherwise tag the cancel.
-            if pageTurnLastPrepareFailureForTesting == nil {
-                pageTurnLastPrepareFailureForTesting = "cancelActivePageTurn"
-            }
+            // Always tag the latest cancel reason during an active turn.
+            pageTurnLastPrepareFailureForTesting = reason
         }
         if pageTurnController.isCommitting {
             // Surface styles interrupt via cancelAnimation + isInvalidated;
@@ -2365,7 +2363,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                     || pageTurnTransaction?.didPrepareTarget == true
             )
 
-        cancelActivePageTurn()
+        cancelActivePageTurn(reason: "hardAbort")
         pageTurnDisplayFrameWaiter?.cancel()
         pageTurnDisplayFrameWaiter = nil
         pageTurnTransactionTask?.cancel()
@@ -3296,7 +3294,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func accessibilityStatusDidChange() {
-        cancelActivePageTurn()
+        cancelActivePageTurn(reason: "accessibilityStatus")
         updatePageTurnInteractionMode()
     }
 
@@ -3323,7 +3321,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             // native text selection exists so handle drags cannot start a turn.
             pageTurnPanGestureRecognizer.isEnabled = currentSelection == nil
         } else {
-            cancelActivePageTurn()
+            cancelActivePageTurn(reason: "interactionMode-nonPaged")
             if pageTurnPanGestureRecognizer.view != nil {
                 view.removeGestureRecognizer(pageTurnPanGestureRecognizer)
             }
@@ -3862,7 +3860,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 !pageTurnController.isCommitting,
                 transaction.terminalIntent == nil
             {
-                cancelActivePageTurn()
+                cancelActivePageTurn(reason: "settlePageTurn")
             }
             _ = await transaction.waitForCompletion()
         }
@@ -4541,7 +4539,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     func spreadViewActiveMediaDidChange(_ spreadView: EPUBSpreadView) {
         snapshotProvider.invalidate()
         if spreadView.hasActiveMedia {
-            cancelActivePageTurn()
+            cancelActivePageTurn(reason: "activeMedia")
         } else if currentSelection == nil {
         }
     }
