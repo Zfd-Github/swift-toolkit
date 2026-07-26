@@ -20,12 +20,12 @@ final class EPUBPageCurlController {
     init?(
         currentImage: CGImage,
         paperColor: UIColor,
-        physicalCompletionDirection: EPUBSpreadView.Direction
+        isForward: Bool
     ) {
         guard let view = EPUBPageCurlRenderView(
             currentImage: currentImage,
             paperColor: paperColor,
-            physicalCompletionDirection: physicalCompletionDirection
+            isForward: isForward
         ) else {
             return nil
         }

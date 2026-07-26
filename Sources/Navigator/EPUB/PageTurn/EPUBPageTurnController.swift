@@ -172,19 +172,29 @@ final class EPUBPageTurnSurfaceAnimator {
     private var activeFrameWaiter: PageTurnAnimationFrameWaiter?
     private let style: EPUBPageTurnStyle
     private let physicalCompletionDirection: EPUBSpreadView.Direction
+    /// Reading-order forward peels/slides current; backward covers with the target page.
+    private let isForward: Bool
+    private let paperColor: UIColor
     private var progress: CGFloat = 0
+    /// Opaque freeze kept above all turn surfaces while prepare navigates and
+    /// captures the target. Without it, `snapshotView(afterScreenUpdates:)` can
+    /// briefly composite the live next page (tap-path flash). Swipe is less
+    /// sensitive because the user is already mid-gesture.
+    private var prepareShield: UIView?
 
     convenience init?(
         rootView: UIView,
         documentView: UIView? = nil,
         style: EPUBPageTurnStyle,
-        physicalCompletionDirection: EPUBSpreadView.Direction
+        physicalCompletionDirection: EPUBSpreadView.Direction,
+        isForward: Bool
     ) {
         self.init(
             rootViewProvider: { [weak rootView] in rootView },
             documentView: documentView,
             style: style,
-            physicalCompletionDirection: physicalCompletionDirection
+            physicalCompletionDirection: physicalCompletionDirection,
+            isForward: isForward
         )
     }
 
@@ -192,7 +202,8 @@ final class EPUBPageTurnSurfaceAnimator {
         rootViewProvider: @escaping () -> UIView?,
         documentView: UIView? = nil,
         style: EPUBPageTurnStyle,
-        physicalCompletionDirection: EPUBSpreadView.Direction
+        physicalCompletionDirection: EPUBSpreadView.Direction,
+        isForward: Bool
     ) {
         guard
             let rootView = rootViewProvider(),
@@ -201,18 +212,19 @@ final class EPUBPageTurnSurfaceAnimator {
         else {
             return nil
         }
+        let paperColor = (
+            rootView.backgroundColor
+                ?? parentView.backgroundColor
+                ?? .systemBackground
+        ).resolvedColor(with: rootView.traitCollection)
         let pageCurlController: EPUBPageCurlController?
         if style == .simulation {
             guard
                 let image = EPUBPageCurlController.rasterize(rootView)?.cgImage,
                 let controller = EPUBPageCurlController(
                     currentImage: image,
-                    paperColor: (
-                        rootView.backgroundColor
-                            ?? parentView.backgroundColor
-                            ?? .systemBackground
-                    ).resolvedColor(with: rootView.traitCollection),
-                    physicalCompletionDirection: physicalCompletionDirection
+                    paperColor: paperColor,
+                    isForward: isForward
                 )
             else {
                 return nil
@@ -230,9 +242,13 @@ final class EPUBPageTurnSurfaceAnimator {
         )
         self.style = style
         self.physicalCompletionDirection = physicalCompletionDirection
+        self.isForward = isForward
+        self.paperColor = paperColor
         self.pageCurlController = pageCurlController
         configure(currentView, role: "current", frame: rootView.frame)
         parentView.insertSubview(currentView, aboveSubview: rootView)
+        // Install before any prepare navigation / afterScreenUpdates capture.
+        installPrepareShield(over: rootView, in: parentView)
     }
 
     var hasTarget: Bool {
@@ -287,6 +303,8 @@ final class EPUBPageTurnSurfaceAnimator {
         }
         configure(targetView, role: "target", frame: rootView.frame)
         parentView.insertSubview(targetView, aboveSubview: rootView)
+        // Match pre-regression order: keep current above the newly inserted
+        // target immediately (HEAD), before any transform work.
         parentView.bringSubviewToFront(currentView)
         self.targetView = targetView
         targetRootIdentity = Self.rootIdentity(
@@ -308,7 +326,11 @@ final class EPUBPageTurnSurfaceAnimator {
             renderView.isUserInteractionEnabled = false
             parentView.insertSubview(renderView, aboveSubview: currentView)
         }
+        // Position first so cover-backward target is off-screen before it rises.
+        syncPrepareShieldFrame(to: rootView)
         render(progress: progress)
+        applySurfaceStacking(in: parentView)
+        bringPrepareShieldToFront(in: parentView)
         return true
     }
 
@@ -349,7 +371,10 @@ final class EPUBPageTurnSurfaceAnimator {
             pageCurlController.view.frame = rootView.frame
             parentView.insertSubview(pageCurlController.view, aboveSubview: currentView)
         }
+        syncPrepareShieldFrame(to: rootView)
         render(progress: progress)
+        applySurfaceStacking(in: parentView)
+        bringPrepareShieldToFront(in: parentView)
         return true
     }
 
@@ -377,11 +402,13 @@ final class EPUBPageTurnSurfaceAnimator {
         {
             pageCurlController?.setCurrentImage(image)
         }
-        if let targetView, targetView.superview === parentView {
-            parentView.bringSubviewToFront(targetView)
-            parentView.bringSubviewToFront(currentView)
-        }
+        // Layout may have changed since prepare (rotation / split view). Keep
+        // the freeze mask covering the full root so the live next page cannot
+        // flash through uncovered edges.
+        syncPrepareShieldFrame(to: rootView)
         render(progress: progress)
+        applySurfaceStacking(in: parentView)
+        bringPrepareShieldToFront(in: parentView)
         return true
     }
 
@@ -402,11 +429,21 @@ final class EPUBPageTurnSurfaceAnimator {
                 y: 0
             )
         case .cover:
-            currentView.transform = CGAffineTransform(
-                translationX: sign * width * progress,
-                y: 0
-            )
-            targetView.transform = .identity
+            // Forward: current slides out, revealing still target underneath.
+            // Backward: target slides in from the outer side and covers current.
+            if isForward {
+                currentView.transform = CGAffineTransform(
+                    translationX: sign * width * progress,
+                    y: 0
+                )
+                targetView.transform = .identity
+            } else {
+                currentView.transform = .identity
+                targetView.transform = CGAffineTransform(
+                    translationX: -sign * width * (1 - progress),
+                    y: 0
+                )
+            }
         case .simulation:
             pageCurlController?.render(progress: progress)
             currentView.transform = .identity
@@ -446,6 +483,8 @@ final class EPUBPageTurnSurfaceAnimator {
         scheduleDisplayFrame: (@MainActor (PageTurnAnimationFrameWaiter) -> Void)? = nil,
         shouldContinue: @MainActor @escaping () -> Bool = { true }
     ) async -> Bool {
+        // Prepare finished; show real turn surfaces for the animation.
+        dismissPrepareShield()
         if style == .simulation, let pageCurlController {
             progress = min(max(targetProgress, 0), 1)
             return await pageCurlController.animate(
@@ -512,6 +551,7 @@ final class EPUBPageTurnSurfaceAnimator {
 
     func remove() {
         cancelAnimation()
+        dismissPrepareShield()
         currentView.layer.removeAllAnimations()
         targetView?.layer.removeAllAnimations()
         currentView.removeFromSuperview()
@@ -521,6 +561,58 @@ final class EPUBPageTurnSurfaceAnimator {
         targetRootIdentity = nil
     }
 
+    /// Drops the prepare freeze so interactive tracking / animation can show.
+    func dismissPrepareShield() {
+        prepareShield?.removeFromSuperview()
+        prepareShield = nil
+    }
+
+    private func installPrepareShield(over rootView: UIView, in parentView: UIView) {
+        dismissPrepareShield()
+        // Prefer an opaque raster (no transparent holes from snapshotView).
+        let shield: UIView
+        if let image = EPUBPageCurlController.rasterize(rootView) {
+            let imageView = UIImageView(image: image)
+            imageView.contentMode = .scaleToFill
+            shield = imageView
+        } else if let snap = currentView.snapshotView(afterScreenUpdates: false) {
+            shield = snap
+        } else {
+            let fill = UIView()
+            fill.backgroundColor = paperColor
+            shield = fill
+        }
+        // Do not use `surface.*` accessibility ids — probes treat those as
+        // turn surfaces and would keep tracking until the shield is cleared.
+        // Follow the root's edges when the parent resizes (rotation / split
+        // view). `recaptureCurrent` also hard-syncs the frame in case the root
+        // moves independently of the parent.
+        shield.frame = rootView.frame
+        shield.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        shield.backgroundColor = paperColor
+        shield.isOpaque = true
+        shield.isAccessibilityElement = false
+        shield.accessibilityElementsHidden = true
+        shield.accessibilityIdentifier = "readium.page-turn.prepare-shield"
+        shield.isUserInteractionEnabled = false
+        parentView.addSubview(shield)
+        parentView.bringSubviewToFront(shield)
+        prepareShield = shield
+    }
+
+    /// Keeps the prepare freeze covering the live root after layout changes
+    /// (rotation, split view, root replacement) so the next page cannot flash
+    /// through uncovered regions.
+    private func syncPrepareShieldFrame(to rootView: UIView) {
+        prepareShield?.frame = rootView.frame
+    }
+
+    private func bringPrepareShieldToFront(in parentView: UIView) {
+        if let prepareShield {
+            parentView.bringSubviewToFront(prepareShield)
+        }
+    }
+
     private func configure(_ view: UIView, role: String, frame: CGRect) {
         view.frame = frame
         view.autoresizingMask = []
@@ -528,6 +620,30 @@ final class EPUBPageTurnSurfaceAnimator {
         view.accessibilityElementsHidden = true
         view.accessibilityIdentifier = "readium.page-turn.surface.\(role)"
         view.isUserInteractionEnabled = false
+    }
+
+    /// Cover backward keeps the incoming target above current; every other
+    /// style keeps current (and optional curl) as the top occlusion layer.
+    private func applySurfaceStacking(in parentView: UIView) {
+        switch style {
+        case .cover where !isForward:
+            parentView.bringSubviewToFront(currentView)
+            if let targetView {
+                parentView.bringSubviewToFront(targetView)
+            }
+        case .simulation:
+            parentView.bringSubviewToFront(currentView)
+            if let targetView {
+                parentView.bringSubviewToFront(targetView)
+            }
+            if let curl = pageCurlController?.view, curl.superview === parentView {
+                parentView.bringSubviewToFront(curl)
+            }
+        default:
+            // HEAD behavior: current stays the top occlusion layer.
+            parentView.bringSubviewToFront(currentView)
+        }
+        bringPrepareShieldToFront(in: parentView)
     }
 
     private static func rootIdentity(rootView: UIView, documentView: UIView) -> RootIdentity {
