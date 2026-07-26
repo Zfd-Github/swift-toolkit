@@ -938,7 +938,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // Recover from selection-interrupted stuck presentation for every style
         // so the user does not need to leave the book to get a clean page again.
         if hasInFlightPageTurnWork, pageTurnTransaction?.isRunning != true {
-            hardAbortInFlightPageTurn(restorePreparedLocation: true)
+            hardAbortInFlightPageTurn(
+                restorePreparedLocation: true,
+                reason: "beginPageTurn-orphan"
+            )
         }
         guard on(.move(direction)) else { return nil }
         guard let session = pageTurnController.begin(
@@ -1520,7 +1523,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             if pageTurnTransaction?.isRunning == true {
                 return false
             }
-            hardAbortInFlightPageTurn(restorePreparedLocation: false)
+            hardAbortInFlightPageTurn(
+                restorePreparedLocation: false,
+                reason: "install-orphan-animator"
+            )
         }
         for _ in 0 ..< 3 {
             guard !Task.isCancelled else { return false }
@@ -2353,7 +2359,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Soft `cancelActivePageTurn` alone can leave snapshot or curl surfaces
     /// mid-transform (half previous / half next) when selection UI interrupts.
     private func hardAbortInFlightPageTurn(
-        restorePreparedLocation: Bool
+        restorePreparedLocation: Bool,
+        reason: String = "hardAbort"
     ) {
         let originalLocator = pageTurnTransaction?.originalLocator
             ?? pageTurnSurfaceOriginalPreview?.location
@@ -2363,7 +2370,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                     || pageTurnTransaction?.didPrepareTarget == true
             )
 
-        cancelActivePageTurn(reason: "hardAbort")
+        cancelActivePageTurn(reason: reason)
         pageTurnDisplayFrameWaiter?.cancel()
         pageTurnDisplayFrameWaiter = nil
         pageTurnTransactionTask?.cancel()
@@ -2400,7 +2407,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func abortPageTurnInterruptedBySelection() {
-        hardAbortInFlightPageTurn(restorePreparedLocation: true)
+        hardAbortInFlightPageTurn(
+            restorePreparedLocation: true,
+            reason: "selection-interrupt"
+        )
         snapVisibleDocumentToPageBoundaries()
         updatePageTurnInteractionMode()
     }
