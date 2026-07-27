@@ -3460,8 +3460,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private(set) var pageTurnPendingQueueCountForTesting = 0
     /// Test seam: times resumePending was entered with a non-nil pending gesture.
     private(set) var pageTurnPendingResumeAttemptCountForTesting = 0
-    /// Last surface-prepare failure stage for diagnostics / UI tests.
-    public private(set) var pageTurnLastPrepareFailureForTesting: String?
+    /// Test seam: last surface-prepare failure stage (module-internal only).
+    private(set) var pageTurnLastPrepareFailureForTesting: String?
 
     private func resumePendingPageTurnGesture() {
         guard pageTurnTransaction == nil else { return }
