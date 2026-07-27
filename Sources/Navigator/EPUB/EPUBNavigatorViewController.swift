@@ -748,8 +748,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         /// gesture after the previous turn cancelled.
         var isResumedPendingGesture = false
         /// True when `.commit` was resolved before surface prepare began
-        /// (discrete edge/keyboard turns). Used to degrade animation rather
-        /// than swallow the navigation when prepare fails.
+        /// (discrete edge/keyboard turns). Used to keep preparing through
+        /// selection interrupts that would otherwise hard-abort the turn.
         var didResolveCommitBeforePrepare = false
         var originalLocator: Locator?
         var didObserveSurface = false
@@ -920,6 +920,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private var didNavigateColdTargetForTesting = false
     private var didCaptureAfterColdNavigationForTesting = false
 
+    /// Hard-abort location restore is a single worker that fully finishes one
+    /// `restorePageTurnLocator` before starting the next. Superseded targets
+    /// replace `hardAbortRestoreRequest` but never cancel an in-flight
+    /// navigation (pagination/WebKit go does not honour Task cancel).
+    private var hardAbortRestoreRequest: (locator: Locator, snapAfterRestore: Bool)?
+    private var hardAbortLocationRestoreTask: Task<Void, Never>?
+    private var hardAbortLocationRestorePending = false
+    /// Flushes a pan that began while restore was still running.
+    private var hardAbortPanResumeTask: Task<Void, Never>?
+
     private func effectivePageTurnStyle(
         userStyle: EPUBPageTurnStyle,
         isReduceMotionEnabled: Bool,
@@ -932,9 +942,74 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         )
     }
 
+    /// Enqueues the latest restore target. If a restore is already running, the
+    /// worker finishes it, then restores this newer target (true serialization).
+    private func queueHardAbortLocationRestore(
+        _ locator: Locator,
+        snapAfterRestore: Bool
+    ) {
+        hardAbortRestoreRequest = (locator, snapAfterRestore)
+        hardAbortLocationRestorePending = true
+        ensureHardAbortLocationRestoreWorker()
+    }
+
+    private func ensureHardAbortLocationRestoreWorker() {
+        guard hardAbortLocationRestoreTask == nil else { return }
+        hardAbortLocationRestoreTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.hardAbortLocationRestoreTask = nil }
+            while true {
+                guard let request = self.hardAbortRestoreRequest else {
+                    self.hardAbortLocationRestorePending = false
+                    return
+                }
+                self.hardAbortRestoreRequest = nil
+                // Always run to completion — do not cancel mid-navigation.
+                _ = await self.restorePageTurnLocator(request.locator)
+                // A newer hard-abort may have replaced the target during await.
+                if self.hardAbortRestoreRequest != nil {
+                    continue
+                }
+                if request.snapAfterRestore {
+                    self.snapVisibleDocumentToPageBoundaries()
+                }
+            }
+        }
+    }
+
+    /// Waits until the restore worker is idle and no request remains.
+    private func awaitHardAbortLocationRestoreIfNeeded() async {
+        while hardAbortLocationRestorePending {
+            if hardAbortLocationRestoreTask == nil, hardAbortRestoreRequest != nil {
+                ensureHardAbortLocationRestoreWorker()
+            }
+            guard let task = hardAbortLocationRestoreTask else {
+                if hardAbortRestoreRequest == nil {
+                    hardAbortLocationRestorePending = false
+                }
+                return
+            }
+            await task.value
+        }
+    }
+
+    /// After restore drains, replay any pan that was buffered during restore.
+    private func schedulePendingPanResumeAfterHardAbortRestore() {
+        guard hardAbortPanResumeTask == nil else { return }
+        hardAbortPanResumeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.hardAbortPanResumeTask = nil }
+            await self.awaitHardAbortLocationRestoreIfNeeded()
+            await self.resumePendingPageTurnGesture()
+        }
+    }
+
     private func beginPageTurn(
         to direction: EPUBSpreadView.Direction
-    ) -> PageTurnSession? {
+    ) async -> PageTurnSession? {
+        // Drain any hard-abort restore before opening a new session so a
+        // previous prepare's navigation cannot race the next gesture.
+        await awaitHardAbortLocationRestoreIfNeeded()
         // Recover from selection-interrupted stuck presentation for every style
         // so the user does not need to leave the book to get a clean page again.
         if hasInFlightPageTurnWork, pageTurnTransaction?.isRunning != true {
@@ -942,7 +1017,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 restorePreparedLocation: true,
                 reason: "beginPageTurn-orphan"
             )
+            await awaitHardAbortLocationRestoreIfNeeded()
         }
+        return openPageTurnSession(to: direction)
+    }
+
+    /// Opens a page-turn session assuming hard-abort restore is not pending.
+    /// Callers that cannot await must only use this when
+    /// `hardAbortLocationRestorePending` is false.
+    private func openPageTurnSession(
+        to direction: EPUBSpreadView.Direction
+    ) -> PageTurnSession? {
         guard on(.move(direction)) else { return nil }
         guard let session = pageTurnController.begin(
             to: direction,
@@ -1064,8 +1149,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
     }
 
-    /// Completes a surface-style turn whose overlay prepare failed after the
-    /// user already committed. If prepare already moved the live page, only
+    /// Completes a surface-style turn when the user committed but overlay
+    /// prepare failed (interactive pan, discrete tap, missing root, capture
+    /// failure, resumed reverse). If prepare already moved the live page, only
     /// publish; otherwise perform the same instant navigation as `.none`.
     private func commitPageTurnAfterFailedSurfacePrepare(
         _ transaction: PageTurnTransaction
@@ -1463,7 +1549,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         to direction: EPUBSpreadView.Direction,
         options: NavigatorGoOptions
     ) async -> Bool {
-        guard let session = beginPageTurn(to: direction) else { return false }
+        guard let session = await beginPageTurn(to: direction) else { return false }
         guard !Task.isCancelled else {
             finishPageTurn(session)
             return false
@@ -1477,7 +1563,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         style: EPUBPageTurnStyle,
         target: Locator? = nil
     ) async -> Bool {
-        guard let session = beginPageTurn(to: direction) else { return false }
+        guard let session = await beginPageTurn(to: direction) else { return false }
         guard !Task.isCancelled else {
             finishPageTurn(session)
             return false
@@ -1705,16 +1791,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 transaction,
                 progress: transaction.progress
             )
-        } else if intent == .commit, transaction.isResumedPendingGesture {
-            // Queued reverse replays fall back to instant commit when surface
-            // prepare fails.
-            result = await owner.commitPageTurnAfterFailedSurfacePrepare(
-                transaction
-            )
-        } else if intent == .commit, transaction.didResolveCommitBeforePrepare {
-            // Discrete edge/keyboard turns resolve `.commit` before prepare. If
-            // surface prepare fails, still honour the input with instant
-            // navigation instead of swallowing a deliberate page-turn tap.
+        } else if intent == .commit {
+            // Committed intent with a failed surface prepare (interactive pan,
+            // discrete tap, resumed reverse, missing/default nil root, capture
+            // failure mid-prepare). Always degrade to instant navigation rather
+            // than cancel-restore and swallow the page turn.
             result = await owner.commitPageTurnAfterFailedSurfacePrepare(
                 transaction
             )
@@ -1747,7 +1828,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
         owner.releasePageTurnNavigatorNavigationLock()
         owner.applyDeferredPageTurnInteractionMode()
-        owner.resumePendingPageTurnGesture()
+        await owner.resumePendingPageTurnGesture()
         return result
     }
 
@@ -2360,7 +2441,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// mid-transform (half previous / half next) when selection UI interrupts.
     private func hardAbortInFlightPageTurn(
         restorePreparedLocation: Bool,
-        reason: String = "hardAbort"
+        reason: String = "hardAbort",
+        snapDocuments: Bool = true
     ) {
         let originalLocator = pageTurnTransaction?.originalLocator
             ?? pageTurnSurfaceOriginalPreview?.location
@@ -2392,21 +2474,23 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
         // Snap web/pagination offsets even when no surface remains — selection
         // handle drags leave mid-page contentOffset for every page-turn style.
-        snapVisibleDocumentToPageBoundaries()
+        // Selection handle paths may pass snapDocuments: false so mid-page
+        // offset remains for native handles.
+        if snapDocuments {
+            snapVisibleDocumentToPageBoundaries()
+        }
         releasePageTurnNavigatorNavigationLock()
         applyDeferredPageTurnInteractionMode()
 
         if needsLocationRestore, let originalLocator {
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                guard self.pageTurnTransaction == nil else { return }
-                _ = await self.restorePageTurnLocator(originalLocator)
-                self.snapVisibleDocumentToPageBoundaries()
-            }
+            queueHardAbortLocationRestore(
+                originalLocator,
+                snapAfterRestore: snapDocuments
+            )
         }
     }
 
-    private func abortPageTurnInterruptedBySelection() {
+    private func abortPageTurnInterruptedBySelection(snapDocuments: Bool = true) {
         // Discrete edge taps often land on selectable text. WebKit can arm a
         // native selection on the same touch that started a commit-before-prepare
         // turn. Hard-aborting that turn swallows the deliberate page-turn input
@@ -2420,9 +2504,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
         hardAbortInFlightPageTurn(
             restorePreparedLocation: true,
-            reason: "selection-interrupt"
+            reason: "selection-interrupt",
+            snapDocuments: snapDocuments
         )
-        snapVisibleDocumentToPageBoundaries()
+        if snapDocuments {
+            snapVisibleDocumentToPageBoundaries()
+        }
         updatePageTurnInteractionMode()
     }
 
@@ -2431,6 +2518,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// split is almost always a mid-page `contentOffset` on the reflowable
     /// web scroll view (or outer pagination).
     private func snapVisibleDocumentToPageBoundaries() {
+        pageTurnSnapDocumentCountForTesting += 1
         paginationView?.snapToNearestHorizontalPage()
         guard let loadedViews = paginationView?.loadedViews.values else { return }
         for view in loadedViews {
@@ -2438,11 +2526,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
     }
 
+    /// Test seam: times `snapVisibleDocumentToPageBoundaries` ran (selection
+    /// clear / hard-abort with snap, etc.).
+    private(set) var pageTurnSnapDocumentCountForTesting = 0
+
     private var hasInFlightPageTurnWork: Bool {
         pageTurnTransaction != nil
             || !pageTurnController.isIdle
             || pageTurnSurfaceAnimator != nil
             || pendingPageTurnGesture != nil
+            || hardAbortLocationRestorePending
     }
 
     private func releaseFailedPageTurnRestore(_ session: PageTurnSession) async -> Bool {
@@ -3053,10 +3146,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     func beginCoverPageTurnForTesting(
         to direction: EPUBSpreadView.Direction
-    ) -> Bool {
+    ) async -> Bool {
         guard
             pageTurnTransaction == nil,
-            let session = beginPageTurn(to: direction)
+            let session = await beginPageTurn(to: direction)
         else {
             return false
         }
@@ -3094,14 +3187,35 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     func beginPageTurnForTesting(
         to direction: EPUBSpreadView.Direction
-    ) -> Bool {
-        beginPageTurn(to: direction) != nil
+    ) async -> Bool {
+        await beginPageTurn(to: direction) != nil
+    }
+
+    /// Queues a hard-abort location restore without aborting a live turn.
+    /// Used to unit-test begin-time drain serialization.
+    func queueHardAbortRestoreForTesting(_ locator: Locator) {
+        queueHardAbortLocationRestore(locator, snapAfterRestore: true)
+    }
+
+    var hasPendingHardAbortRestoreForTesting: Bool {
+        hardAbortLocationRestorePending
+    }
+
+    func awaitPendingHardAbortLocationRestoreForTesting() async {
+        await awaitHardAbortLocationRestoreIfNeeded()
+    }
+
+    func abortPageTurnInterruptedBySelectionForTesting(snap: Bool) {
+        abortPageTurnInterruptedBySelection(snapDocuments: snap)
     }
 
     var isPageTurnIdleForTesting: Bool {
         pageTurnController.isIdle
             && pageTurnTransaction == nil
             && pageTurnSurfaceAnimator == nil
+            && !hardAbortLocationRestorePending
+            && hardAbortPanResumeTask == nil
+            && pendingPageTurnGesture == nil
     }
 
     var isPageTurnControllerIdleForTesting: Bool {
@@ -3408,6 +3522,54 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         to direction: EPUBSpreadView.Direction,
         velocityX: CGFloat = 0
     ) -> Bool {
+        // While hard-abort restore is running, buffer the pan into
+        // `pendingPageTurnGesture` so changed/ended are not dropped. A bare
+        // async begin without that buffer would open a transaction after the
+        // finger already lifted and leave it without a terminal intent.
+        if hardAbortLocationRestorePending {
+            return bufferPageTurnPanDuringHardAbortRestore(
+                to: direction,
+                velocityX: velocityX
+            )
+        }
+        return beginPageTurnPanAssumingRestoreDrained(
+            to: direction,
+            velocityX: velocityX
+        )
+    }
+
+    /// Stores a pan that began (or continued) while location restore is still
+    /// running. `updatePendingPageTurnGesture` receives changed/ended; after
+    /// restore drains, `resumePendingPageTurnGesture` applies the terminal.
+    private func bufferPageTurnPanDuringHardAbortRestore(
+        to direction: EPUBSpreadView.Direction,
+        velocityX: CGFloat
+    ) -> Bool {
+        if var existing = pendingPageTurnGesture {
+            existing = PendingPageTurnGesture(
+                direction: direction,
+                translationX: existing.translationX,
+                velocityX: velocityX,
+                terminalState: existing.terminalState
+            )
+            pendingPageTurnGesture = existing
+        } else {
+            pendingPageTurnGesture = PendingPageTurnGesture(
+                direction: direction,
+                translationX: 0,
+                velocityX: velocityX,
+                terminalState: nil
+            )
+            pageTurnPendingQueueCountForTesting += 1
+        }
+        schedulePendingPanResumeAfterHardAbortRestore()
+        return true
+    }
+
+    private func beginPageTurnPanAssumingRestoreDrained(
+        to direction: EPUBSpreadView.Direction,
+        velocityX: CGFloat = 0
+    ) -> Bool {
         guard shouldBeginPageTurnPan(to: direction) else {
             return false
         }
@@ -3422,9 +3584,21 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             transaction.resolve(.cancel)
             return true
         }
-        guard
-            let session = beginPageTurn(to: direction)
-        else {
+        // Orphan recovery may queue a restore; buffer the pan rather than
+        // opening a session that cannot see later ended events.
+        if hasInFlightPageTurnWork, pageTurnTransaction?.isRunning != true {
+            hardAbortInFlightPageTurn(
+                restorePreparedLocation: true,
+                reason: "beginPageTurnPan-orphan"
+            )
+            if hardAbortLocationRestorePending {
+                return bufferPageTurnPanDuringHardAbortRestore(
+                    to: direction,
+                    velocityX: velocityX
+                )
+            }
+        }
+        guard let session = openPageTurnSession(to: direction) else {
             return false
         }
         let style = currentEffectivePageTurnStyle()
@@ -3463,7 +3637,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Test seam: last surface-prepare failure stage (module-internal only).
     private(set) var pageTurnLastPrepareFailureForTesting: String?
 
-    private func resumePendingPageTurnGesture() {
+    private func resumePendingPageTurnGesture() async {
         guard pageTurnTransaction == nil else { return }
         guard let pending = pendingPageTurnGesture else { return }
         pageTurnPendingResumeAttemptCountForTesting += 1
@@ -3487,7 +3661,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         guard
             pageTurnTransaction == nil,
             pageTurnController.isIdle,
-            let session = beginPageTurn(to: pending.direction)
+            let session = await beginPageTurn(to: pending.direction)
         else {
             if pageTurnTransaction == nil, pageTurnController.isIdle {
                 pendingPageTurnGesture = nil
@@ -3566,10 +3740,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         velocityX: CGFloat
     ) {
         // Selection handle drags can look like horizontal pans. Never keep a
-        // page-turn in flight while a native selection is active.
+        // page-turn in flight while a native selection is active, and never
+        // snap mid-drag (that would fight the selection handles).
         if currentSelection != nil {
             if hasInFlightPageTurnWork {
-                abortPageTurnInterruptedBySelection()
+                abortPageTurnInterruptedBySelection(snapDocuments: false)
             }
             return
         }
@@ -3891,6 +4066,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 return await releaseFailedPageTurnRestore(session)
             }
             return true
+        }
+        await awaitHardAbortLocationRestoreIfNeeded()
+        if let panResume = hardAbortPanResumeTask {
+            await panResume.value
         }
         await snapshotProvider.settle()
     }
@@ -4525,7 +4704,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
             // Abort any turn that started under the selection gesture, but do
             // not snap mid-drag (that would fight the selection handles).
             if hasInFlightPageTurnWork {
-                abortPageTurnInterruptedBySelection()
+                abortPageTurnInterruptedBySelection(snapDocuments: false)
             } else {
                 updatePageTurnInteractionMode()
             }
@@ -4536,7 +4715,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         // Selection cleared: hard-abort leftover turns and snap mid-page
         // web/pagination offsets back to whole pages for every style.
         if hasInFlightPageTurnWork {
-            abortPageTurnInterruptedBySelection()
+            abortPageTurnInterruptedBySelection(snapDocuments: true)
         } else {
             snapVisibleDocumentToPageBoundaries()
             updatePageTurnInteractionMode()

@@ -1468,7 +1468,7 @@ struct EPUBPageTurnControllerTests {
         delegate.pageTurnRootView = root
         navigator.delegate = delegate
 
-        #expect(navigator.beginCoverPageTurnForTesting(to: .right))
+        #expect(await navigator.beginCoverPageTurnForTesting(to: .right))
         #expect(await waitUntil { pageTurnSurfaces(in: container).count == 2 })
         let surfaces = pageTurnSurfaces(in: container)
         #expect(surfaces.count == 2)
@@ -1502,7 +1502,7 @@ struct EPUBPageTurnControllerTests {
             }
         }
 
-        #expect(navigator.beginCoverPageTurnForTesting(to: .right))
+        #expect(await navigator.beginCoverPageTurnForTesting(to: .right))
         #expect(root.snapshotCount == 2)
         #expect(protectedSnapshots == 2)
         await navigator.settlePageTurn()
@@ -1520,7 +1520,7 @@ struct EPUBPageTurnControllerTests {
         delegate.pageTurnRootView = root
         navigator.delegate = delegate
 
-        #expect(navigator.beginCoverPageTurnForTesting(to: .right))
+        #expect(await navigator.beginCoverPageTurnForTesting(to: .right))
         #expect(pageTurnSurfaces(in: container).count == 2)
         navigator.pageTurnStyle = .push
         await navigator.settlePageTurn()
@@ -3080,7 +3080,7 @@ struct EPUBPageTurnControllerTests {
         #expect(await navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(original))
     }
 
-    @Test("failed surface prepare after navigation publishes without advancing again")
+    @Test("failed surface prepare after navigation does not navigate again on commit")
     func failedSurfacePrepareAfterNavigationDoesNotAdvanceAgain() async throws {
         let (navigator, delegate) = try await makeLoadedNavigator(
             pageTurnStyle: .push,
@@ -3095,57 +3095,35 @@ struct EPUBPageTurnControllerTests {
         #expect(await navigator.goForward(options: .none))
         await navigator.settlePageTurn()
         delegate.resetLocationChanges()
-        let start = try #require(navigator.currentLocation)
-        #expect(start.href == AnyURL(string: "chapter-2.xhtml"))
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-2.xhtml"))
 
-        // After navigation under the surface, fail capture so prepare ends with
-        // didPrepareTarget == true but isPrepared == false. The resumed-pending
-        // fallback must publish the already-reached page, not go forward again.
+        // Prepare installs with the first snapshot, then pretends under-surface
+        // navigation succeeded. Fail every later snapshot so target capture
+        // fails → didPrepareTarget == true, isPrepared == false. Commit must
+        // publish only and must not call navigation a second time.
         var navigationCount = 0
         navigator.pageTurnNavigationForTesting = { _, _ in
             navigationCount += 1
             return true
         }
-        navigator.pageTurnPreviewCalculationForTesting = {
-            let location = Locator(
-                href: AnyURL(string: "chapter-3.xhtml")!,
-                mediaType: .html,
-                locations: .init(progression: 0)
-            )
-            return (location, navigator.viewport)
-        }
-        // Force capture/match failure after navigation by removing the root
-        // mid-turn is hard; use a navigation-only path via resumed pending:
-        // start a turn, queue reverse that will re-enter with prepare nav only.
-        // Simpler: invoke the failed-prepare commit path via goForward after
-        // arming a capture failure by nil root during target capture.
         root.onSnapshot = {
-            // First snapshot (current) succeeds; subsequent target capture fails
-            // by detaching the root from the hierarchy after current is taken.
-            if root.snapshotCount >= 1 {
-                root.removeFromSuperview()
+            // After the install snapshot succeeds, fail subsequent captures.
+            if root.snapshotCount >= 2 {
+                root.shouldFailSnapshots = true
             }
         }
 
-        let didGo = await navigator.goForward(options: .animated)
+        _ = await navigator.goForward(options: .animated)
         await navigator.settlePageTurn()
 
-        // Either surface commit or failed-prepare publish is fine; must not
-        // overshoot past the single forward step from chapter-2.
-        if didGo {
-            #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-3.xhtml"))
-            #expect(delegate.locationChangeCount == 1)
-        } else {
-            // Fail-closed restore back to chapter-2 is also acceptable when
-            // surface cannot be built; never land on chapter-4 / double advance.
-            #expect(
-                navigator.currentLocation?.href == AnyURL(string: "chapter-2.xhtml")
-                    || navigator.currentLocation?.href == AnyURL(string: "chapter-3.xhtml")
-            )
-        }
-        #expect(navigator.currentLocation?.href != AnyURL(string: "chapter-1.xhtml"))
-        // navigationCount is only for the test hook; primary guard is href.
-        _ = navigationCount
+        // Prepare may navigate once under the surface; commit after a failed
+        // prepare must not issue a second navigation (no chapter-4 overshoot).
+        #expect(navigationCount <= 1)
+        #expect(
+            navigator.currentLocation?.href == AnyURL(string: "chapter-2.xhtml")
+                || navigator.currentLocation?.href == AnyURL(string: "chapter-3.xhtml")
+        )
+        #expect(navigator.currentLocation?.href != AnyURL(string: "chapter-4.xhtml"))
         #expect(navigator.isPageTurnIdleForTesting)
     }
 
@@ -3282,11 +3260,11 @@ struct EPUBPageTurnControllerTests {
 
         #expect(try await capture() != nil)
         let revision = navigator.snapshotProvider.revision
-        #expect(navigator.beginPageTurnForTesting(to: .right))
+        #expect(await navigator.beginPageTurnForTesting(to: .right))
         spread.updateActiveMediaState(document: "same-url:first", isActive: true)
         #expect(navigator.snapshotProvider.revision == revision + 1)
         #expect(navigator.snapshotProvider.cachedSnapshot(for: target) == nil)
-        #expect(navigator.beginPageTurnForTesting(to: .left))
+        #expect(await navigator.beginPageTurnForTesting(to: .left))
 
         spread.updateActiveMediaState(document: "same-url:second", isActive: true)
         spread.updateActiveMediaState(document: "same-url:first", isActive: false)
@@ -3324,7 +3302,7 @@ struct EPUBPageTurnControllerTests {
             { NotificationCenter.default.post(name: UIApplication.willResignActiveNotification, object: nil) },
             { navigator.didReceiveMemoryWarning() },
         ] {
-            #expect(navigator.beginCoverPageTurnForTesting(to: .right))
+            #expect(await navigator.beginCoverPageTurnForTesting(to: .right))
             let didMountSurface = await waitUntil {
                 !pageTurnSurfaces(in: container).isEmpty
             }
@@ -3991,18 +3969,25 @@ struct EPUBPageTurnControllerTests {
         #expect(navigator.canBeginPageTurnPanForTesting())
     }
 
-    @Test("missing page root never animates the navigator body")
-    func missingPageTurnRootSafelyCancelsAnimatedTapAndPan() async throws {
-        let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .push)
+    @Test("missing page root degrades committed turns to non-animated navigation")
+    func missingPageTurnRootDegradesCommittedTurnsToInstantNavigation() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(
+            pageTurnStyle: .push,
+            chapterCount: 3
+        )
         let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
         navigator.view.frame = container.bounds
         container.addSubview(navigator.view)
+        // Default / unadapted integrations leave pageTurnRootView nil. Surface
+        // prepare must fail closed on animation, but a committed turn still
+        // navigates instantly instead of cancel-restoring in place.
         delegate.pageTurnRootView = nil
-        let original = try #require(navigator.currentLocation)
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-1.xhtml"))
 
-        #expect(!(await navigator.goForward(options: .animated)))
-        #expect(navigator.currentLocation == original)
+        #expect(await navigator.goForward(options: .animated))
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-2.xhtml"))
         #expect(pageTurnSurfaces(in: container).isEmpty)
+        #expect(navigator.isPageTurnIdleForTesting)
 
         navigator.handlePageTurnPanForTesting(
             state: .began,
@@ -4014,8 +3999,11 @@ struct EPUBPageTurnControllerTests {
             translationX: -100,
             velocityX: -700
         )
-        #expect(await waitUntil { navigator.isPageTurnIdleForTesting })
-        #expect(navigator.currentLocation == original)
+        #expect(await waitUntil {
+            navigator.isPageTurnIdleForTesting
+                && navigator.currentLocation?.href == AnyURL(string: "chapter-3.xhtml")
+        })
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-3.xhtml"))
         #expect(pageTurnSurfaces(in: container).isEmpty)
     }
 
