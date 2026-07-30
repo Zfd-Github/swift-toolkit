@@ -173,6 +173,17 @@ public class PublicationSpeechSynthesizer: Loggable {
         engine.availableVoices
     }
 
+    /// Switches the voice for the current utterance from its latest word boundary.
+    @MainActor
+    @discardableResult
+    public func switchVoice(to identifier: String?) -> Bool {
+        guard engine.switchVoice(to: identifier) else {
+            return false
+        }
+        config.voiceIdentifier = identifier
+        return true
+    }
+
     /// Returns the first voice with the given `identifier` supported by the TTS `engine`.
     ///
     /// This can be used to restore the user selected voice after storing it in the user defaults.
@@ -192,6 +203,11 @@ public class PublicationSpeechSynthesizer: Loggable {
         audioSession.start(with: audioSessionUser, isPlaying: false)
 
         currentTask?.cancel()
+        if let text = startLocator?.text, text.before != nil {
+            startText = text
+        } else {
+            startText = nil
+        }
         publicationIterator = publication.content(from: startLocator)?.iterator()
         currentTask = Task {
             await playNextUtterance(.forward)
@@ -258,6 +274,8 @@ public class PublicationSpeechSynthesizer: Loggable {
             utterances = CursorList()
         }
     }
+
+    private var startText: Locator.Text?
 
     /// Utterances for the current publication `ContentElement` item.
     private var utterances: CursorList<Utterance> = CursorList()
@@ -378,8 +396,96 @@ public class PublicationSpeechSynthesizer: Loggable {
     ///
     /// This is used to split a paragraph into sentences, for example.
     func tokenize(_ element: ContentElement) throws -> [ContentElement] {
+        guard
+            let startText,
+            var first = element as? TextContentElement
+        else {
+            let tokenizer = tokenizerFactory(config.defaultLanguage ?? publication.metadata.language)
+            return try tokenizer(element)
+        }
+
+        self.startText = nil
+        if let offset = textOffset(in: first, for: startText) {
+            first.segments = trimming(first.segments, before: offset)
+        }
+
         let tokenizer = tokenizerFactory(config.defaultLanguage ?? publication.metadata.language)
-        return try tokenizer(element)
+        return try tokenizer(first)
+    }
+
+    private func textOffset(in element: TextContentElement, for startText: Locator.Text) -> Int? {
+        guard let before = startText.before else {
+            return nil
+        }
+
+        let text = element.segments.map(\.text).joined()
+        let normalized = coalescingWhitespace(in: text)
+        let normalizedBefore = coalescingWhitespace(in: before).text
+        if let offset = normalized.rawOffset(afterPrefix: normalizedBefore) {
+            return offset
+        }
+
+        return nil
+    }
+
+    private func trimming(
+        _ segments: [TextContentElement.Segment],
+        before offset: Int
+    ) -> [TextContentElement.Segment] {
+        var remaining = offset
+        for index in segments.indices {
+            guard remaining < segments[index].text.count else {
+                remaining -= segments[index].text.count
+                continue
+            }
+            var first = segments[index]
+            first.text = String(first.text.dropFirst(remaining))
+            first.locator = first.locator.copy(text: { $0.highlight = first.text })
+            return [first] + segments.dropFirst(index + 1)
+        }
+        return []
+    }
+
+    private func coalescingWhitespace(in text: String) -> CoalescedText {
+        let characters = Array(text)
+        var result: [Character] = []
+        var rawOffsets: [Int] = []
+        var hasWhitespace = false
+        for (index, character) in characters.enumerated() {
+            if character.isWhitespace {
+                hasWhitespace = true
+            } else {
+                if hasWhitespace, !result.isEmpty {
+                    result.append(" ")
+                    rawOffsets.append(index)
+                }
+                result.append(character)
+                rawOffsets.append(index + 1)
+                hasWhitespace = false
+            }
+        }
+        if hasWhitespace, !result.isEmpty {
+            result.append(" ")
+            rawOffsets.append(characters.count)
+        }
+        return CoalescedText(text: String(result), rawOffsets: rawOffsets)
+    }
+
+    private struct CoalescedText {
+        let text: String
+        let rawOffsets: [Int]
+
+        func rawOffset(afterPrefix prefix: String) -> Int? {
+            guard text.hasPrefix(prefix) else {
+                return nil
+            }
+            return rawOffset(at: text.index(text.startIndex, offsetBy: prefix.count))
+        }
+
+        func rawOffset(at index: String.Index) -> Int {
+            let offset = text.distance(from: text.startIndex, to: index)
+            return offset == 0 ? 0 : rawOffsets[offset - 1]
+        }
     }
 
     /// Splits a publication `ContentElement` item into the utterances to be spoken.

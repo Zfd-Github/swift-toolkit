@@ -47,6 +47,8 @@ enum AccessibilityID: String {
     case jumpReflowMarker
     case captureCurrentLocation
     case captureFirstVisible
+    case captureFirstVisibleText
+    case captureFirstVisibleTextAtViewport
     case captureMetrics
     case captureViewportMetrics
     case captureTitle

@@ -3931,6 +3931,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func firstVisibleElementLocator() async -> Locator? {
+        await firstVisibleSpreadAndLocator()?.locator
+    }
+
+    private func firstVisibleSpreadAndLocator() async -> (
+        spreadView: EPUBSpreadView,
+        locator: Locator,
+        visibleFrame: CGRect?
+    )? {
         guard let paginationView else {
             return nil
         }
@@ -3939,11 +3947,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             for index in paginationView.visibleIndices {
                 guard
                     let spreadView = paginationView.loadedViews[index] as? EPUBReflowableSpreadView,
-                    let visibleFrame = paginationView.visibleFrame(at: index)
+                    let visibleFrame = paginationView.visibleFrame(at: index),
+                    let locator = await spreadView.findFirstVisibleElementLocator(in: visibleFrame)
                 else {
                     continue
                 }
-                return await spreadView.findFirstVisibleElementLocator(in: visibleFrame)
+                return (spreadView, locator, visibleFrame)
             }
             return nil
         }
@@ -3951,7 +3960,100 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         guard let spreadView = paginationView.currentView as? EPUBSpreadView else {
             return nil
         }
-        return await spreadView.findFirstVisibleElementLocator()
+        guard let locator = await spreadView.findFirstVisibleElementLocator() else {
+            return nil
+        }
+        return (spreadView, locator, nil)
+    }
+
+    /// Returns a locator targeting the first visible character in the current spread.
+    ///
+    /// The locator keeps the containing CSS block and stores the full prefix in
+    /// `text.before`, so a text-to-speech client can start within a paragraph.
+    public func firstVisibleTextLocator() async -> Locator? {
+        guard
+            let visible = await firstVisibleSpreadAndLocator(),
+            let cssSelector = visible.locator.locations.cssSelector,
+            let cssSelectorJSON = try? JSONValue.string(cssSelector).jsonString(),
+            let locatorJSON = try? JSONValue.object(visible.locator.jsonObject).jsonString()
+        else {
+            return nil
+        }
+        let visibleRectJSON = visible.visibleFrame.flatMap { frame in
+            try? JSONValue.object([
+                "x": .double(Double(frame.minX)),
+                "y": .double(Double(frame.minY)),
+                "width": .double(Double(frame.width)),
+                "height": .double(Double(frame.height)),
+            ]).jsonString()
+        } ?? "null"
+        let script = """
+        (() => {
+          const locator = \(locatorJSON);
+          locator.locations.cssSelector = \(cssSelectorJSON);
+          const visibleRect = \(visibleRectJSON) ?? { x: 0, y: 0, width: window.innerWidth, height: window.innerHeight };
+          const block = document.querySelector(locator.locations.cssSelector);
+          if (!block) return null;
+          const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+          let textNodeIndex = 0;
+          while (walker.nextNode()) {
+            const node = walker.currentNode;
+            const currentTextNodeIndex = textNodeIndex++;
+            const length = node.textContent.length;
+            if (!length) continue;
+            const range = document.createRange();
+            const reachesViewport = (end) => {
+              range.setStart(node, 0);
+              range.setEnd(node, end);
+              return Array.from(range.getClientRects()).some((rect) =>
+                rect.right > visibleRect.x && rect.left < visibleRect.x + visibleRect.width &&
+                rect.bottom > visibleRect.y && rect.top < visibleRect.y + visibleRect.height
+              );
+            };
+            if (!reachesViewport(length)) continue;
+            let lower = 1;
+            let upper = length;
+            while (lower < upper) {
+              const middle = Math.floor((lower + upper) / 2);
+              if (reachesViewport(middle)) upper = middle;
+              else lower = middle + 1;
+            }
+            const index = lower - 1;
+            range.setStart(node, index);
+            range.setEnd(node, index + 1);
+            const rect = range.getBoundingClientRect();
+            if (rect.right <= visibleRect.x || rect.left >= visibleRect.x + visibleRect.width || rect.bottom <= visibleRect.y || rect.top >= visibleRect.y + visibleRect.height) continue;
+            const before = document.createRange();
+            before.selectNodeContents(block);
+            before.setEnd(node, index);
+            const after = document.createRange();
+            after.selectNodeContents(block);
+            after.setStart(node, index);
+            locator.text = { before: before.toString(), highlight: after.toString() };
+            locator.locations.domRange = {
+              start: {
+                cssSelector: locator.locations.cssSelector,
+                textNodeIndex: currentTextNodeIndex,
+                charOffset: index,
+              },
+            };
+            return locator;
+          }
+          return null;
+        })()
+        """
+        guard
+            case let .success(value) = await visible.spreadView.evaluateScript(script),
+            let json = JSONValue(value),
+            let locator = try? Locator(json: json)
+        else {
+            return nil
+        }
+        return locator.copy(
+            href: visible.locator.href,
+            mediaType: visible.locator.mediaType,
+            title: visible.locator.title
+        )
     }
 
     /// Last current location notified to the delegate.

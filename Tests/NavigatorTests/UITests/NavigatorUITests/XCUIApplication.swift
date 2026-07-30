@@ -120,6 +120,8 @@ struct ReaderUI {
 
             case .captureCurrentLocation,
                  .captureFirstVisible,
+                 .captureFirstVisibleText,
+                 .captureFirstVisibleTextAtViewport,
                  .captureMetrics,
                  .captureViewportMetrics,
                  .captureTitle,

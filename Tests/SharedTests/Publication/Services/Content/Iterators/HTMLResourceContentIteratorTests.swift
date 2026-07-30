@@ -67,6 +67,31 @@ struct HTMLResourceContentIteratorTests {
         #expect(result == nil)
     }
 
+    @Test func startingFromDOMRangeCountsSkippedMediaTextNodes() async throws {
+        let html = "<html><body><p>before<audio>fallback</audio>middle<span>target</span></p></body></html>"
+        var locator = makeLocator(selector: "p")
+        let range = DOMRange(start: .init(cssSelector: "p", textNodeIndex: 3, charOffset: 1))
+        locator.locations.otherLocations["domRange"] = .object(range.jsonObject)
+        let iterator = makeIterator(html, start: locator)
+
+        let text = try await iterator.next() as? TextContentElement
+
+        #expect(text?.text == "arget")
+    }
+
+    @Test func startingFromDOMRangeAtInlineTextEndStartsAtFollowingNode() async throws {
+        var locator = makeLocator(selector: "p")
+        let range = DOMRange(start: .init(cssSelector: "p", textNodeIndex: 1, charOffset: 3))
+        locator.locations.otherLocations["domRange"] = .object(range.jsonObject)
+
+        let text = try await makeIterator(
+            "<html><body><p>one<span>two</span>three</p></body></html>",
+            start: locator
+        ).next() as? TextContentElement
+
+        #expect(text?.text == "three")
+    }
+
     @Test func callingPreviousWhenStartingFromCSSSelector() async throws {
         let iter = makeIterator(sampleHTML, start: makeLocator(selector: "#pgepubid00498 > p:nth-child(3)"))
         let result = try await iter.previous()

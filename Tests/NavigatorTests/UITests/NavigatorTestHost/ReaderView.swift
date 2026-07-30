@@ -181,6 +181,8 @@ struct ReaderView: View {
                                 Menu("Capture Actions") {
                                     testAction("Capture Current Location", .captureCurrentLocation, id: .captureCurrentLocation)
                                     testAction("Capture First Visible", .captureFirstVisible, id: .captureFirstVisible)
+                                    testAction("Capture First Visible Text", .captureFirstVisibleText, id: .captureFirstVisibleText)
+                                    testAction("Capture First Visible Text At Viewport", .captureFirstVisibleTextAtViewport, id: .captureFirstVisibleTextAtViewport)
                                     testAction("Capture Metrics", .captureMetrics, id: .captureMetrics)
                                     testAction("Capture Viewport Metrics", .captureViewportMetrics, id: .captureViewportMetrics)
                                     testAction("Capture Title", .captureTitle, id: .captureTitle)
@@ -299,6 +301,8 @@ enum ReaderTestAction: String {
     case jumpReflowMarker
     case captureCurrentLocation
     case captureFirstVisible
+    case captureFirstVisibleText
+    case captureFirstVisibleTextAtViewport
     case captureMetrics
     case captureViewportMetrics
     case captureTitle
@@ -970,6 +974,56 @@ enum ReaderTestAction: String {
                 return
             }
             firstVisibleMarker = describe(locator)
+            complete(action, generation: generation)
+
+        case .captureFirstVisibleText:
+            let injected = await navigator.evaluateJavaScript("""
+            (() => {
+              const id = 'readium-first-visible-text-test';
+              document.getElementById(id)?.remove();
+              const paragraph = document.createElement('p');
+              paragraph.id = id;
+              paragraph.textContent = 'FIRST-VISIBLE-TEXT '.repeat(2000);
+              document.body.append(paragraph);
+              return true;
+            })()
+            """)
+            guard case let .success(value) = injected, value as? Bool == true else {
+                fail(action, generation: generation, reason: "injection-failed")
+                return
+            }
+            let moved = await navigator.evaluateJavaScript("""
+            (() => {
+              if (!readium.scrollToId('readium-first-visible-text-test', false)) return false;
+              readium.scrollRight('ltr', false);
+              return true;
+            })()
+            """)
+            guard case let .success(value) = moved, value as? Bool == true else {
+                fail(action, generation: generation, reason: "page-turn-failed")
+                return
+            }
+            await nextMainRunLoop()
+            guard
+                let locator = await navigator.firstVisibleTextLocator(),
+                let before = locator.text.before,
+                before.count >= 64
+            else {
+                fail(action, generation: generation, reason: "missing-text-offset")
+                return
+            }
+            firstVisibleMarker = "\(describe(locator))|before=\(before.count)"
+            complete(action, generation: generation)
+
+        case .captureFirstVisibleTextAtViewport:
+            guard
+                let locator = await navigator.firstVisibleTextLocator(),
+                let before = locator.text.before
+            else {
+                fail(action, generation: generation, reason: "missing-first-visible-text")
+                return
+            }
+            firstVisibleMarker = "\(describe(locator))|before=\(before.count)"
             complete(action, generation: generation)
 
         case .captureMetrics:

@@ -25,11 +25,23 @@ public protocol TTSEngine: AnyObject {
         _ utterance: TTSUtterance,
         onSpeakRange: @escaping (Range<String.Index>) -> Void
     ) async -> Result<Void, TTSError>
+
+    /// Changes the voice of the utterance currently being spoken.
+    ///
+    /// Returns `true` when the engine will restart the current utterance from
+    /// its current word boundary using the requested voice.
+    @MainActor
+    func switchVoice(to identifier: String?) -> Bool
 }
 
 public extension TTSEngine {
     func voiceWithIdentifier(_ identifier: String) -> TTSVoice? {
         availableVoices.first { $0.identifier == identifier }
+    }
+
+    @MainActor
+    func switchVoice(to identifier: String?) -> Bool {
+        false
     }
 }
 

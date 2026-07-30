@@ -118,6 +118,7 @@ public class HTMLResourceContentIterator: ContentIterator {
                     // with SwiftSoup.
                     try document.select($0.removingPrefix(":root > ")).first()
                 },
+            startDOMRange: locator.locations.domRange,
             beforeMaxLength: beforeMaxLength
         )
 
@@ -173,12 +174,19 @@ public class HTMLResourceContentIterator: ContentIterator {
         private let baseLocator: Locator
         private let baseHREF: AnyURL?
         private let startElement: Element?
+        private let startDOMRange: DOMRange?
         private let beforeMaxLength: Int
 
-        init(baseLocator: Locator, startElement: Element?, beforeMaxLength: Int) {
+        init(
+            baseLocator: Locator,
+            startElement: Element?,
+            startDOMRange: DOMRange?,
+            beforeMaxLength: Int
+        ) {
             self.baseLocator = baseLocator
             baseHREF = baseLocator.href
             self.startElement = startElement
+            self.startDOMRange = startDOMRange
             self.beforeMaxLength = beforeMaxLength
         }
 
@@ -193,6 +201,8 @@ public class HTMLResourceContentIterator: ContentIterator {
 
         private var elements: [ContentElement] = []
         private var startIndex = 0
+        private var isInsideStartElement = false
+        private var startTextNodeIndex = 0
 
         /// Segments accumulated for the current element.
         private var segmentsAcc: [TextContentElement.Segment] = []
@@ -236,6 +246,9 @@ public class HTMLResourceContentIterator: ContentIterator {
 
         func head(_ node: Node, _ depth: Int) throws {
             if let node = node as? Element {
+                if node === startElement {
+                    isInsideStartElement = true
+                }
                 let parent = ParentElement(element: node, cssSelector: selectorGenerator.cssSelector(for: node))
                 if node.isBlock() {
                     flushText()
@@ -320,9 +333,19 @@ public class HTMLResourceContentIterator: ContentIterator {
 
         func tail(_ node: Node, _ depth: Int) throws {
             if let node = node as? TextNode {
+                let textNodeIndex = startTextNodeIndex
+                if isInsideStartElement {
+                    startTextNodeIndex += 1
+                }
+
                 guard !isInsideSkippedElement else { return }
 
                 guard let wholeText = node.getWholeText().orNilIfBlank() else {
+                    return
+                }
+
+                if let startDOMRange, isInsideStartElement,
+                   textNodeIndex < startDOMRange.start.textNodeIndex {
                     return
                 }
 
@@ -332,7 +355,17 @@ public class HTMLResourceContentIterator: ContentIterator {
                     currentLanguage = language
                 }
 
-                let text = try Parser.unescapeEntities(wholeText, false)
+                var text = try Parser.unescapeEntities(wholeText, false)
+                if
+                    isInsideStartElement,
+                    textNodeIndex == startDOMRange?.start.textNodeIndex,
+                    let charOffset = startDOMRange?.start.charOffset,
+                    charOffset <= text.utf16.count
+                {
+                    text = charOffset < text.utf16.count
+                        ? String(text[String.Index(utf16Offset: charOffset, in: text)...])
+                        : ""
+                }
                 rawTextAcc += text
                 try appendNormalisedText(text)
 
@@ -345,6 +378,9 @@ public class HTMLResourceContentIterator: ContentIterator {
                     assert(breadcrumbs.last?.element == node)
                     flushText()
                     breadcrumbs.removeLast()
+                }
+                if node === startElement {
+                    isInsideStartElement = false
                 }
             }
         }

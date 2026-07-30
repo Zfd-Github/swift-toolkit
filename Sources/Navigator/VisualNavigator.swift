@@ -37,11 +37,19 @@ public protocol VisualNavigator: Navigator, InputObservable {
     /// Returns the `Locator` to the first content element that begins on the
     /// current screen.
     func firstVisibleElementLocator() async -> Locator?
+
+    /// Returns a locator targeting the first readable text in the current
+    /// screen, when the navigator can provide a text-level position.
+    func firstVisibleTextLocator() async -> Locator?
 }
 
 public extension VisualNavigator {
     func firstVisibleElementLocator() async -> Locator? {
         currentLocation
+    }
+
+    func firstVisibleTextLocator() async -> Locator? {
+        await firstVisibleElementLocator()
     }
 
     @discardableResult

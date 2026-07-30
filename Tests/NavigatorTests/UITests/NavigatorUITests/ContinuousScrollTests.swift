@@ -130,6 +130,15 @@ final class ContinuousScrollTests: XCTestCase {
         XCTAssertTrue(reader.marker(.currentLocationMarker).contains("chapter-01.xhtml"))
         reader.runAction(.captureFirstVisible, completionPrefix: "captureFirstVisible")
         XCTAssertTrue(reader.marker(.firstVisibleMarker).contains("chapter-01.xhtml"))
+        reader.runAction(.captureFirstVisibleTextAtViewport, completionPrefix: "captureFirstVisibleTextAtViewport")
+        let firstVisibleText = reader.marker(.firstVisibleMarker)
+        XCTAssertTrue(firstVisibleText.contains("chapter-01.xhtml"))
+        let before = firstVisibleText
+            .split(separator: "|")
+            .first(where: { $0.hasPrefix("before=") })
+            .flatMap { Int($0.dropFirst("before=".count)) }
+            ?? 0
+        XCTAssertGreaterThanOrEqual(before, 64, firstVisibleText)
 
         let secondResourceTarget = app.staticTexts["CHAPTER-02-START"].firstMatch
         XCTAssertTrue(secondResourceTarget.waitUntil(timeout: 10) {
@@ -226,6 +235,24 @@ final class ContinuousScrollTests: XCTestCase {
         reader.runAction(.captureTitle, completionPrefix: "captureTitle")
         XCTAssertEqual(reader.marker(.titleMarker), "Chapter 50")
 
+        reader.close(assertMemoryDeallocated: true)
+    }
+
+    func testFirstVisibleTextUsesTheVisibleCharacterInALaterColumn() {
+        let reader = app.open(.continuousScrollEPUB, waitUntilReady: true)
+
+        reader.runAction(.toggleLayoutMode, completionPrefix: "toggleLayoutMode")
+        XCTAssertEqual(reader.marker(.modeMarker), "paged")
+        reader.runAction(.captureFirstVisibleText, completionPrefix: "captureFirstVisibleText")
+
+        let marker = reader.marker(.firstVisibleMarker)
+        XCTAssertTrue(marker.contains("before="), marker)
+        let before = marker
+            .split(separator: "|")
+            .first(where: { $0.hasPrefix("before=") })
+            .flatMap { Int($0.dropFirst("before=".count)) }
+            ?? 0
+        XCTAssertGreaterThanOrEqual(before, 64, marker)
         reader.close(assertMemoryDeallocated: true)
     }
 
