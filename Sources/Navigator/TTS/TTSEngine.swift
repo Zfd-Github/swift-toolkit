@@ -21,6 +21,7 @@ public protocol TTSEngine: AnyObject {
     /// Synthesizes the given `utterance` and returns its status.
     ///
     /// `onSpeakRange` is called repeatedly while the engine plays portions (e.g. words) of the utterance.
+    @MainActor
     func speak(
         _ utterance: TTSUtterance,
         onSpeakRange: @escaping (Range<String.Index>) -> Void
@@ -64,6 +65,16 @@ public struct TTSUtterance {
     /// Either an explicit voice or the language of the text. If a language is provided, the default voice for this
     /// language will be used.
     public let voiceOrLanguage: Either<TTSVoice, Language>
+
+    public init(
+        text: String,
+        delay: TimeInterval,
+        voiceOrLanguage: Either<TTSVoice, Language>
+    ) {
+        self.text = text
+        self.delay = delay
+        self.voiceOrLanguage = voiceOrLanguage
+    }
 
     public var language: Language {
         switch voiceOrLanguage {
