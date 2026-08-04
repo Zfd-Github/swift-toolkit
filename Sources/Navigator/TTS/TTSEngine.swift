@@ -21,6 +21,9 @@ public protocol TTSEngine: AnyObject {
     /// Synthesizes the given `utterance` and returns its status.
     ///
     /// `onSpeakRange` is called repeatedly while the engine plays portions (e.g. words) of the utterance.
+    /// When the calling task is cancelled, the engine must stop playback and
+    /// return promptly. Calls to this method are serialized; a new utterance
+    /// is not submitted until the cancelled call returns.
     @MainActor
     func speak(
         _ utterance: TTSUtterance,
@@ -33,6 +36,25 @@ public protocol TTSEngine: AnyObject {
     /// its current word boundary using the requested voice.
     @MainActor
     func switchVoice(to identifier: String?) -> Bool
+}
+
+/// Optional contract for engines which can synthesize a small amount of audio
+/// without scheduling playback.
+public protocol TTSPrefetchingEngine: TTSEngine {
+    /// Synthesizes `utterance` without playing it and returns its cached audio
+    /// duration. Results exceeding `maximumDuration` must not be retained.
+    @MainActor
+    func prefetch(
+        _ utterance: TTSUtterance,
+        maximumDuration: TimeInterval
+    ) async -> TimeInterval?
+
+    /// Invalidates all pending and cached prefetched audio.
+    ///
+    /// This must cause any pending ``prefetch(_:maximumDuration:)`` calls to
+    /// return promptly, usually with `nil`.
+    @MainActor
+    func cancelPrefetch()
 }
 
 public extension TTSEngine {
@@ -62,6 +84,10 @@ public struct TTSUtterance {
     /// Delay before speaking the utterance, in seconds.
     public let delay: TimeInterval
 
+    /// Stable identity used to match one prefetched utterance occurrence with
+    /// its later playback request.
+    public let prefetchIdentifier: UUID?
+
     /// Either an explicit voice or the language of the text. If a language is provided, the default voice for this
     /// language will be used.
     public let voiceOrLanguage: Either<TTSVoice, Language>
@@ -69,10 +95,12 @@ public struct TTSUtterance {
     public init(
         text: String,
         delay: TimeInterval,
+        prefetchIdentifier: UUID? = nil,
         voiceOrLanguage: Either<TTSVoice, Language>
     ) {
         self.text = text
         self.delay = delay
+        self.prefetchIdentifier = prefetchIdentifier
         self.voiceOrLanguage = voiceOrLanguage
     }
 

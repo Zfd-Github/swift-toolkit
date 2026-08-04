@@ -20,12 +20,13 @@ public protocol PublicationSpeechSynthesizerDelegate: AnyObject {
 
 /// `PublicationSpeechSynthesizer` orchestrates the rendition of a `Publication` by iterating through its content,
 /// splitting it into individual utterances using a `ContentTokenizer`, then using a `TTSEngine` to read them aloud.
+@preconcurrency @MainActor
 public class PublicationSpeechSynthesizer: Loggable {
     public typealias EngineFactory = () -> TTSEngine
     public typealias TokenizerFactory = (_ defaultLanguage: Language?) -> ContentTokenizer
 
     /// Returns whether the `publication` can be played with a `PublicationSpeechSynthesizer`.
-    public static func canSpeak(publication: Publication) -> Bool {
+    nonisolated public static func canSpeak(publication: Publication) -> Bool {
         publication.content() != nil
     }
 
@@ -60,6 +61,13 @@ public class PublicationSpeechSynthesizer: Loggable {
         public let locator: Locator
         /// Language of this utterance, if it dffers from the default publication language.
         public let language: Language?
+        let prefetchIdentifier = UUID()
+
+        public static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.text == rhs.text &&
+                lhs.locator == rhs.locator &&
+                lhs.language == rhs.language
+        }
     }
 
     /// Represents a state of the `PublicationSpeechSynthesizer`.
@@ -87,20 +95,24 @@ public class PublicationSpeechSynthesizer: Loggable {
     /// Current state of the `PublicationSpeechSynthesizer`.
     public private(set) var state: State = .stopped {
         didSet {
+            guard oldValue != state else { return }
             if oldValue.isPlaying != state.isPlaying {
                 audioSession.user(audioSessionUser, didChangePlaying: state.isPlaying)
             }
-
-            Task {
-                await delegate?.publicationSpeechSynthesizer(self, stateDidChange: state)
-            }
+            delegate?.publicationSpeechSynthesizer(self, stateDidChange: state)
         }
     }
 
     /// Current configuration of the `PublicationSpeechSynthesizer`.
     ///
     /// Changes are not immediate, they will be applied for the next utterance.
-    public var config: Configuration
+    public var config: Configuration {
+        didSet {
+            guard oldValue != config else { return }
+            invalidatePrefetch()
+            forwardGroups = forwardGroups.map { $0.invalidatingPrefetch() }
+        }
+    }
 
     public weak var delegate: PublicationSpeechSynthesizerDelegate?
 
@@ -108,6 +120,8 @@ public class PublicationSpeechSynthesizer: Loggable {
     private let audioSession: AudioSessionManaging
     private let engineFactory: EngineFactory
     private let tokenizerFactory: TokenizerFactory
+    private static let maximumPrefetchDuration: TimeInterval = 15
+    private static let maximumSingleUtterancePrefetchDuration: TimeInterval = 75
 
     /// Creates a `PublicationSpeechSynthesizer` using the given `TTSEngine` factory.
     ///
@@ -154,7 +168,7 @@ public class PublicationSpeechSynthesizer: Loggable {
     }
 
     /// The default content tokenizer will split the `Content.Element` items into individual sentences.
-    public static let defaultTokenizerFactory: TokenizerFactory = { defaultLanguage in
+    nonisolated public static let defaultTokenizerFactory: TokenizerFactory = { defaultLanguage in
         makeTextContentTokenizer(
             defaultLanguage: defaultLanguage,
             contextSnippetLength: 50,
@@ -165,8 +179,28 @@ public class PublicationSpeechSynthesizer: Loggable {
     }
 
     private var currentTask: Task<Void, Never>?
+    private var forwardPrefetchTask: Task<Void, Never>?
+    private var prefetchCancellationTask: Task<Void, Never>?
+    private var operationGeneration: UInt64 = 0
+    private var prefetchGeneration: UInt64 = 0
+    private var prefetchRequestGeneration: UInt64 = 0
+    private var prefetchCancellationGeneration: UInt64 = 0
+    private struct ForwardPrefetch {
+        let identifier: UUID
+        let duration: TimeInterval
+    }
 
-    private lazy var engine: TTSEngine = engineFactory()
+    private var readyForwardPrefetches: [ForwardPrefetch] = []
+    private var engineStorage: TTSEngine?
+
+    private var engine: TTSEngine {
+        if let engineStorage {
+            return engineStorage
+        }
+        let engine = engineFactory()
+        engineStorage = engine
+        return engine
+    }
 
     /// List of synthesizer voices supported by the TTS engine.
     public var availableVoices: [TTSVoice] {
@@ -174,7 +208,6 @@ public class PublicationSpeechSynthesizer: Loggable {
     }
 
     /// Switches the voice for the current utterance from its latest word boundary.
-    @MainActor
     @discardableResult
     public func switchVoice(to identifier: String?) -> Bool {
         guard engine.switchVoice(to: identifier) else {
@@ -198,19 +231,162 @@ public class PublicationSpeechSynthesizer: Loggable {
     /// Cache for the last requested voice, for performance.
     private var lastUsedVoice: TTSVoice?
 
+    /// Prepares the first utterance at `startLocator` without scheduling audio.
+    ///
+    /// Returns whether prefetching completed successfully. Returns `false` when
+    /// playback is active, no utterance is available, the request is cancelled
+    /// or superseded, the engine doesn't support prefetching, or it rejects the
+    /// prepared audio.
+    @discardableResult
+    public func prefetch(from startLocator: Locator? = nil) async -> Bool {
+        guard case .stopped = state else {
+            return false
+        }
+        let oldCurrentTask = currentTask
+        oldCurrentTask?.cancel()
+        let oldPrefetchTask = invalidatePrefetch()
+        operationGeneration &+= 1
+        let generation = operationGeneration
+        let prefetchGeneration = self.prefetchGeneration
+        prefetchRequestGeneration &+= 1
+        let prefetchRequestGeneration = self.prefetchRequestGeneration
+        setStartText(from: startLocator)
+        publicationIterator = nil
+        return await withTaskCancellationHandler(
+            operation: {
+                await self.prefetchInitial(
+                    from: startLocator,
+                    oldCurrentTask: oldCurrentTask,
+                    oldPrefetchTask: oldPrefetchTask,
+                    operationGeneration: generation,
+                    prefetchGeneration: prefetchGeneration,
+                    prefetchRequestGeneration: prefetchRequestGeneration
+                )
+            },
+            onCancel: { [weak self] in
+                Task { @MainActor in
+                    self?.invalidatePrefetchIfCurrent(
+                        operationGeneration: generation,
+                        prefetchGeneration: prefetchGeneration,
+                        prefetchRequestGeneration: prefetchRequestGeneration
+                    )
+                }
+            }
+        )
+    }
+
+    private func prefetchInitial(
+        from startLocator: Locator?,
+        oldCurrentTask: Task<Void, Never>?,
+        oldPrefetchTask: Task<Void, Never>?,
+        operationGeneration generation: UInt64,
+        prefetchGeneration: UInt64,
+        prefetchRequestGeneration: UInt64
+    ) async -> Bool {
+        defer {
+            if Task.isCancelled {
+                invalidatePrefetchIfCurrent(
+                    operationGeneration: generation,
+                    prefetchGeneration: prefetchGeneration,
+                    prefetchRequestGeneration: prefetchRequestGeneration
+                )
+            }
+        }
+        await oldCurrentTask?.value
+        await oldPrefetchTask?.value
+        guard !Task.isCancelled else { return false }
+        guard
+            generation == operationGeneration,
+            prefetchGeneration == self.prefetchGeneration
+        else {
+            return false
+        }
+        publicationIterator = publication.content(from: startLocator)?.iterator()
+        guard let utterance = await nextUtterance(.forward, generation: generation) else { return false }
+        guard !Task.isCancelled else { return false }
+        guard
+            generation == operationGeneration,
+            prefetchGeneration == self.prefetchGeneration
+        else {
+            return false
+        }
+        guard let engine = engine as? TTSPrefetchingEngine else {
+            return false
+        }
+        guard let prefetchDuration = await engine.prefetch(
+            ttsUtterance(for: utterance),
+            maximumDuration: Self.maximumSingleUtterancePrefetchDuration
+        ),
+        prefetchDuration.isFinite,
+        prefetchDuration > 0,
+        prefetchDuration <= Self.maximumSingleUtterancePrefetchDuration
+        else { return false }
+        guard !Task.isCancelled else { return false }
+        guard
+            generation == operationGeneration,
+            prefetchGeneration == self.prefetchGeneration
+        else {
+            return false
+        }
+        preparedStartLocator = startLocator
+        preparedUtterance = utterance
+
+        startForwardPrefetch(
+            generation: generation,
+            prefetchGeneration: prefetchGeneration
+        )
+        let forwardPrefetchTask = forwardPrefetchTask
+        await forwardPrefetchTask?.value
+        guard !Task.isCancelled else { return false }
+        guard
+            generation == operationGeneration,
+            prefetchGeneration == self.prefetchGeneration
+        else {
+            return false
+        }
+        return true
+    }
+
     /// (Re)starts the synthesizer from the given locator or the beginning of the publication.
     public func start(from startLocator: Locator? = nil) {
         audioSession.start(with: audioSessionUser, isPlaying: false)
 
-        currentTask?.cancel()
+        let oldCurrentTask = currentTask
+        oldCurrentTask?.cancel()
+        if
+            preparedStartLocator == startLocator,
+            let utterance = preparedUtterance
+        {
+            preparedStartLocator = nil
+            preparedUtterance = nil
+            prefetchRequestGeneration &+= 1
+            let generation = operationGeneration
+            currentTask = Task {
+                await oldCurrentTask?.value
+                guard generation == self.operationGeneration else { return }
+                await play(utterance, generation: generation)
+            }
+            return
+        }
+        operationGeneration &+= 1
+        let generation = operationGeneration
+        let oldPrefetchTask = invalidatePrefetch()
+        setStartText(from: startLocator)
+        publicationIterator = nil
+        currentTask = Task {
+            await oldCurrentTask?.value
+            await oldPrefetchTask?.value
+            guard generation == self.operationGeneration else { return }
+            self.publicationIterator = self.publication.content(from: startLocator)?.iterator()
+            await playNextUtterance(.forward, generation: generation)
+        }
+    }
+
+    private func setStartText(from startLocator: Locator?) {
         if let text = startLocator?.text, text.before != nil {
             startText = text
         } else {
             startText = nil
-        }
-        publicationIterator = publication.content(from: startLocator)?.iterator()
-        currentTask = Task {
-            await playNextUtterance(.forward)
         }
     }
 
@@ -219,6 +395,8 @@ public class PublicationSpeechSynthesizer: Loggable {
     /// Use `start()` to restart it.
     public func stop() {
         currentTask?.cancel()
+        operationGeneration &+= 1
+        invalidatePrefetch()
         state = .stopped
         publicationIterator = nil
     }
@@ -228,6 +406,8 @@ public class PublicationSpeechSynthesizer: Loggable {
     /// Use `resume()` to restart the playback from the same utterance.
     public func pause() {
         currentTask?.cancel()
+        operationGeneration &+= 1
+        invalidatePrefetch()
         if case let .playing(utterance, range: _) = state {
             state = .paused(utterance)
         }
@@ -235,10 +415,17 @@ public class PublicationSpeechSynthesizer: Loggable {
 
     /// Resumes an utterance interrupted with `pause()`.
     public func resume() {
-        currentTask?.cancel()
+        let oldCurrentTask = currentTask
+        oldCurrentTask?.cancel()
         if case let .paused(utterance) = state {
+            operationGeneration &+= 1
+            let generation = operationGeneration
+            let oldPrefetchTask = invalidatePrefetch()
             currentTask = Task {
-                await play(utterance)
+                await oldCurrentTask?.value
+                await oldPrefetchTask?.value
+                guard generation == self.operationGeneration else { return }
+                await play(utterance, generation: generation)
             }
         }
     }
@@ -254,17 +441,37 @@ public class PublicationSpeechSynthesizer: Loggable {
 
     /// Skips to the previous utterance.
     public func previous() {
-        currentTask?.cancel()
+        let oldCurrentTask = currentTask
+        oldCurrentTask?.cancel()
+        operationGeneration &+= 1
+        let generation = operationGeneration
+        let oldPrefetchTask = invalidatePrefetch()
         currentTask = Task {
-            await playNextUtterance(.backward)
+            await oldCurrentTask?.value
+            await oldPrefetchTask?.value
+            guard generation == self.operationGeneration else { return }
+            await rollbackForwardBuffer(generation: generation)
+            guard generation == self.operationGeneration else { return }
+            await playNextUtterance(.backward, generation: generation)
         }
     }
 
     /// Skips to the next utterance.
     public func next() {
-        currentTask?.cancel()
+        let oldCurrentTask = currentTask
+        oldCurrentTask?.cancel()
+        operationGeneration &+= 1
+        let generation = operationGeneration
+        let oldPrefetchTask = invalidatePrefetch()
         currentTask = Task {
-            await playNextUtterance(.forward)
+            await oldCurrentTask?.value
+            await oldPrefetchTask?.value
+            guard generation == self.operationGeneration else { return }
+            if requiresForwardBufferRollback {
+                await rollbackForwardBuffer(generation: generation)
+                guard generation == self.operationGeneration else { return }
+            }
+            await playNextUtterance(.forward, generation: generation)
         }
     }
 
@@ -272,37 +479,70 @@ public class PublicationSpeechSynthesizer: Loggable {
     private var publicationIterator: ContentIterator? {
         didSet {
             utterances = CursorList()
+            forwardGroups = []
+            trailingForwardAdvanceCount = 0
+            requiresForwardBufferRollback = false
+            pendingIteratorResult = nil
         }
     }
 
     private var startText: Locator.Text?
+    private var preparedStartLocator: Locator?
+    private var preparedUtterance: Utterance?
 
     /// Utterances for the current publication `ContentElement` item.
     private var utterances: CursorList<Utterance> = CursorList()
+    private var forwardGroups: [BufferedUtteranceGroup] = []
+    private var trailingForwardAdvanceCount = 0
+    private var requiresForwardBufferRollback = false
+    private var pendingIteratorResult: (
+        iterator: ContentIterator,
+        direction: Direction,
+        content: ContentElement
+    )?
+
+    private func isCurrentOperation(
+        _ generation: UInt64,
+        iterator: ContentIterator? = nil
+    ) -> Bool {
+        !Task.isCancelled &&
+            generation == operationGeneration &&
+            (iterator == nil || publicationIterator === iterator)
+    }
 
     /// Plays the next utterance in the given `direction`.
-    private func playNextUtterance(_ direction: Direction) async {
-        guard let utterance = await nextUtterance(direction) else {
+    private func playNextUtterance(
+        _ direction: Direction,
+        generation: UInt64
+    ) async {
+        guard let utterance = await nextUtterance(direction, generation: generation) else {
+            guard generation == operationGeneration else { return }
             state = .stopped
             return
         }
-        await play(utterance)
+        guard generation == operationGeneration else { return }
+        await play(utterance, generation: generation)
     }
 
     /// Plays the given `utterance` with the TTS `engine`.
-    private func play(_ utterance: Utterance) async {
+    private func play(
+        _ utterance: Utterance,
+        generation: UInt64
+    ) async {
+        let ttsUtterance = ttsUtterance(for: utterance)
         state = .playing(utterance, range: nil)
+        guard !Task.isCancelled, generation == operationGeneration else {
+            return
+        }
+        var didStartPrefetch = false
 
         let result = await engine.speak(
-            TTSUtterance(
-                text: utterance.text,
-                delay: 0,
-                voiceOrLanguage: voiceOrLanguage(for: utterance)
-            ),
+            ttsUtterance,
             onSpeakRange: { [weak self] range in
                 guard let self = self else {
                     return
                 }
+                guard generation == self.operationGeneration else { return }
 
                 self.state = .playing(
                     utterance,
@@ -318,20 +558,46 @@ public class PublicationSpeechSynthesizer: Loggable {
                         }
                     )
                 )
+                guard generation == self.operationGeneration else { return }
+                if !didStartPrefetch {
+                    didStartPrefetch = true
+                    self.startForwardPrefetch(generation: generation)
+                }
             }
         )
 
-        guard !Task.isCancelled else {
+        guard
+            !Task.isCancelled,
+            generation == operationGeneration
+        else {
             return
         }
 
         switch result {
         case .success:
-            await playNextUtterance(.forward)
+            let canContinueImmediately = !readyForwardPrefetches.isEmpty
+            if canContinueImmediately {
+                readyForwardPrefetches.removeFirst()
+            } else {
+                let oldPrefetchTask = invalidatePrefetch()
+                await oldPrefetchTask?.value
+            }
+            guard generation == operationGeneration else { return }
+            await playNextUtterance(.forward, generation: generation)
         case let .failure(error):
+            invalidatePrefetch()
             state = .paused(utterance)
-            await delegate?.publicationSpeechSynthesizer(self, utterance: utterance, didFailWithError: .engine(error))
+            delegate?.publicationSpeechSynthesizer(self, utterance: utterance, didFailWithError: .engine(error))
         }
+    }
+
+    private func ttsUtterance(for utterance: Utterance) -> TTSUtterance {
+        TTSUtterance(
+            text: utterance.text,
+            delay: 0,
+            prefetchIdentifier: utterance.prefetchIdentifier,
+            voiceOrLanguage: voiceOrLanguage(for: utterance)
+        )
     }
 
     /// Returns the user selected voice if it's compatible with the utterance language. Otherwise, falls back on
@@ -351,10 +617,14 @@ public class PublicationSpeechSynthesizer: Loggable {
     }
 
     /// Gets the next utterance in the given `direction`, or null when reaching the beginning or the end.
-    private func nextUtterance(_ direction: Direction) async -> Utterance? {
+    private func nextUtterance(
+        _ direction: Direction,
+        generation: UInt64
+    ) async -> Utterance? {
+        guard isCurrentOperation(generation) else { return nil }
         guard let utterance = utterances.next(direction) else {
-            if await loadNextUtterances(direction) {
-                return await nextUtterance(direction)
+            if await loadNextUtterances(direction, generation: generation) {
+                return await nextUtterance(direction, generation: generation)
             }
             return nil
         }
@@ -362,16 +632,92 @@ public class PublicationSpeechSynthesizer: Loggable {
     }
 
     /// Loads the utterances for the next publication `ContentElement` item in the given `direction`.
-    private func loadNextUtterances(_ direction: Direction) async -> Bool {
-        do {
-            var nextUtterances: [Utterance] = []
-            while nextUtterances.isEmpty {
-                guard let content = try await publicationIterator?.next(direction) else {
+    private func loadNextUtterances(
+        _ direction: Direction,
+        generation: UInt64
+    ) async -> Bool {
+        guard isCurrentOperation(generation) else { return false }
+        if direction == .forward, !forwardGroups.isEmpty {
+            guard let iterator = publicationIterator else { return false }
+            let group = forwardGroups.removeFirst()
+            func restoreGroup() {
+                guard publicationIterator === iterator else { return }
+                forwardGroups.insert(group, at: 0)
+            }
+            do {
+                let nextUtterances = try group.utterances ?? tokenize(group.content)
+                    .flatMap { utterances(for: $0) }
+                guard !nextUtterances.isEmpty else {
+                    if forwardGroups.isEmpty {
+                        trailingForwardAdvanceCount += group.iteratorAdvanceCount
+                    } else {
+                        forwardGroups[0] = forwardGroups[0]
+                            .addingIteratorAdvanceCount(group.iteratorAdvanceCount)
+                    }
+                    return await loadNextUtterances(direction, generation: generation)
+                }
+                guard isCurrentOperation(generation, iterator: iterator) else {
+                    restoreGroup()
                     return false
+                }
+                utterances = CursorList(list: nextUtterances, startIndex: 0)
+                return true
+            } catch {
+                restoreGroup()
+                log(.error, error)
+                return false
+            }
+        }
+        do {
+            guard let iterator = publicationIterator else { return false }
+            var nextUtterances: [Utterance] = []
+            var usesPendingResult = false
+            while nextUtterances.isEmpty {
+                guard isCurrentOperation(generation, iterator: iterator) else {
+                    return false
+                }
+                let content: ContentElement
+                if
+                    let pending = pendingIteratorResult,
+                    pending.iterator === iterator
+                {
+                    if pending.direction == direction {
+                        content = pending.content
+                        usesPendingResult = true
+                    } else {
+                        guard try await iterator.next(pending.direction.opposite) != nil else {
+                            return false
+                        }
+                        pendingIteratorResult = nil
+                        guard isCurrentOperation(generation, iterator: iterator) else {
+                            return false
+                        }
+                        continue
+                    }
+                } else {
+                    pendingIteratorResult = nil
+                    guard let nextContent = try await iterator.next(direction) else {
+                        return false
+                    }
+                    guard isCurrentOperation(generation, iterator: iterator) else {
+                        if publicationIterator === iterator {
+                            pendingIteratorResult = (iterator, direction, nextContent)
+                        }
+                        return false
+                    }
+                    content = nextContent
+                    usesPendingResult = false
                 }
 
                 nextUtterances = try tokenize(content)
                     .flatMap { utterances(for: $0) }
+                if usesPendingResult, nextUtterances.isEmpty {
+                    pendingIteratorResult = nil
+                }
+            }
+
+            guard isCurrentOperation(generation, iterator: iterator) else {
+                return false
             }
 
             utterances = CursorList(
@@ -383,12 +729,291 @@ public class PublicationSpeechSynthesizer: Loggable {
                     }
                 }()
             )
+            if direction == .forward {
+                trailingForwardAdvanceCount = 0
+            }
+            if usesPendingResult {
+                pendingIteratorResult = nil
+            }
 
             return true
 
+        } catch is CancellationError {
+            return false
         } catch {
             log(.error, error)
             return false
+        }
+    }
+
+    private func startForwardPrefetch(
+        generation: UInt64,
+        prefetchGeneration requestedPrefetchGeneration: UInt64? = nil
+    ) {
+        guard
+            forwardPrefetchTask == nil,
+            engine is TTSPrefetchingEngine
+        else {
+            return
+        }
+        let prefetchGeneration: UInt64
+        if let requestedPrefetchGeneration {
+            prefetchGeneration = requestedPrefetchGeneration
+        } else {
+            self.prefetchGeneration &+= 1
+            prefetchGeneration = self.prefetchGeneration
+        }
+        let cancellationTask = prefetchCancellationTask
+        forwardPrefetchTask = Task { [weak self] in
+            guard let self else { return }
+            await cancellationTask?.value
+            guard
+                operationGeneration == self.operationGeneration,
+                prefetchGeneration == self.prefetchGeneration
+            else {
+                return
+            }
+            await self.prefetchForward(
+                operationGeneration: generation,
+                prefetchGeneration: prefetchGeneration
+            )
+            guard
+                operationGeneration == self.operationGeneration,
+                prefetchGeneration == self.prefetchGeneration
+            else {
+                return
+            }
+            self.forwardPrefetchTask = nil
+        }
+    }
+
+    private func prefetchForward(
+        operationGeneration: UInt64,
+        prefetchGeneration: UInt64
+    ) async {
+        guard let engine = engine as? TTSPrefetchingEngine else { return }
+        var candidates = Array(utterances.elementsAfterCurrent()) +
+            forwardGroups.flatMap { $0.utterances ?? [] }
+        var candidateIndex = 0
+        var prefetchedIdentifiers = Set(readyForwardPrefetches.map(\.identifier))
+        var duration = readyForwardPrefetches.reduce(into: 0) { $0 += $1.duration }
+
+        while duration < Self.maximumPrefetchDuration {
+            guard
+                !Task.isCancelled,
+                operationGeneration == self.operationGeneration,
+                prefetchGeneration == self.prefetchGeneration
+            else {
+                return
+            }
+
+            if candidateIndex == candidates.count {
+                guard
+                    let group = await loadForwardGroupForPrefetch(
+                        operationGeneration: operationGeneration,
+                        prefetchGeneration: prefetchGeneration
+                    )
+                else {
+                    return
+                }
+                guard
+                    !Task.isCancelled,
+                    operationGeneration == self.operationGeneration,
+                    prefetchGeneration == self.prefetchGeneration
+                else {
+                    return
+                }
+                candidates.append(contentsOf: group.utterances ?? [])
+            }
+
+            let utterance = candidates[candidateIndex]
+            candidateIndex += 1
+            guard prefetchedIdentifiers.insert(utterance.prefetchIdentifier).inserted else {
+                continue
+            }
+            guard let prefetchedDuration = await engine.prefetch(
+                ttsUtterance(for: utterance),
+                maximumDuration: Self.maximumSingleUtterancePrefetchDuration
+            ) else {
+                return
+            }
+            guard
+                prefetchedDuration.isFinite,
+                prefetchedDuration > 0,
+                prefetchedDuration <= Self.maximumSingleUtterancePrefetchDuration
+            else {
+                return
+            }
+            guard
+                !Task.isCancelled,
+                operationGeneration == self.operationGeneration,
+                prefetchGeneration == self.prefetchGeneration
+            else {
+                return
+            }
+            readyForwardPrefetches.append(
+                ForwardPrefetch(
+                    identifier: utterance.prefetchIdentifier,
+                    duration: prefetchedDuration
+                )
+            )
+            duration += prefetchedDuration
+        }
+    }
+
+    private func loadForwardGroupForPrefetch(
+        operationGeneration: UInt64,
+        prefetchGeneration: UInt64
+    ) async -> BufferedUtteranceGroup? {
+        guard let iterator = publicationIterator else { return nil }
+        var contentToPreserve: ContentElement?
+        var advanceCount = 0
+        do {
+            advanceCount = trailingForwardAdvanceCount
+            trailingForwardAdvanceCount = 0
+            while true {
+                guard publicationIterator === iterator else {
+                    return nil
+                }
+                guard let content = try await iterator.next() else {
+                    if publicationIterator === iterator {
+                        trailingForwardAdvanceCount = advanceCount
+                    }
+                    return nil
+                }
+                advanceCount += 1
+                guard publicationIterator === iterator else {
+                    return nil
+                }
+                contentToPreserve = content
+                let nextUtterances = try tokenize(content)
+                    .flatMap { utterances(for: $0) }
+                if !nextUtterances.isEmpty {
+                    let group = BufferedUtteranceGroup(
+                        content: content,
+                        utterances: nextUtterances,
+                        iteratorAdvanceCount: advanceCount
+                    )
+                    forwardGroups.append(group)
+                    return group
+                }
+                guard
+                    publicationIterator === iterator,
+                    prefetchGeneration == self.prefetchGeneration
+                else {
+                    trailingForwardAdvanceCount = advanceCount
+                    return nil
+                }
+            }
+        } catch {
+            if !(error is CancellationError) {
+                log(.error, error)
+            }
+            if let content = contentToPreserve, publicationIterator === iterator {
+                forwardGroups.append(
+                    BufferedUtteranceGroup(
+                        content: content,
+                        utterances: nil,
+                        iteratorAdvanceCount: advanceCount
+                    )
+                )
+            } else if publicationIterator === iterator {
+                trailingForwardAdvanceCount = advanceCount
+            }
+            return nil
+        }
+    }
+
+    private func invalidatePrefetchIfCurrent(
+        operationGeneration: UInt64,
+        prefetchGeneration: UInt64,
+        prefetchRequestGeneration: UInt64
+    ) {
+        guard
+            operationGeneration == self.operationGeneration,
+            prefetchGeneration == self.prefetchGeneration,
+            prefetchRequestGeneration == self.prefetchRequestGeneration
+        else {
+            return
+        }
+        invalidatePrefetch()
+    }
+
+    @discardableResult
+    private func invalidatePrefetch() -> Task<Void, Never>? {
+        prefetchGeneration &+= 1
+        readyForwardPrefetches = []
+        preparedStartLocator = nil
+        preparedUtterance = nil
+        let task = forwardPrefetchTask
+        forwardPrefetchTask = nil
+        task?.cancel()
+        guard
+            task != nil ||
+            engineStorage is TTSPrefetchingEngine ||
+            prefetchCancellationTask != nil
+        else {
+            return nil
+        }
+        let engine = engineStorage as? TTSPrefetchingEngine
+        engine?.cancelPrefetch()
+        let previousCancellation = prefetchCancellationTask
+        prefetchCancellationGeneration &+= 1
+        let cancellationGeneration = prefetchCancellationGeneration
+        let cancellation = Task { [weak self] in
+            await previousCancellation?.value
+            await task?.value
+            guard
+                let self,
+                cancellationGeneration == self.prefetchCancellationGeneration
+            else {
+                return
+            }
+            self.prefetchCancellationTask = nil
+        }
+        prefetchCancellationTask = cancellation
+        return cancellation
+    }
+
+    private func rollbackForwardBuffer(generation: UInt64) async {
+        guard isCurrentOperation(generation) else { return }
+        let advanceCount = forwardGroups.reduce(trailingForwardAdvanceCount) {
+            $0 + $1.iteratorAdvanceCount
+        }
+        forwardGroups = []
+        trailingForwardAdvanceCount = 0
+        guard let iterator = publicationIterator else { return }
+
+        func preserveRemainingAdvances(_ remaining: Int) {
+            guard publicationIterator === iterator else { return }
+            trailingForwardAdvanceCount = remaining
+            requiresForwardBufferRollback = remaining > 0
+        }
+
+        var completed = 0
+        do {
+            for _ in 0 ..< advanceCount {
+                guard isCurrentOperation(generation, iterator: iterator) else {
+                    preserveRemainingAdvances(advanceCount - completed)
+                    return
+                }
+                guard try await iterator.previous() != nil else {
+                    preserveRemainingAdvances(advanceCount - completed)
+                    return
+                }
+                completed += 1
+                guard isCurrentOperation(generation, iterator: iterator) else {
+                    preserveRemainingAdvances(advanceCount - completed)
+                    return
+                }
+            }
+            requiresForwardBufferRollback = false
+        } catch is CancellationError {
+            preserveRemainingAdvances(advanceCount - completed)
+            return
+        } catch {
+            preserveRemainingAdvances(advanceCount - completed)
+            log(.error, error)
         }
     }
 
@@ -403,8 +1028,8 @@ public class PublicationSpeechSynthesizer: Loggable {
             let tokenizer = tokenizerFactory(config.defaultLanguage ?? publication.metadata.language)
             return try tokenizer(element)
         }
+        defer { self.startText = nil }
 
-        self.startText = nil
         if let offset = textOffset(in: first, for: startText) {
             first.segments = trimming(first.segments, before: offset)
         }
@@ -539,8 +1164,29 @@ public class PublicationSpeechSynthesizer: Loggable {
     }
 }
 
-private enum Direction {
+private struct BufferedUtteranceGroup {
+    let content: ContentElement
+    let utterances: [PublicationSpeechSynthesizer.Utterance]?
+    let iteratorAdvanceCount: Int
+
+    func invalidatingPrefetch() -> Self {
+        .init(content: content, utterances: nil, iteratorAdvanceCount: iteratorAdvanceCount)
+    }
+
+    func addingIteratorAdvanceCount(_ count: Int) -> Self {
+        .init(content: content, utterances: utterances, iteratorAdvanceCount: iteratorAdvanceCount + count)
+    }
+}
+
+private enum Direction: Equatable {
     case forward, backward
+
+    var opposite: Self {
+        switch self {
+        case .forward: return .backward
+        case .backward: return .forward
+        }
+    }
 }
 
 private extension CursorList {

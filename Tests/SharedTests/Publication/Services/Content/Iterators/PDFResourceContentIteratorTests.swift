@@ -223,6 +223,67 @@ enum PDFResourceContentIteratorTests {
             }
         }
 
+        @Test func cancellationDoesNotWaitForOpenDocument() async throws {
+            let gate = AsyncGate()
+            let openCount = LockedCounter()
+            let document = MockPDFDocument(texts: ["first"])
+            let iterator = PDFResourceContentIterator(
+                openDocument: {
+                    openCount.increment()
+                    await gate.wait()
+                    return document
+                },
+                resourceInfo: { PDFResourceContentIterator.ResourceInfo(positionOffset: 0, totalProgressionRange: nil) },
+                locator: Locator(href: "mock.pdf", mediaType: .pdf)
+            )
+            let task = Task { try await iterator.next() }
+            guard await gate.waitForWaiters() else {
+                task.cancel()
+                gate.open()
+                Issue.record("Timed out waiting for openDocument()")
+                return
+            }
+            task.cancel()
+
+            await #expect(throws: CancellationError.self) {
+                _ = try await task.value
+            }
+            #expect(!gate.isOpen)
+
+            let second = Task { try await iterator.next() }
+            gate.open()
+            #expect(try await (second.value as? TextContentElement)?.text == "first")
+            #expect(openCount.value == 1)
+        }
+
+        @Test func cancelledPageExtractionIsReusedInsteadOfStartedConcurrently() async throws {
+            let gate = AsyncGate()
+            let document = GatedPDFDocument(gate: gate)
+            let iterator = PDFResourceContentIterator(
+                openDocument: { document },
+                resourceInfo: { PDFResourceContentIterator.ResourceInfo(positionOffset: 0, totalProgressionRange: nil) },
+                locator: Locator(href: "mock.pdf", mediaType: .pdf)
+            )
+
+            let first = Task { try await iterator.next() }
+            guard await gate.waitForWaiters() else {
+                first.cancel()
+                gate.open()
+                Issue.record("Timed out waiting for pageText()")
+                return
+            }
+            first.cancel()
+            await #expect(throws: CancellationError.self) {
+                _ = try await first.value
+            }
+
+            let second = Task { try await iterator.next() }
+            gate.open()
+            #expect(try await (second.value as? TextContentElement)?.text == "first")
+            #expect(document.pageTextCallCount == 1)
+            #expect(document.maximumConcurrentPageTextCalls == 1)
+        }
+
         @Test func documentWithoutTextSupportProducesNoElements() async throws {
             let iter = PDFResourceContentIterator(
                 openDocument: { MockNonTextPDFDocument() },
@@ -313,7 +374,7 @@ private func makeIterator(
 
 // MARK: - Mock PDF Documents
 
-private class MockPDFDocument: PDFDocumentTextProviding {
+private class MockPDFDocument: PDFDocumentTextProviding, @unchecked Sendable {
     private let texts: [String?]
     private(set) var requestedPageIndices: [Int] = []
 
@@ -403,6 +464,38 @@ private class MockNonTextPDFDocument: PDFDocument {
     func tableOfContents() async throws -> [PDFOutlineNode] {
         []
     }
+}
+
+private final class GatedPDFDocument: MockPDFDocument, @unchecked Sendable {
+    private let gate: AsyncGate
+    private let lock = NSLock()
+    private var activePageTextCalls = 0
+    private(set) var maximumConcurrentPageTextCalls = 0
+    private(set) var pageTextCallCount = 0
+
+    init(gate: AsyncGate) {
+        self.gate = gate
+        super.init(texts: ["first"])
+    }
+
+    override func pageText(at pageIndex: Int) async throws -> String? {
+        lock.withLock {
+            pageTextCallCount += 1
+            activePageTextCalls += 1
+            maximumConcurrentPageTextCalls = max(maximumConcurrentPageTextCalls, activePageTextCalls)
+        }
+        await gate.wait()
+        lock.withLock { activePageTextCalls -= 1 }
+        return "first"
+    }
+}
+
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int { lock.withLock { count } }
+    func increment() { lock.withLock { count += 1 } }
 }
 
 private func makeIteratorFromMock(

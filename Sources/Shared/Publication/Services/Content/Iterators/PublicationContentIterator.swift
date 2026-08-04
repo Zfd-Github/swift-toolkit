@@ -25,7 +25,7 @@ public class PublicationContentIterator: ContentIterator, Loggable {
     /// `ContentIterator` for a resource, associated with its index in the reading order.
     private typealias IndexedIterator = (index: Int, iterator: ContentIterator)
 
-    private enum Direction: Int {
+    private enum Direction: Int, Hashable {
         case forward = 1
         case backward = -1
     }
@@ -33,6 +33,7 @@ public class PublicationContentIterator: ContentIterator, Loggable {
     private let publication: Publication
     private var startLocator: Locator?
     private var _currentIterator: IndexedIterator?
+    private var pendingIterators: [Direction: IndexedIterator] = [:]
 
     /// List of `ResourceContentIteratorFactory` which will be used to create the iterator for each resource. The
     /// factories are tried in order until there's a match.
@@ -53,10 +54,20 @@ public class PublicationContentIterator: ContentIterator, Loggable {
     }
 
     private func next(_ direction: Direction) async throws -> ContentElement? {
+        try Task.checkCancellation()
         guard let iterator = await currentIterator() else {
             return nil
         }
+        try Task.checkCancellation()
 
+        return try await next(direction, from: iterator, commitOnSuccess: false)
+    }
+
+    private func next(
+        _ direction: Direction,
+        from iterator: IndexedIterator,
+        commitOnSuccess: Bool
+    ) async throws -> ContentElement? {
         let content: ContentElement? = try await {
             switch direction {
             case .forward:
@@ -65,15 +76,33 @@ public class PublicationContentIterator: ContentIterator, Loggable {
                 return try await iterator.iterator.previous()
             }
         }()
-        guard content != nil else {
-            guard let nextIterator = await nextIterator(direction, fromIndex: iterator.index) else {
-                return nil
+        if let content {
+            if commitOnSuccess {
+                _currentIterator = iterator
+                pendingIterators.removeAll()
             }
-            _currentIterator = nextIterator
-            return try await next(direction)
+            return content
         }
 
-        return content
+        if
+            commitOnSuccess,
+            pendingIterators[direction]?.iterator === iterator.iterator
+        {
+            pendingIterators.removeValue(forKey: direction)
+        }
+        try Task.checkCancellation()
+        let candidate: IndexedIterator
+        if let pending = pendingIterators[direction] {
+            candidate = pending
+        } else {
+            guard let next = await nextIterator(direction, fromIndex: iterator.index) else {
+                return nil
+            }
+            pendingIterators[direction] = next
+            candidate = next
+        }
+        try Task.checkCancellation()
+        return try await next(direction, from: candidate, commitOnSuccess: true)
     }
 
     /// Returns the `ContentIterator` for the current `Resource` in the reading order.

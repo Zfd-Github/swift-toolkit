@@ -305,13 +305,83 @@ public extension ContentAttributesHolder {
 /// Iterates through a list of `ContentElement` items.
 public protocol ContentIterator: AnyObject {
     /// Retrieves the next element, or nil if we reached the end.
+    ///
+    /// A pending call must return promptly when its task is cancelled,
+    /// typically by throwing `CancellationError`. If this method throws, it
+    /// must leave the iteration position unchanged. Once the position moves,
+    /// it must return the corresponding element even if cancellation occurs.
     func next() async throws -> ContentElement?
 
     /// Advances to the previous item and returns it, or null if we reached the beginning.
+    ///
+    /// A pending call must return promptly when its task is cancelled,
+    /// typically by throwing `CancellationError`. If this method throws, it
+    /// must leave the iteration position unchanged. Once the position moves,
+    /// it must return the corresponding element even if cancellation occurs.
     func previous() async throws -> ContentElement?
 }
 
+final class SharedTaskValue<Success>: @unchecked Sendable {
+    typealias Output = Result<Success, Error>
+
+    private let lock = NSLock()
+    private var output: Output?
+    private var waiters: [UUID: CheckedContinuation<Output, Never>] = [:]
+    private var task: Task<Void, Never>?
+
+    init(_ operation: @escaping () async -> Output) {
+        task = Task { [weak self] in
+            let output = await operation()
+            self?.complete(with: output)
+        }
+    }
+
+    deinit {
+        task?.cancel()
+    }
+
+    func value() async throws -> Success {
+        let id = UUID()
+        let output = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let output = lock.withLock { () -> Output? in
+                    if Task<Never, Never>.isCancelled {
+                        return .failure(CancellationError())
+                    }
+                    if let output = self.output {
+                        return output
+                    }
+                    waiters[id] = continuation
+                    return nil
+                }
+                if let output {
+                    continuation.resume(returning: output)
+                }
+            }
+        } onCancel: {
+            let waiter = lock.withLock {
+                waiters.removeValue(forKey: id)
+            }
+            waiter?.resume(returning: .failure(CancellationError()))
+        }
+        try Task.checkCancellation()
+        return try output.get()
+    }
+
+    private func complete(with output: Output) {
+        let waiters = lock.withLock {
+            self.output = output
+            defer { self.waiters = [:] }
+            return Array(self.waiters.values)
+        }
+        waiters.forEach { $0.resume(returning: output) }
+    }
+}
+
 /// Helper class to treat a `Content` as a `Sequence`.
+///
+/// Cancellation ends the sequence with `nil`; callers needing to distinguish
+/// it from normal exhaustion can check `Task.isCancelled` after iteration.
 public class ContentSequence: AsyncSequence {
     public typealias Element = ContentElement
 
@@ -335,6 +405,8 @@ public class ContentSequence: AsyncSequence {
         public func next() async -> ContentElement? {
             do {
                 return try await iterator.next()
+            } catch is CancellationError {
+                return nil
             } catch {
                 log(.warning, error)
                 return await next()

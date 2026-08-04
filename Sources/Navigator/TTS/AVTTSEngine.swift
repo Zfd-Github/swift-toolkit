@@ -42,6 +42,8 @@ public class AVTTSEngine: NSObject, TTSEngine, AVSpeechSynthesizerDelegate, Logg
     private let debug: Bool = false
     private let synthesizer = AVSpeechSynthesizer()
     private let speechOutput: any AVSpeechOutput
+    private let resolveVoiceIdentifier: (String) -> AVSpeechSynthesisVoice?
+    private let resolveVoiceLanguage: (Language) -> AVSpeechSynthesisVoice?
 
     /// Creates a new `AVTTSEngine` instance.
     public init(
@@ -49,6 +51,8 @@ public class AVTTSEngine: NSObject, TTSEngine, AVSpeechSynthesizerDelegate, Logg
     ) {
         self.delegate = delegate
         speechOutput = SystemAVSpeechOutput(synthesizer: synthesizer)
+        resolveVoiceIdentifier = { AVSpeechSynthesisVoice(identifier: $0) }
+        resolveVoiceLanguage = { AVSpeechSynthesisVoice(language: $0) }
 
         super.init()
         synthesizer.delegate = self
@@ -56,10 +60,14 @@ public class AVTTSEngine: NSObject, TTSEngine, AVSpeechSynthesizerDelegate, Logg
 
     init(
         delegate: AVTTSEngineDelegate? = nil,
-        speechOutput: any AVSpeechOutput
+        speechOutput: any AVSpeechOutput,
+        resolveVoiceIdentifier: @escaping (String) -> AVSpeechSynthesisVoice?,
+        resolveVoiceLanguage: @escaping (Language) -> AVSpeechSynthesisVoice?
     ) {
         self.delegate = delegate
         self.speechOutput = speechOutput
+        self.resolveVoiceIdentifier = resolveVoiceIdentifier
+        self.resolveVoiceLanguage = resolveVoiceLanguage
         super.init()
     }
 
@@ -82,7 +90,7 @@ public class AVTTSEngine: NSObject, TTSEngine, AVSpeechSynthesizerDelegate, Logg
             .map { TTSVoice(voice: $0) }
 
     public func voiceWithIdentifier(_ id: String) -> TTSVoice? {
-        AVSpeechSynthesisVoice(identifier: id)
+        resolveVoiceIdentifier(id)
             .map { TTSVoice(voice: $0) }
     }
 
@@ -123,7 +131,7 @@ public class AVTTSEngine: NSObject, TTSEngine, AVSpeechSynthesizerDelegate, Logg
 
         let voiceSelection: VoiceSelection
         if let identifier {
-            guard let voice = AVSpeechSynthesisVoice(identifier: identifier) else {
+            guard let voice = resolveVoiceIdentifier(identifier) else {
                 return false
             }
             voiceSelection = .explicit(voice)
@@ -460,7 +468,7 @@ public class AVTTSEngine: NSObject, TTSEngine, AVSpeechSynthesizerDelegate, Logg
     private func voice(for task: Task) -> AVSpeechSynthesisVoice? {
         switch task.voiceSelection {
         case .system:
-            return AVSpeechSynthesisVoice(language: task.utterance.language)
+            return resolveVoiceLanguage(task.utterance.language)
         case let .explicit(voice):
             return voice
         case .utterance:
@@ -469,9 +477,9 @@ public class AVTTSEngine: NSObject, TTSEngine, AVSpeechSynthesizerDelegate, Logg
 
         switch task.utterance.voiceOrLanguage {
         case let .left(voice):
-            return AVSpeechSynthesisVoice(identifier: voice.identifier)
+            return resolveVoiceIdentifier(voice.identifier)
         case let .right(language):
-            return AVSpeechSynthesisVoice(language: language)
+            return resolveVoiceLanguage(language)
         }
     }
 }

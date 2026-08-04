@@ -96,6 +96,19 @@ public class PDFResourceContentIterator: ContentIterator, Loggable {
     /// Whether initialization has completed.
     private var initialized: Bool = false
 
+    private struct Initialization {
+        let resourceInfo: ResourceInfo
+        let document: (any PDFDocumentTextProviding)?
+        let pageCount: Int
+    }
+
+    private var initializationTask: SharedTaskValue<Initialization>?
+
+    private var pageTextTask: (
+        pageIndex: Int,
+        task: SharedTaskValue<String?>
+    )?
+
     /// Current page index (0-based). `nil` means iteration hasn't started yet.
     private var currentPageIndex: Int?
 
@@ -112,11 +125,13 @@ public class PDFResourceContentIterator: ContentIterator, Loggable {
     // MARK: - ContentIterator
 
     public func next() async throws -> ContentElement? {
+        try Task.checkCancellation()
         try await initializeIfNeeded()
 
         var pageIndex = (currentPageIndex ?? (startPageIndex - 1)) + 1
 
         while pageIndex < pageCount {
+            try Task.checkCancellation()
             if let element = try await elementForPage(at: pageIndex) {
                 currentPageIndex = pageIndex
                 return element
@@ -128,11 +143,13 @@ public class PDFResourceContentIterator: ContentIterator, Loggable {
     }
 
     public func previous() async throws -> ContentElement? {
+        try Task.checkCancellation()
         try await initializeIfNeeded()
 
         var pageIndex = (currentPageIndex ?? startPageIndex) - 1
 
         while pageIndex >= 0 {
+            try Task.checkCancellation()
             if let element = try await elementForPage(at: pageIndex) {
                 currentPageIndex = pageIndex
                 return element
@@ -146,21 +163,49 @@ public class PDFResourceContentIterator: ContentIterator, Loggable {
     // MARK: - Initialization
 
     private func initializeIfNeeded() async throws {
+        try Task.checkCancellation()
         guard !initialized else { return }
 
-        let info = await makeResourceInfo()
-        resourceInfo = info
-
-        let doc = try await openDocument()
-        guard let textDoc = doc as? PDFDocumentTextProviding else {
+        if initializationTask == nil {
+            let makeResourceInfo = makeResourceInfo
+            let openDocument = openDocument
+            initializationTask = SharedTaskValue {
+                do {
+                    let resourceInfo = await makeResourceInfo()
+                    let document = try await openDocument() as? PDFDocumentTextProviding
+                    let pageCount = try await document?.pageCount() ?? 0
+                    return .success(Initialization(
+                        resourceInfo: resourceInfo,
+                        document: document,
+                        pageCount: pageCount
+                    ))
+                } catch {
+                    return .failure(error)
+                }
+            }
+        }
+        guard let task = initializationTask else { return }
+        let initialization: Initialization
+        do {
+            initialization = try await task.value()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            initializationTask = nil
+            throw error
+        }
+        try Task.checkCancellation()
+        initializationTask = nil
+        resourceInfo = initialization.resourceInfo
+        document = initialization.document
+        pageCount = initialization.pageCount
+        guard document != nil else {
             log(.warning, "The PDF document does not support text extraction; no content elements will be produced.")
             initialized = true
             return
         }
 
-        document = textDoc
-        pageCount = try await textDoc.pageCount()
-        startPageIndex = computeStartPage(positionOffset: info.positionOffset)
+        startPageIndex = computeStartPage(positionOffset: initialization.resourceInfo.positionOffset)
         initialized = true
     }
 
@@ -192,14 +237,53 @@ public class PDFResourceContentIterator: ContentIterator, Loggable {
     private func elementForPage(at pageIndex: Int) async throws -> TextContentElement? {
         guard let doc = document, let info = resourceInfo else { return nil }
 
-        guard
-            let pageText = try await doc.pageText(at: pageIndex),
-            !pageText.isBlank
-        else {
+        guard let pageText = try await pageText(at: pageIndex, in: doc), !pageText.isBlank else {
             return nil
         }
+        try Task.checkCancellation()
 
         return makeElement(pageIndex: pageIndex, pageText: pageText, resourceInfo: info)
+    }
+
+    private func pageText(
+        at pageIndex: Int,
+        in document: any PDFDocumentTextProviding
+    ) async throws -> String? {
+        if let pending = pageTextTask, pending.pageIndex != pageIndex {
+            do {
+                _ = try await pending.task.value()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // The abandoned page failed; the requested page can still be read.
+            }
+            pageTextTask = nil
+        }
+
+        if pageTextTask == nil {
+            pageTextTask = (
+                pageIndex,
+                SharedTaskValue {
+                    do {
+                        return .success(try await document.pageText(at: pageIndex))
+                    } catch {
+                        return .failure(error)
+                    }
+                }
+            )
+        }
+        guard let pending = pageTextTask else { return nil }
+
+        do {
+            let text = try await pending.task.value()
+            pageTextTask = nil
+            return text
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            pageTextTask = nil
+            throw error
+        }
     }
 
     private func makeElement(pageIndex: Int, pageText: String, resourceInfo: ResourceInfo) -> TextContentElement {

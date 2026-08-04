@@ -33,6 +33,12 @@ struct CursorList<Element> {
         moveAndGet(index.map { $0 + 1 } ?? startIndex)
     }
 
+    /// Returns the elements after the cursor without moving it.
+    /// If the cursor hasn't moved yet, starts at `startIndex`.
+    func elementsAfterCurrent() -> ArraySlice<Element> {
+        list.dropFirst((index ?? (startIndex - 1)) + 1)
+    }
+
     private mutating func moveAndGet(_ index: Int) -> Element? {
         guard list.indices.contains(index) else {
             return nil

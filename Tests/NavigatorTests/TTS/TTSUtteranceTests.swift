@@ -11,14 +11,17 @@ import XCTest
 final class TTSUtteranceTests: XCTestCase {
     func testPublicInitializerPreservesValues() {
         let language = Language(code: .bcp47("zh-CN"))
+        let prefetchIdentifier = UUID()
         let utterance = TTSUtterance(
             text: "测试句子",
             delay: 0.25,
+            prefetchIdentifier: prefetchIdentifier,
             voiceOrLanguage: .right(language)
         )
 
         XCTAssertEqual(utterance.text, "测试句子")
         XCTAssertEqual(utterance.delay, 0.25)
+        XCTAssertEqual(utterance.prefetchIdentifier, prefetchIdentifier)
         XCTAssertEqual(utterance.language, language)
     }
 }

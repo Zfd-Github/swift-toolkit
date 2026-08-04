@@ -94,21 +94,27 @@ public class HTMLResourceContentIterator: ContentIterator {
     private var currentIndex: Int?
 
     private func elements() async throws -> ParsedElements {
-        try await elementsTask.value.get()
+        try await elementsTask.value()
     }
 
-    private lazy var elementsTask = Task {
+    private lazy var elementsTask = SharedTaskValue { [fetchTotalProgressionRange, resource, locator, beforeMaxLength] in
         let range = await fetchTotalProgressionRange()
         return await resource
             .read()
             .asString()
             .eraseToAnyError()
             .tryMap { try SwiftSoup.parse($0) }
-            .tryMap { try parse(document: $0, locator: locator, beforeMaxLength: beforeMaxLength) }
-            .asyncMap { await adjustProgressions(of: $0, totalProgressionRange: range) }
+            .tryMap { try Self.parse(document: $0, locator: locator, beforeMaxLength: beforeMaxLength) }
+            .asyncMap {
+                await Self.adjustProgressions(
+                    of: $0,
+                    totalProgressionRange: range,
+                    locator: locator
+                )
+            }
     }
 
-    private func parse(document: Document, locator: Locator, beforeMaxLength: Int) throws -> ParsedElements {
+    private static func parse(document: Document, locator: Locator, beforeMaxLength: Int) throws -> ParsedElements {
         let parser = try ContentParser(
             baseLocator: locator,
             startElement: locator.locations.cssSelector
@@ -127,7 +133,11 @@ public class HTMLResourceContentIterator: ContentIterator {
         return parser.result
     }
 
-    private func adjustProgressions(of elements: ParsedElements, totalProgressionRange: ClosedRange<Double>?) async -> ParsedElements {
+    private static func adjustProgressions(
+        of elements: ParsedElements,
+        totalProgressionRange: ClosedRange<Double>?,
+        locator: Locator
+    ) async -> ParsedElements {
         let count = Double(elements.elements.count)
         guard count > 0 else {
             return elements

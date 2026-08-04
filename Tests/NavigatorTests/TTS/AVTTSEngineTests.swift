@@ -19,7 +19,7 @@ final class AVTTSEngineTests: XCTestCase, @preconcurrency AVTTSEngineDelegate {
 
     func testSwitchingVoiceKeepsTheCurrentSpeakTaskUntilTheRestartFinishes() async throws {
         let output = TestSpeechOutput()
-        let engine = AVTTSEngine(delegate: self, speechOutput: output)
+        let engine = makeEngine(output: output)
         let completion = TestCompletion()
         let firstSpoken = expectation(description: "first utterance spoken")
         output.onSpeak = { _ in firstSpoken.fulfill() }
@@ -60,7 +60,7 @@ final class AVTTSEngineTests: XCTestCase, @preconcurrency AVTTSEngineDelegate {
 
     func testCancellingAQueuedTaskCompletesItsSpeakCall() async throws {
         let output = TestSpeechOutput()
-        let engine = AVTTSEngine(delegate: self, speechOutput: output)
+        let engine = makeEngine(output: output)
         let firstSpoken = expectation(description: "first utterance spoken")
         output.onSpeak = { _ in firstSpoken.fulfill() }
         let firstTask = Task { @MainActor in
@@ -94,7 +94,7 @@ final class AVTTSEngineTests: XCTestCase, @preconcurrency AVTTSEngineDelegate {
 
     func testNewSpeakDuringVoiceRestartCompletesBothTasks() async throws {
         let output = TestSpeechOutput()
-        let engine = AVTTSEngine(delegate: self, speechOutput: output)
+        let engine = makeEngine(output: output)
         let firstSpoken = expectation(description: "first utterance spoken")
         output.onSpeak = { _ in firstSpoken.fulfill() }
         let firstTask = Task { @MainActor in
@@ -133,6 +133,15 @@ final class AVTTSEngineTests: XCTestCase, @preconcurrency AVTTSEngineDelegate {
         if case .failure = await nextTask.value {
             XCTFail("The queued task should finish")
         }
+    }
+
+    private func makeEngine(output: TestSpeechOutput) -> AVTTSEngine {
+        AVTTSEngine(
+            delegate: self,
+            speechOutput: output,
+            resolveVoiceIdentifier: { _ in nil },
+            resolveVoiceLanguage: { _ in nil }
+        )
     }
 }
 

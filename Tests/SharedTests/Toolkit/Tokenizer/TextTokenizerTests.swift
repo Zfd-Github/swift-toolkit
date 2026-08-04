@@ -32,13 +32,23 @@ class TextTokenizerTests: XCTestCase {
                 Mr. Bougee said, looking above: "and what is the use of a book?". So she was considering (as well as she could), whether making a daisy-chain would be worth the trouble
                 In the end, she went ahead.
             """
-        XCTAssertEqual(
-            try tokenizer(text).map { String(text[$0]) },
+        var sentences: [String] = []
+        XCTAssertNoThrow(sentences = try tokenizer(text).map { String(text[$0]) })
+        // NLTokenizer changed its abbreviation boundary for "Mr." in iOS 18.
+        XCTAssertTrue(
             [
-                "Mr. Bougee said, looking above: \"and what is the use of a book?\".",
-                "So she was considering (as well as she could), whether making a daisy-chain would be worth the trouble",
-                "In the end, she went ahead.",
-            ]
+                [
+                    "Mr. Bougee said, looking above: \"and what is the use of a book?\".",
+                    "So she was considering (as well as she could), whether making a daisy-chain would be worth the trouble",
+                    "In the end, she went ahead.",
+                ],
+                [
+                    "Mr.",
+                    "Bougee said, looking above: \"and what is the use of a book?\".",
+                    "So she was considering (as well as she could), whether making a daisy-chain would be worth the trouble",
+                    "In the end, she went ahead.",
+                ],
+            ].contains(sentences)
         )
     }
 
@@ -84,13 +94,23 @@ class TextTokenizerTests: XCTestCase {
                 Mr. Bougee said, looking above: "and what is the use of a book?". So she was considering (as well as she could), whether making a daisy-chain would be worth the trouble
                 In the end, she went ahead.
             """
-        XCTAssertEqual(
-            try tokenizer(text).map { String(text[$0]) },
+        var sentences: [String] = []
+        XCTAssertNoThrow(sentences = try tokenizer(text).map { String(text[$0]) })
+        // NSString's sentence enumerator changed its abbreviation boundary in iOS 18.
+        XCTAssertTrue(
             [
-                "Mr. Bougee said, looking above: \"and what is the use of a book?\".",
-                "So she was considering (as well as she could), whether making a daisy-chain would be worth the trouble",
-                "In the end, she went ahead.",
-            ]
+                [
+                    "Mr. Bougee said, looking above: \"and what is the use of a book?\".",
+                    "So she was considering (as well as she could), whether making a daisy-chain would be worth the trouble",
+                    "In the end, she went ahead.",
+                ],
+                [
+                    "Mr.",
+                    "Bougee said, looking above: \"and what is the use of a book?\".",
+                    "So she was considering (as well as she could), whether making a daisy-chain would be worth the trouble",
+                    "In the end, she went ahead.",
+                ],
+            ].contains(sentences)
         )
     }
 

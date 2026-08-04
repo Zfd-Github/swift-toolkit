@@ -2,7 +2,19 @@
 
 All notable changes to this project will be documented in this file. Take a look at [the migration guide](docs/Migration%20Guide.md) to upgrade between two major versions.
 
-<!-- ## [Unreleased] -->
+## [Unreleased]
+
+### Changed
+
+#### Shared
+
+* `ContentIterator.next()`/`previous()` implementations must now return promptly when their task is cancelled. A throwing call must leave its position unchanged; after moving, it must return the corresponding element even if cancellation was requested.
+
+#### Navigator
+
+* Added `TTSPrefetchingEngine` and `PublicationSpeechSynthesizer.prefetch(from:)` for engines which can prepare audio before playback. `TTSUtterance` now carries a `prefetchIdentifier` to match prepared audio with playback.
+* `PublicationSpeechSynthesizer` is now main actor-isolated. Swift 6 callers outside the main actor receive migration warnings and must move calls to the main actor when warnings are treated as errors.
+* `TTSEngine.speak()` implementations must now stop pending work and return promptly when their task is cancelled.
 
 ## [3.11.0] - 2026-07-17
 

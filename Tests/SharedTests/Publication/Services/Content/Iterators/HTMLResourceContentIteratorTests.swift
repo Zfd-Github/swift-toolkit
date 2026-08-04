@@ -5,9 +5,35 @@
 //
 
 @testable import ReadiumShared
+import Foundation
 import Testing
 
 struct HTMLResourceContentIteratorTests {
+    @Test func cancellationDoesNotWaitForParsingTask() async {
+        let gate = AsyncGate()
+        var iterator: HTMLResourceContentIterator? = HTMLResourceContentIterator(
+            resource: DataResource(string: sampleHTML),
+            totalProgressionRange: {
+                await withTaskCancellationHandler {
+                    await gate.wait()
+                } onCancel: {
+                    gate.open()
+                }
+                return nil
+            },
+            locator: makeLocator()
+        )
+        weak var weakIterator: HTMLResourceContentIterator?
+        weakIterator = iterator
+
+        await cancelNext(on: iterator!, after: gate)
+        #expect(!gate.isOpen)
+        iterator = nil
+
+        #expect(weakIterator == nil)
+        #expect(gate.isOpen)
+    }
+
     @Test func iterateFromStartToFinish() async throws {
         let iter = makeIterator(sampleHTML)
         for expected in sampleElements {
@@ -619,6 +645,20 @@ struct HTMLResourceContentIteratorTests {
             let result = try await makeIterator(html).next()
             #expect(result?.locator.locations.cssSelector == "html > body > p.apple.mango.zebra")
         }
+    }
+}
+
+private func cancelNext(on iterator: HTMLResourceContentIterator, after gate: AsyncGate) async {
+    let task = Task { try await iterator.next() }
+    guard await gate.waitForWaiters() else {
+        task.cancel()
+        gate.open()
+        Issue.record("Timed out waiting for the parsing task")
+        return
+    }
+    task.cancel()
+    await #expect(throws: CancellationError.self) {
+        _ = try await task.value
     }
 }
 
