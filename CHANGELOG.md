@@ -13,6 +13,7 @@ All notable changes to this project will be documented in this file. Take a look
 #### Navigator
 
 * Added `TTSPrefetchingEngine` and `PublicationSpeechSynthesizer.prefetch(from:)` for engines which can prepare audio before playback. `TTSUtterance` now carries a `prefetchIdentifier` to match prepared audio with playback.
+* `PublicationSpeechSynthesizer.prefetch(from:)` returns as soon as the first utterance is prepared. Forward look-ahead continues in the background and no longer blocks the call (avoids multi-second first-audio delay on offline neural TTS).
 * `PublicationSpeechSynthesizer` is now main actor-isolated. Swift 6 callers outside the main actor receive migration warnings and must move calls to the main actor when warnings are treated as errors.
 * `TTSEngine.speak()` implementations must now stop pending work and return promptly when their task is cancelled.
 

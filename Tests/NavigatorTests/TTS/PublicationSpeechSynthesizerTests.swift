@@ -58,7 +58,7 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         synthesizer.stop()
     }
 
-    func testInitialPrefetchFillsForwardWaterlineBeforePlayback() async throws {
+    func testInitialPrefetchReturnsAfterFirstUtteranceAndFillsForwardInBackground() async throws {
         let first = textElement("first", href: "first.xhtml")
         let second = textElement("second", href: "second.xhtml")
         let third = textElement("third", href: "third.xhtml")
@@ -70,13 +70,21 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         )
 
         let prefetchTask = Task { await synthesizer.prefetch() }
-        try await waitUntil {
-            engine.prefetchedTexts == ["first", "second"] && engine.hasPendingPrefetch
-        }
-        engine.completePrefetch()
+        // First utterance is immediate; `prefetch` must return without waiting
+        // for the deferred second (forward waterline) call.
         let didPrefetch = await prefetchTask.value
         XCTAssertTrue(didPrefetch)
-        XCTAssertEqual(engine.prefetchedTexts, ["first", "second", "third", "fourth"])
+        XCTAssertEqual(engine.prefetchedTexts.first, "first")
+        // Full waterline must not be a precondition of returning.
+        XCTAssertFalse(engine.prefetchedTexts.contains("fourth"))
+
+        try await waitUntil {
+            engine.prefetchedTexts.contains("second") && engine.hasPendingPrefetch
+        }
+        engine.completePrefetch()
+        try await waitUntil {
+            engine.prefetchedTexts == ["first", "second", "third", "fourth"]
+        }
 
         synthesizer.start()
         try await waitUntil { engine.spokenTexts == ["first"] }
@@ -341,7 +349,8 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
 
         let didPrefetch = await synthesizer.prefetch()
         XCTAssertTrue(didPrefetch)
-        XCTAssertEqual(engine.prefetchedTexts, ["first", "second"])
+        // Forward look-ahead continues after return; wait for the retained second.
+        try await waitUntil { engine.prefetchedTexts == ["first", "second"] }
         synthesizer.stop()
     }
 
@@ -907,24 +916,29 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
     }
 
     func testCancelledInitialPrefetchIsNotMarkedPrepared() async throws {
-        let engine = PrefetchingTTSEngine(deferPrefetchOnCall: 2)
+        // Defer the *first* utterance so cancellation still races the initial
+        // prepare path (forward waterline no longer blocks `prefetch` return).
+        let engine = PrefetchingTTSEngine(
+            defersPrefetch: true,
+            cancelsPendingPrefetch: true
+        )
         let synthesizer = try makeSynthesizer(
             elements: [textElement("first"), textElement("second")],
             engine: engine
         )
 
         let prefetchTask = Task { await synthesizer.prefetch() }
-        try await waitUntil {
-            engine.prefetchedTexts == ["first", "second"] && engine.hasPendingPrefetch
-        }
+        try await waitUntil { engine.hasPendingPrefetch }
         prefetchTask.cancel()
-        engine.completePrefetch()
 
         let didPrefetch = await prefetchTask.value
         XCTAssertFalse(didPrefetch)
         synthesizer.start()
         try await waitUntil { engine.spokenIdentifiers.count == 1 }
-        XCTAssertNotEqual(engine.spokenIdentifiers[0], engine.prefetchedIdentifiers[0])
+        // Cancelled prepare must not leave a reusable prepared utterance.
+        if !engine.prefetchedIdentifiers.isEmpty {
+            XCTAssertNotEqual(engine.spokenIdentifiers[0], engine.prefetchedIdentifiers[0])
+        }
         synthesizer.stop()
     }
 

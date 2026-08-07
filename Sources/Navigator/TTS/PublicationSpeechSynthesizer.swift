@@ -233,10 +233,15 @@ public class PublicationSpeechSynthesizer: Loggable {
 
     /// Prepares the first utterance at `startLocator` without scheduling audio.
     ///
-    /// Returns whether prefetching completed successfully. Returns `false` when
-    /// playback is active, no utterance is available, the request is cancelled
-    /// or superseded, the engine doesn't support prefetching, or it rejects the
-    /// prepared audio.
+    /// Returns as soon as the first utterance is ready. Forward look-ahead may
+    /// continue in the background up to `maximumPrefetchDuration` and does not
+    /// block this call — offline engines (e.g. on-device neural TTS) would
+    /// otherwise delay first audio by generating many seconds of speech first.
+    ///
+    /// Returns whether the first utterance was prepared successfully. Returns
+    /// `false` when playback is active, no utterance is available, the request
+    /// is cancelled or superseded, the engine doesn't support prefetching, or
+    /// it rejects the prepared audio.
     @discardableResult
     public func prefetch(from startLocator: Locator? = nil) async -> Bool {
         guard case .stopped = state else {
@@ -331,19 +336,13 @@ public class PublicationSpeechSynthesizer: Loggable {
         preparedStartLocator = startLocator
         preparedUtterance = utterance
 
+        // Fire-and-forget: do not await the forward waterline here. Callers
+        // (e.g. app audio owner) await `prefetch` then immediately `start`;
+        // blocking on ~15s of look-ahead audio makes first playback hang.
         startForwardPrefetch(
             generation: generation,
             prefetchGeneration: prefetchGeneration
         )
-        let forwardPrefetchTask = forwardPrefetchTask
-        await forwardPrefetchTask?.value
-        guard !Task.isCancelled else { return false }
-        guard
-            generation == operationGeneration,
-            prefetchGeneration == self.prefetchGeneration
-        else {
-            return false
-        }
         return true
     }
 
