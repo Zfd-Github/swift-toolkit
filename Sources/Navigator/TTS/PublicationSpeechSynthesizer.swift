@@ -165,13 +165,13 @@ public class PublicationSpeechSynthesizer: Loggable {
 
     deinit {
         audioSession.end(for: audioSessionUser)
-        // Cancel look-ahead even if the task only weakly references `self` and is
-        // still suspended (e.g. on `iterator.next()`). Without this, a released
-        // synthesizer can leave engine work and iterator advances running.
+        // Cancel playback + look-ahead even if task bodies only weakly reference
+        // `self` and are suspended (speak / iterator.next / waiter).
         //
         // Only `Task.cancel()` runs here synchronously. `cancelPrefetch()` is
         // `@MainActor` — hop explicitly and retain the engine for that hop so
         // the call is not made from a nonisolated deinit context.
+        playbackTaskLifecycle.cancelTask()
         forwardPrefetchLifecycle.cancelTask()
         if let engine = engineStorage as? TTSPrefetchingEngine {
             Task { @MainActor in
@@ -194,9 +194,9 @@ public class PublicationSpeechSynthesizer: Loggable {
     private var currentTask: Task<Void, Never>?
     private var forwardPrefetchTask: Task<Void, Never>?
     private var forwardPrefetchTaskID: UInt64 = 0
-    /// Keeps a cancellable handle to the look-ahead task so `deinit` can stop it
-    /// without going through MainActor-isolated state after teardown begins.
-    private let forwardPrefetchLifecycle = ForwardPrefetchLifecycleHandle()
+    /// Cancels playback / look-ahead tasks from `deinit` without MainActor hops.
+    private let playbackTaskLifecycle = DetachedTaskLifecycleHandle()
+    private let forwardPrefetchLifecycle = DetachedTaskLifecycleHandle()
     private var prefetchCancellationTask: Task<Void, Never>?
     private var operationGeneration: UInt64 = 0
     private var prefetchGeneration: UInt64 = 0
@@ -387,11 +387,23 @@ public class PublicationSpeechSynthesizer: Loggable {
             preparedUtterance = nil
             prefetchRequestGeneration &+= 1
             let generation = operationGeneration
-            currentTask = Task {
+            setCurrentTask(Task { [weak self] in
                 await oldCurrentTask?.value
-                guard generation == self.operationGeneration else { return }
-                await play(utterance, generation: generation)
-            }
+                // Bind `self` only in a nested scope so it is not retained across
+                // `continuePlaying` (speak / look-ahead waits).
+                let weakSynthesizer: WeakPublicationSpeechSynthesizer
+                if let self {
+                    guard generation == self.operationGeneration else { return }
+                    weakSynthesizer = WeakPublicationSpeechSynthesizer(self)
+                } else {
+                    return
+                }
+                await Self.continuePlaying(
+                    weakSynthesizer: weakSynthesizer,
+                    utterance: utterance,
+                    generation: generation
+                )
+            })
             return
         }
         operationGeneration &+= 1
@@ -399,13 +411,28 @@ public class PublicationSpeechSynthesizer: Loggable {
         let oldPrefetchTask = invalidatePrefetch()
         setStartText(from: startLocator)
         publicationIterator = nil
-        currentTask = Task {
+        setCurrentTask(Task { [weak self] in
             await oldCurrentTask?.value
             await oldPrefetchTask?.value
-            guard generation == self.operationGeneration else { return }
-            self.publicationIterator = self.publication.content(from: startLocator)?.iterator()
-            await playNextUtterance(.forward, generation: generation)
-        }
+            let weakSynthesizer: WeakPublicationSpeechSynthesizer
+            if let self {
+                guard generation == self.operationGeneration else { return }
+                self.publicationIterator = self.publication.content(from: startLocator)?.iterator()
+                weakSynthesizer = WeakPublicationSpeechSynthesizer(self)
+            } else {
+                return
+            }
+            await Self.continuePlaying(
+                weakSynthesizer: weakSynthesizer,
+                utterance: nil,
+                generation: generation
+            )
+        })
+    }
+
+    private func setCurrentTask(_ task: Task<Void, Never>) {
+        currentTask = task
+        playbackTaskLifecycle.setTask(task)
     }
 
     private func setStartText(from startLocator: Locator?) {
@@ -421,6 +448,8 @@ public class PublicationSpeechSynthesizer: Loggable {
     /// Use `start()` to restart it.
     public func stop() {
         currentTask?.cancel()
+        currentTask = nil
+        playbackTaskLifecycle.clearTask()
         operationGeneration &+= 1
         invalidatePrefetch()
         state = .stopped
@@ -432,6 +461,8 @@ public class PublicationSpeechSynthesizer: Loggable {
     /// Use `resume()` to restart the playback from the same utterance.
     public func pause() {
         currentTask?.cancel()
+        currentTask = nil
+        playbackTaskLifecycle.clearTask()
         operationGeneration &+= 1
         invalidatePrefetch()
         if case let .playing(utterance, range: _) = state {
@@ -447,12 +478,22 @@ public class PublicationSpeechSynthesizer: Loggable {
             operationGeneration &+= 1
             let generation = operationGeneration
             let oldPrefetchTask = invalidatePrefetch()
-            currentTask = Task {
+            setCurrentTask(Task { [weak self] in
                 await oldCurrentTask?.value
                 await oldPrefetchTask?.value
-                guard generation == self.operationGeneration else { return }
-                await play(utterance, generation: generation)
-            }
+                let weakSynthesizer: WeakPublicationSpeechSynthesizer
+                if let self {
+                    guard generation == self.operationGeneration else { return }
+                    weakSynthesizer = WeakPublicationSpeechSynthesizer(self)
+                } else {
+                    return
+                }
+                await Self.continuePlaying(
+                    weakSynthesizer: weakSynthesizer,
+                    utterance: utterance,
+                    generation: generation
+                )
+            })
         }
     }
 
@@ -472,14 +513,25 @@ public class PublicationSpeechSynthesizer: Loggable {
         operationGeneration &+= 1
         let generation = operationGeneration
         let oldPrefetchTask = invalidatePrefetch()
-        currentTask = Task {
+        setCurrentTask(Task { [weak self] in
             await oldCurrentTask?.value
             await oldPrefetchTask?.value
-            guard generation == self.operationGeneration else { return }
-            await rollbackForwardBuffer(generation: generation)
-            guard generation == self.operationGeneration else { return }
-            await playNextUtterance(.backward, generation: generation)
-        }
+            let weakSynthesizer: WeakPublicationSpeechSynthesizer
+            if let self {
+                guard generation == self.operationGeneration else { return }
+                await self.rollbackForwardBuffer(generation: generation)
+                guard generation == self.operationGeneration else { return }
+                weakSynthesizer = WeakPublicationSpeechSynthesizer(self)
+            } else {
+                return
+            }
+            await Self.continuePlaying(
+                weakSynthesizer: weakSynthesizer,
+                utterance: nil,
+                generation: generation,
+                direction: .backward
+            )
+        })
     }
 
     /// Skips to the next utterance.
@@ -489,16 +541,26 @@ public class PublicationSpeechSynthesizer: Loggable {
         operationGeneration &+= 1
         let generation = operationGeneration
         let oldPrefetchTask = invalidatePrefetch()
-        currentTask = Task {
+        setCurrentTask(Task { [weak self] in
             await oldCurrentTask?.value
             await oldPrefetchTask?.value
-            guard generation == self.operationGeneration else { return }
-            if requiresForwardBufferRollback {
-                await rollbackForwardBuffer(generation: generation)
+            let weakSynthesizer: WeakPublicationSpeechSynthesizer
+            if let self {
                 guard generation == self.operationGeneration else { return }
+                if self.requiresForwardBufferRollback {
+                    await self.rollbackForwardBuffer(generation: generation)
+                    guard generation == self.operationGeneration else { return }
+                }
+                weakSynthesizer = WeakPublicationSpeechSynthesizer(self)
+            } else {
+                return
             }
-            await playNextUtterance(.forward, generation: generation)
-        }
+            await Self.continuePlaying(
+                weakSynthesizer: weakSynthesizer,
+                utterance: nil,
+                generation: generation
+            )
+        })
     }
 
     /// `Content.Iterator` used to iterate through the `publication`.
@@ -536,38 +598,79 @@ public class PublicationSpeechSynthesizer: Loggable {
             (iterator == nil || publicationIterator === iterator)
     }
 
-    /// Plays the next utterance in the given `direction`.
-    private func playNextUtterance(
-        _ direction: Direction,
-        generation: UInt64
+    /// Playback worker that only weakly references the synthesizer across
+    /// `engine.speak` and look-ahead waits, so releasing the last external
+    /// reference can run `deinit` and cancel outstanding work.
+    private static func continuePlaying(
+        weakSynthesizer: WeakPublicationSpeechSynthesizer,
+        utterance: Utterance?,
+        generation: UInt64,
+        direction: Direction = .forward
     ) async {
-        guard let utterance = await nextUtterance(direction, generation: generation) else {
-            guard generation == operationGeneration else { return }
-            state = .stopped
-            return
-        }
-        guard generation == operationGeneration else { return }
-        await play(utterance, generation: generation)
-    }
+        var pendingUtterance = utterance
+        var loadDirection = direction
 
-    /// Plays the given `utterance` with the TTS `engine`.
-    private func play(
-        _ utterance: Utterance,
-        generation: UInt64
-    ) async {
-        let ttsUtterance = ttsUtterance(for: utterance)
-        state = .playing(utterance, range: nil)
-        guard !Task.isCancelled, generation == operationGeneration else {
-            return
-        }
-        var didStartPrefetch = false
-
-        let result = await engine.speak(
-            ttsUtterance,
-            onSpeakRange: { [weak self] range in
-                guard let self = self else {
+        while true {
+            let toPlay: Utterance
+            if let pending = pendingUtterance {
+                toPlay = pending
+                pendingUtterance = nil
+            } else {
+                guard let self = weakSynthesizer.value else { return }
+                guard !Task.isCancelled, generation == self.operationGeneration else { return }
+                guard let next = await self.nextUtterance(loadDirection, generation: generation) else {
+                    if let self = weakSynthesizer.value, generation == self.operationGeneration {
+                        self.state = .stopped
+                    }
                     return
                 }
+                loadDirection = .forward
+                toPlay = next
+            }
+
+            let shouldContinue = await playOneUtterance(
+                weakSynthesizer: weakSynthesizer,
+                utterance: toPlay,
+                generation: generation
+            )
+            if !shouldContinue {
+                return
+            }
+        }
+    }
+
+    /// Speaks a single utterance without retaining the synthesizer across
+    /// engine or look-ahead suspensions. Returns whether automatic forward
+    /// continuation should proceed.
+    private static func playOneUtterance(
+        weakSynthesizer: WeakPublicationSpeechSynthesizer,
+        utterance: Utterance,
+        generation: UInt64
+    ) async -> Bool {
+        let prepared: (engine: TTSEngine, ttsUtterance: TTSUtterance)
+        if let self = weakSynthesizer.value {
+            guard !Task.isCancelled, generation == self.operationGeneration else {
+                return false
+            }
+            prepared = (self.engine, self.ttsUtterance(for: utterance))
+            self.state = .playing(utterance, range: nil)
+            // Delegate may stop/cancel synchronously from stateDidChange.
+            guard !Task.isCancelled, generation == self.operationGeneration else {
+                return false
+            }
+        } else {
+            return false
+        }
+
+        final class PrefetchStartFlag: @unchecked Sendable {
+            var didStart = false
+        }
+        let prefetchStart = PrefetchStartFlag()
+
+        let result = await prepared.engine.speak(
+            prepared.ttsUtterance,
+            onSpeakRange: { range in
+                guard let self = weakSynthesizer.value else { return }
                 guard generation == self.operationGeneration else { return }
 
                 self.state = .playing(
@@ -585,56 +688,62 @@ public class PublicationSpeechSynthesizer: Loggable {
                     )
                 )
                 guard generation == self.operationGeneration else { return }
-                if !didStartPrefetch {
-                    didStartPrefetch = true
+                if !prefetchStart.didStart {
+                    prefetchStart.didStart = true
                     self.startForwardPrefetch(generation: generation)
                 }
             }
         )
 
-        guard
-            !Task.isCancelled,
-            generation == operationGeneration
-        else {
-            return
+        guard let self = weakSynthesizer.value else { return false }
+        guard !Task.isCancelled, generation == self.operationGeneration else {
+            return false
         }
 
         switch result {
         case .success:
             // Prefer waiting for an in-flight look-ahead item over cancel+resynth.
             // Only wait for the *next* ready event (or task end) — never the full waterline.
-            if readyForwardPrefetches.isEmpty, forwardPrefetchTask != nil {
+            if self.readyForwardPrefetches.isEmpty, self.forwardPrefetchTask != nil {
+                let prefetchGeneration = self.prefetchGeneration
                 await waitUntilNextForwardReadyOrFinished(
+                    weakSynthesizer: weakSynthesizer,
                     operationGeneration: generation,
                     prefetchGeneration: prefetchGeneration
                 )
             }
 
-            guard !Task.isCancelled, generation == operationGeneration else {
-                return
+            guard let self = weakSynthesizer.value else { return false }
+            guard !Task.isCancelled, generation == self.operationGeneration else {
+                return false
             }
 
             // Always drain look-ahead cancellation before exclusive iterator /
             // engine use. Config mid-utterance already advances
             // `prefetchGeneration` and nils `forwardPrefetchTask` while the
             // cancelled body may still be inside `iterator.next` or
-            // `engine.prefetch`. Comparing generations *after* speak therefore
-            // cannot see that invalidation (both sides already show the new epoch).
-            await prefetchCancellationTask?.value
+            // `engine.prefetch`.
+            let cancellation = self.prefetchCancellationTask
+            await cancellation?.value
 
-            guard !Task.isCancelled, generation == operationGeneration else {
-                return
+            guard let self = weakSynthesizer.value else { return false }
+            guard !Task.isCancelled, generation == self.operationGeneration else {
+                return false
             }
 
-            if !readyForwardPrefetches.isEmpty {
-                readyForwardPrefetches.removeFirst()
+            if !self.readyForwardPrefetches.isEmpty {
+                self.readyForwardPrefetches.removeFirst()
             }
-
-            await playNextUtterance(.forward, generation: generation)
+            return true
         case let .failure(error):
-            invalidatePrefetch()
-            state = .paused(utterance)
-            delegate?.publicationSpeechSynthesizer(self, utterance: utterance, didFailWithError: .engine(error))
+            self.invalidatePrefetch()
+            self.state = .paused(utterance)
+            self.delegate?.publicationSpeechSynthesizer(
+                self,
+                utterance: utterance,
+                didFailWithError: .engine(error)
+            )
+            return false
         }
     }
 
@@ -835,8 +944,21 @@ public class PublicationSpeechSynthesizer: Loggable {
                 else {
                     return
                 }
-                candidates = Array(self.utterances.elementsAfterCurrent()) +
-                    self.forwardGroups.flatMap { $0.utterances ?? [] }
+                // Re-tokenize config-invalidated groups (`utterances == nil`) in
+                // order before reading further from the iterator — never skip
+                // over pending buffer slots to later content.
+                do {
+                    candidates = try self.collectForwardPrefetchCandidates()
+                } catch {
+                    self.log(.error, error)
+                    return
+                }
+                guard
+                    generation == self.operationGeneration,
+                    prefetchGeneration == self.prefetchGeneration
+                else {
+                    return
+                }
                 prefetchedIdentifiers = Set(self.readyForwardPrefetches.map(\.identifier))
                 duration = self.readyForwardPrefetches.reduce(into: 0) { $0 += $1.duration }
             } else {
@@ -1142,16 +1264,46 @@ public class PublicationSpeechSynthesizer: Loggable {
         }
     }
 
+    /// Builds look-ahead candidates from the current cursor and `forwardGroups`,
+    /// re-tokenizing any groups whose utterances were cleared by a config change.
+    /// Does not advance the publication iterator.
+    private func collectForwardPrefetchCandidates() throws -> [Utterance] {
+        var candidates = Array(utterances.elementsAfterCurrent())
+        for index in forwardGroups.indices {
+            let group = forwardGroups[index]
+            if let existing = group.utterances {
+                candidates.append(contentsOf: existing)
+                continue
+            }
+            let nextUtterances = try tokenize(group.content)
+                .flatMap { utterances(for: $0) }
+            // Persist retokenized result (`[]` = empty after retokenize, not pending).
+            forwardGroups[index] = BufferedUtteranceGroup(
+                content: group.content,
+                utterances: nextUtterances,
+                iteratorAdvanceCount: group.iteratorAdvanceCount
+            )
+            candidates.append(contentsOf: nextUtterances)
+        }
+        return candidates
+    }
+
     /// Suspends until the next forward item is ready, the forward task ends
     /// (failure / end of content / cancel), or generations no longer match.
     ///
     /// Check-and-register runs in one MainActor-synchronous section so a ready
     /// or finished event cannot slip between the empty check and the waiter list.
-    private func waitUntilNextForwardReadyOrFinished(
+    /// Does not retain the synthesizer across the suspension.
+    private static func waitUntilNextForwardReadyOrFinished(
+        weakSynthesizer: WeakPublicationSpeechSynthesizer,
         operationGeneration: UInt64,
         prefetchGeneration: UInt64
     ) async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            guard let self = weakSynthesizer.value else {
+                continuation.resume()
+                return
+            }
             guard
                 !Task.isCancelled,
                 operationGeneration == self.operationGeneration,
@@ -1160,11 +1312,11 @@ public class PublicationSpeechSynthesizer: Loggable {
                 continuation.resume()
                 return
             }
-            if !readyForwardPrefetches.isEmpty || forwardPrefetchTask == nil {
+            if !self.readyForwardPrefetches.isEmpty || self.forwardPrefetchTask == nil {
                 continuation.resume()
                 return
             }
-            forwardPrefetchWaiters.append(continuation)
+            self.forwardPrefetchWaiters.append(continuation)
         }
     }
 
@@ -1416,12 +1568,12 @@ public class PublicationSpeechSynthesizer: Loggable {
     }
 }
 
-/// Holds the forward look-ahead task independently of MainActor teardown so
-/// releasing `PublicationSpeechSynthesizer` always cancels outstanding work.
+/// Holds a task independently of MainActor teardown so releasing
+/// `PublicationSpeechSynthesizer` can cancel outstanding playback / look-ahead.
 ///
 /// Only stores `Task` cancellation (thread-safe). Never wraps `@MainActor`
 /// `cancelPrefetch()` — that must be invoked on the MainActor by the synthesizer.
-private final class ForwardPrefetchLifecycleHandle: @unchecked Sendable {
+private final class DetachedTaskLifecycleHandle: @unchecked Sendable {
     private let lock = NSLock()
     private var task: Task<Void, Never>?
 

@@ -294,8 +294,8 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         // End first utterance. Correct code awaits cancellation drain and must
         // NOT enter a new next() while cleanup is still held.
         engine.completeSpeech()
-        try await Task.yield()
-        try await Task.yield()
+        await Task.yield()
+        await Task.yield()
         XCTAssertEqual(engine.spokenTexts, ["first"])
         XCTAssertEqual(iterator.nextCallCount, 2)
         XCTAssertEqual(iterator.activeCallCount, 1)
@@ -1406,6 +1406,69 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
 
         try await waitUntil { engine.spokenTexts == ["first", "fr second"] }
         synthesizer.stop()
+    }
+
+    func testConfigChangeRetokenizesBufferedGroupsInOrderWithoutSkipping() async throws {
+        let french = Language("fr")
+        let engine = PrefetchingTTSEngine(prefetchResult: 5)
+        let synthesizer = try makeSynthesizer(
+            elements: [
+                textElement("first"),
+                textElement("second"),
+                textElement("third"),
+                textElement("fourth"),
+            ],
+            engine: engine,
+            tokenizerFactory: { language in { content in
+                guard
+                    language == french,
+                    var content = content as? TextContentElement
+                else {
+                    return [content]
+                }
+                content.segments = content.segments.map { segment in
+                    var segment = segment
+                    segment.text = "fr " + segment.text
+                    return segment
+                }
+                return [content]
+            } }
+        )
+
+        synthesizer.start()
+        // Waterline should cover second+third (+maybe fourth) before config change.
+        try await waitUntil {
+            engine.spokenTexts == ["first"] &&
+                engine.prefetchedTexts.contains("second") &&
+                engine.prefetchedTexts.contains("third")
+        }
+        synthesizer.config.defaultLanguage = french
+        engine.completeSpeech()
+
+        // Must retokenize second then third in order — never jump to fourth first.
+        try await waitUntil { engine.spokenTexts == ["first", "fr second"] }
+        engine.completeSpeech()
+        try await waitUntil { engine.spokenTexts == ["first", "fr second", "fr third"] }
+        XCTAssertFalse(engine.spokenTexts.contains("fourth"))
+        XCTAssertFalse(engine.spokenTexts.contains("fr fourth"))
+        synthesizer.stop()
+    }
+
+    func testReleasingSynthesizerDuringSpeechAllowsDeinitAndCancelsPlayback() async throws {
+        let engine = PrefetchingTTSEngine(cancelsPendingPrefetch: true)
+        var synthesizer: PublicationSpeechSynthesizer? = try makeSynthesizer(
+            elements: [textElement("first"), textElement("second")],
+            engine: engine
+        )
+        weak let weakSynthesizer = synthesizer
+
+        synthesizer?.start()
+        try await waitUntil { engine.spokenTexts == ["first"] }
+
+        // Drop last external reference while speak is suspended. Weak playback
+        // worker must not keep the synthesizer alive.
+        synthesizer = nil
+        try await waitUntil { weakSynthesizer == nil }
     }
 
     func testPrefetchTokenizationFailureDoesNotSkipContent() async throws {
