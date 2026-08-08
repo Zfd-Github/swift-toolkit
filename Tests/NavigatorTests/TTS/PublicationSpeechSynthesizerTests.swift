@@ -1445,13 +1445,131 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         synthesizer.config.defaultLanguage = french
         engine.completeSpeech()
 
-        // Must retokenize second then third in order — never jump to fourth first.
+        // Live play of retokenized second, then look-ahead must re-prefetch
+        // fr third (not skip to fr fourth) while second is still speaking.
         try await waitUntil { engine.spokenTexts == ["first", "fr second"] }
+        try await waitUntil {
+            engine.prefetchedTexts.contains("fr third") &&
+                !engine.spokenTexts.contains("fr third")
+        }
+        let thirdPrefetchIndex = try XCTUnwrap(
+            engine.prefetchedTexts.firstIndex(of: "fr third")
+        )
+        if let fourthIndex = engine.prefetchedTexts.firstIndex(of: "fr fourth") {
+            XCTAssertLessThan(thirdPrefetchIndex, fourthIndex)
+        }
+        let thirdPrefetchIdentifier = engine.prefetchedIdentifiers[thirdPrefetchIndex]
+
         engine.completeSpeech()
         try await waitUntil { engine.spokenTexts == ["first", "fr second", "fr third"] }
+        // Same identifier proves look-ahead audio was reused (not live resynth only).
+        XCTAssertEqual(engine.spokenIdentifiers[2], thirdPrefetchIdentifier)
         XCTAssertFalse(engine.spokenTexts.contains("fourth"))
         XCTAssertFalse(engine.spokenTexts.contains("fr fourth"))
         synthesizer.stop()
+    }
+
+    func testBufferedGroupRetokenizeReentryConfigDoesNotCommitStaleResult() async throws {
+        let french = Language("fr")
+        final class ReentrantTokenizer: @unchecked Sendable {
+            var onRetokenize: (() -> Void)?
+            private var retokenizeCount = 0
+
+            func makeTokenizer(language: Language?) -> ContentTokenizer {
+                { [self] element in
+                    guard var text = element as? TextContentElement else {
+                        return [element]
+                    }
+                    // Buffered-group retokenize after config invalidation uses fr.
+                    if language?.code.bcp47.lowercased().hasPrefix("fr") == true {
+                        retokenizeCount += 1
+                        if retokenizeCount == 1 {
+                            // Re-enter: invalidate again under the in-flight tokenize.
+                            onRetokenize?()
+                        }
+                        text.segments = text.segments.map { segment in
+                            var segment = segment
+                            if !segment.text.hasPrefix("fr ") {
+                                segment.text = "fr " + segment.text
+                            }
+                            return segment
+                        }
+                    }
+                    return [text]
+                }
+            }
+        }
+
+        let tokenizer = ReentrantTokenizer()
+        let engine = PrefetchingTTSEngine(prefetchResult: 5)
+        let synthesizer = try makeSynthesizer(
+            elements: [
+                textElement("first"),
+                textElement("second"),
+                textElement("third"),
+            ],
+            engine: engine,
+            tokenizerFactory: { language in tokenizer.makeTokenizer(language: language) }
+        )
+        tokenizer.onRetokenize = { [weak synthesizer] in
+            // Bump generation / re-invalidate groups while first retokenize is mid-flight.
+            synthesizer?.config.defaultLanguage = Language("de")
+            synthesizer?.config.defaultLanguage = french
+        }
+
+        synthesizer.start()
+        try await waitUntil {
+            engine.spokenTexts == ["first"] && engine.prefetchedTexts.contains("second")
+        }
+        synthesizer.config.defaultLanguage = french
+        engine.completeSpeech()
+        // Must still play correctly under the latest config without crashing.
+        try await waitUntil { engine.spokenTexts.contains(where: { $0.contains("second") }) }
+        synthesizer.stop()
+    }
+
+    func testBufferedGroupRetokenizeReentryStopDoesNotCrash() async throws {
+        final class ReentrantTokenizer: @unchecked Sendable {
+            weak var synthesizer: PublicationSpeechSynthesizer?
+            private var didStop = false
+
+            func makeTokenizer(language: Language?) -> ContentTokenizer {
+                { [self] element in
+                    if
+                        language?.code.bcp47.lowercased().hasPrefix("fr") == true,
+                        !didStop
+                    {
+                        didStop = true
+                        // Clears forwardGroups via iterator reset paths / stop.
+                        synthesizer?.stop()
+                    }
+                    return [element]
+                }
+            }
+        }
+
+        let tokenizer = ReentrantTokenizer()
+        let engine = PrefetchingTTSEngine(prefetchResult: 5)
+        let french = Language("fr")
+        let synthesizer = try makeSynthesizer(
+            elements: [
+                textElement("first"),
+                textElement("second"),
+                textElement("third"),
+            ],
+            engine: engine,
+            tokenizerFactory: { language in tokenizer.makeTokenizer(language: language) }
+        )
+        tokenizer.synthesizer = synthesizer
+
+        synthesizer.start()
+        try await waitUntil {
+            engine.spokenTexts == ["first"] && engine.prefetchedTexts.contains("second")
+        }
+        synthesizer.config.defaultLanguage = french
+        engine.completeSpeech()
+        // stop() from inside retokenize must not trap on forwardGroups[index].
+        try await waitUntil { synthesizer.state == .stopped }
     }
 
     func testReleasingSynthesizerDuringSpeechAllowsDeinitAndCancelsPlayback() async throws {
