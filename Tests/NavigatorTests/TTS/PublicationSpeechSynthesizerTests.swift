@@ -37,7 +37,53 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         synthesizer.stop()
     }
 
-    func testAutomaticContinuationCancelsPendingPrefetch() async throws {
+    func testAutomaticContinuationWaitsForPendingPrefetchAndReusesIt() async throws {
+        // Three utterances: second is the "next" waterline item; third stays
+        // deferred so an incorrect `await forwardPrefetchTask.value` would hang
+        // before speaking second (or never reach the mid-play assertions).
+        let engine = PrefetchingTTSEngine(
+            defersPrefetch: true,
+            cancelsPendingPrefetch: true
+        )
+        let synthesizer = try makeSynthesizer(
+            elements: [
+                textElement("first"),
+                textElement("second"),
+                textElement("third"),
+            ],
+            engine: engine
+        )
+
+        synthesizer.start()
+        try await waitUntil {
+            engine.spokenTexts == ["first"] && engine.hasPendingPrefetch
+        }
+        let secondPrefetchIdentifier = try XCTUnwrap(engine.prefetchedIdentifiers.last)
+        engine.completeSpeech()
+        try await waitUntil { synthesizer.isWaitingForForwardPrefetchForTesting }
+
+        // While second is still pending: no cancel, no early speak(second).
+        XCTAssertEqual(engine.spokenTexts, ["first"])
+        XCTAssertEqual(engine.cancelPrefetchCount, 0)
+        XCTAssertTrue(engine.hasPendingPrefetch)
+
+        // Complete only the second look-ahead item. Forward continues and hangs
+        // on third — proving we do not wait for the full waterline task.
+        engine.completePrefetch()
+        try await waitUntil {
+            engine.spokenTexts == ["first", "second"] &&
+                engine.hasPendingPrefetch &&
+                engine.prefetchedTexts.contains("third")
+        }
+        XCTAssertEqual(engine.cancelPrefetchCount, 0)
+        // Same prefetchIdentifier ⇒ engine reuses prepared audio, no resynth.
+        XCTAssertEqual(engine.spokenIdentifiers[1], secondPrefetchIdentifier)
+        // Third still pending; full-waterline await would not have reached here.
+        XCTAssertFalse(engine.spokenTexts.contains("third"))
+        synthesizer.stop()
+    }
+
+    func testAutomaticContinuationFallsBackToLiveWhenPrefetchFails() async throws {
         let engine = PrefetchingTTSEngine(
             defersPrefetch: true,
             cancelsPendingPrefetch: true
@@ -52,9 +98,125 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
             engine.spokenTexts == ["first"] && engine.hasPendingPrefetch
         }
         engine.completeSpeech()
+        try await waitUntil { synthesizer.isWaitingForForwardPrefetchForTesting }
+        XCTAssertEqual(engine.spokenTexts, ["first"])
 
+        // Pending look-ahead fails → waiter wakes and live-speaks second.
+        engine.completePrefetch(returning: nil)
         try await waitUntil { engine.spokenTexts == ["first", "second"] }
+        XCTAssertEqual(engine.cancelPrefetchCount, 0)
+        synthesizer.stop()
+    }
+
+    func testStopDuringForwardPrefetchWaitDoesNotDeadlock() async throws {
+        let engine = PrefetchingTTSEngine(
+            defersPrefetch: true,
+            cancelsPendingPrefetch: true
+        )
+        let synthesizer = try makeSynthesizer(
+            elements: [textElement("first"), textElement("second")],
+            engine: engine
+        )
+
+        synthesizer.start()
+        try await waitUntil {
+            engine.spokenTexts == ["first"] && engine.hasPendingPrefetch
+        }
+        engine.completeSpeech()
+        try await waitUntil { synthesizer.isWaitingForForwardPrefetchForTesting }
+        XCTAssertEqual(engine.spokenTexts, ["first"])
+
+        synthesizer.stop()
+        XCTAssertEqual(synthesizer.state, .stopped)
+        // Invalidate wakes the waiter; cancel completes the pending engine work.
         XCTAssertEqual(engine.cancelPrefetchCount, 1)
+    }
+
+    func testPauseDuringForwardPrefetchWaitDoesNotDeadlock() async throws {
+        let engine = PrefetchingTTSEngine(
+            defersPrefetch: true,
+            cancelsPendingPrefetch: true
+        )
+        let synthesizer = try makeSynthesizer(
+            elements: [textElement("first"), textElement("second")],
+            engine: engine
+        )
+
+        synthesizer.start()
+        try await waitUntil {
+            engine.spokenTexts == ["first"] && engine.hasPendingPrefetch
+        }
+        engine.completeSpeech()
+        try await waitUntil { synthesizer.isWaitingForForwardPrefetchForTesting }
+
+        synthesizer.pause()
+        guard case .paused = synthesizer.state else {
+            return XCTFail("Expected paused state after pause during wait")
+        }
+        XCTAssertEqual(engine.cancelPrefetchCount, 1)
+        synthesizer.stop()
+    }
+
+    func testNextDuringForwardPrefetchWaitDoesNotDeadlock() async throws {
+        let engine = PrefetchingTTSEngine(
+            defersPrefetch: true,
+            cancelsPendingPrefetch: true
+        )
+        let synthesizer = try makeSynthesizer(
+            elements: [
+                textElement("first"),
+                textElement("second"),
+                textElement("third"),
+            ],
+            engine: engine
+        )
+
+        synthesizer.start()
+        try await waitUntil {
+            engine.spokenTexts == ["first"] && engine.hasPendingPrefetch
+        }
+        engine.completeSpeech()
+        try await waitUntil { synthesizer.isWaitingForForwardPrefetchForTesting }
+        XCTAssertEqual(engine.spokenTexts, ["first"])
+
+        synthesizer.next()
+        // From first, next must land on second — not skip to third.
+        try await waitUntil { engine.spokenTexts == ["first", "second"] }
+        synthesizer.stop()
+    }
+
+    func testConfigChangeDuringForwardPrefetchWaitSerializesIterator() async throws {
+        let iterator = GatedArrayContentIterator(
+            elements: [
+                textElement("first", href: "first.xhtml"),
+                textElement("second", href: "second.xhtml"),
+                textElement("third", href: "third.xhtml"),
+            ],
+            startIndex: 0,
+            gatedNextCall: 2
+        )
+        let engine = PrefetchingTTSEngine()
+        let synthesizer = try makeSynthesizer(
+            contentService: IteratorContentService(iteratorFactory: { iterator }),
+            engine: engine
+        )
+
+        synthesizer.start()
+        try await waitUntil {
+            engine.spokenTexts == ["first"] && iterator.hasSuspendedNext
+        }
+        engine.completeSpeech()
+        try await waitUntil { synthesizer.isWaitingForForwardPrefetchForTesting }
+
+        // Config invalidates look-ahead without bumping operationGeneration; the
+        // play task must wait for the cancelled iterator call to exit before
+        // live-loading the next utterance.
+        synthesizer.config.defaultLanguage = Language("fr")
+        try await waitUntil { engine.cancelPrefetchCount >= 1 || !iterator.hasSuspendedNext }
+
+        iterator.openGate()
+        try await waitUntil { engine.spokenTexts == ["first", "second"] }
+        XCTAssertEqual(iterator.maximumConcurrentCalls, 1)
         synthesizer.stop()
     }
 
@@ -63,16 +225,23 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         let second = textElement("second", href: "second.xhtml")
         let third = textElement("third", href: "third.xhtml")
         let fourth = textElement("fourth", href: "fourth.xhtml")
-        let engine = PrefetchingTTSEngine(deferPrefetchOnCall: 2)
+        // cancelsPendingPrefetch: hard-timeout path can unblock a hung waterline wait.
+        let engine = PrefetchingTTSEngine(
+            deferPrefetchOnCall: 2,
+            cancelsPendingPrefetch: true
+        )
         let synthesizer = try makeSynthesizer(
             elements: [first, second, third, fourth],
             engine: engine
         )
 
-        let prefetchTask = Task { await synthesizer.prefetch() }
-        // First utterance is immediate; `prefetch` must return without waiting
-        // for the deferred second (forward waterline) call.
-        let didPrefetch = await prefetchTask.value
+        // Hard timeout: if we regress to "await full waterline", fail within 1s
+        // instead of hanging on the deferred second continuation.
+        let didPrefetch = try await withHardTimeout(1, onTimeout: {
+            engine.cancelPrefetch()
+        }) {
+            await synthesizer.prefetch()
+        }
         XCTAssertTrue(didPrefetch)
         XCTAssertEqual(engine.prefetchedTexts.first, "first")
         // Full waterline must not be a precondition of returning.
@@ -90,6 +259,233 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         try await waitUntil { engine.spokenTexts == ["first"] }
         engine.completeSpeech()
         try await waitUntil { engine.spokenTexts == ["first", "second"] }
+        synthesizer.stop()
+    }
+
+    func testConfigChangeDuringFirstUtteranceSerializesBeforePlayNext() async throws {
+        // Cancelled `next` does not exit until `openCleanupGate`, stably holding
+        // the window: forward task slot cleared, but old iterator.next still active.
+        let iterator = GatedArrayContentIterator(
+            elements: [
+                textElement("first", href: "first.xhtml"),
+                textElement("second", href: "second.xhtml"),
+                textElement("third", href: "third.xhtml"),
+            ],
+            startIndex: 0,
+            gatedNextCall: 2,
+            delaysCancellationExit: true
+        )
+        let engine = PrefetchingTTSEngine()
+        let synthesizer = try makeSynthesizer(
+            contentService: IteratorContentService(iteratorFactory: { iterator }),
+            engine: engine
+        )
+
+        synthesizer.start()
+        try await waitUntil {
+            engine.spokenTexts == ["first"] && iterator.hasSuspendedNext
+        }
+
+        // Mid-utterance config invalidates look-ahead.
+        synthesizer.config.defaultLanguage = Language("fr")
+        XCTAssertEqual(engine.cancelPrefetchCount, 1)
+        try await waitUntil { iterator.hasSuspendedCleanup }
+
+        // End first utterance. Correct code awaits cancellation drain and must
+        // NOT enter a new next() while cleanup is still held.
+        engine.completeSpeech()
+        try await Task.yield()
+        try await Task.yield()
+        XCTAssertEqual(engine.spokenTexts, ["first"])
+        XCTAssertEqual(iterator.nextCallCount, 2)
+        XCTAssertEqual(iterator.activeCallCount, 1)
+        XCTAssertFalse(engine.spokenTexts.contains("second"))
+
+        iterator.openCleanupGate()
+        try await waitUntil { engine.spokenTexts == ["first", "second"] }
+        XCTAssertEqual(iterator.maximumConcurrentCalls, 1)
+        synthesizer.stop()
+    }
+
+    func testReleasingSynthesizerDuringForwardEnginePrefetchCancelsWork() async throws {
+        let engine = PrefetchingTTSEngine(
+            deferPrefetchOnCall: 2,
+            cancelsPendingPrefetch: true
+        )
+        var synthesizer: PublicationSpeechSynthesizer? = try makeSynthesizer(
+            elements: [textElement("first"), textElement("second")],
+            engine: engine
+        )
+        weak let weakSynthesizer = synthesizer
+
+        let didPrefetch = try await withHardTimeout(1, onTimeout: {
+            engine.cancelPrefetch()
+        }) {
+            await synthesizer!.prefetch()
+        }
+        XCTAssertTrue(didPrefetch)
+        try await waitUntil {
+            engine.prefetchedTexts.contains("second") && engine.hasPendingPrefetch
+        }
+
+        synthesizer = nil
+        try await waitUntil { weakSynthesizer == nil }
+        try await waitUntil { engine.cancelPrefetchCount >= 1 }
+        XCTAssertFalse(engine.hasPendingPrefetch)
+    }
+
+    func testReleasingSynthesizerDuringForwardIteratorLoadCancelsWork() async throws {
+        let iterator = GatedArrayContentIterator(
+            elements: [
+                textElement("first", href: "first.xhtml"),
+                textElement("second", href: "second.xhtml"),
+            ],
+            startIndex: 0,
+            gatedNextCall: 2
+        )
+        var synthesizer: PublicationSpeechSynthesizer? = try makeSynthesizer(
+            contentService: IteratorContentService(iteratorFactory: { iterator }),
+            engine: PrefetchingTTSEngine()
+        )
+        weak let weakSynthesizer = synthesizer
+
+        // First content loads (call 1); forward look-ahead suspends on call 2.
+        let didPrefetch = try await withHardTimeout(1, onTimeout: {
+            iterator.openGate()
+        }) {
+            await synthesizer!.prefetch()
+        }
+        XCTAssertTrue(didPrefetch)
+        try await waitUntil { iterator.hasSuspendedNext }
+
+        synthesizer = nil
+        try await waitUntil { weakSynthesizer == nil }
+        // Cancelled look-ahead must resume the gated iterator so it can exit.
+        try await waitUntil { !iterator.hasSuspendedNext }
+        XCTAssertEqual(iterator.maximumConcurrentCalls, 1)
+    }
+
+    func testReleasingSynthesizerWhileLaterForwardPrefetchIsPending() async throws {
+        // Second look-ahead succeeds; hang on third engine.prefetch.
+        let engine = PrefetchingTTSEngine(
+            deferPrefetchOnCall: 3,
+            cancelsPendingPrefetch: true
+        )
+        var synthesizer: PublicationSpeechSynthesizer? = try makeSynthesizer(
+            elements: [
+                textElement("first"),
+                textElement("second"),
+                textElement("third"),
+            ],
+            engine: engine
+        )
+        weak let weakSynthesizer = synthesizer
+
+        let didPrefetch = try await withHardTimeout(1, onTimeout: {
+            engine.cancelPrefetch()
+        }) {
+            await synthesizer!.prefetch()
+        }
+        XCTAssertTrue(didPrefetch)
+        // first (initial) + second (forward) immediate; third deferred.
+        try await waitUntil {
+            engine.prefetchedTexts == ["first", "second", "third"] &&
+                engine.hasPendingPrefetch
+        }
+
+        synthesizer = nil
+        try await waitUntil { weakSynthesizer == nil }
+        try await waitUntil { engine.cancelPrefetchCount >= 1 }
+        XCTAssertFalse(engine.hasPendingPrefetch)
+    }
+
+    func testReleasingSynthesizerAfterEmptyContentWhileIteratorIsSuspended() async throws {
+        // Forward skips empty (no utterances), then hangs on the next next().
+        let iterator = GatedArrayContentIterator(
+            elements: [
+                textElement("first", href: "first.xhtml"),
+                textElement("", href: "empty.xhtml"),
+                textElement("second", href: "second.xhtml"),
+            ],
+            startIndex: 0,
+            gatedNextCall: 3
+        )
+        var synthesizer: PublicationSpeechSynthesizer? = try makeSynthesizer(
+            contentService: IteratorContentService(iteratorFactory: { iterator }),
+            engine: PrefetchingTTSEngine()
+        )
+        weak let weakSynthesizer = synthesizer
+
+        let didPrefetch = try await withHardTimeout(1, onTimeout: {
+            iterator.openGate()
+        }) {
+            await synthesizer!.prefetch()
+        }
+        XCTAssertTrue(didPrefetch)
+        try await waitUntil { iterator.hasSuspendedNext }
+        XCTAssertEqual(iterator.nextCallCount, 3)
+
+        synthesizer = nil
+        try await waitUntil { weakSynthesizer == nil }
+        try await waitUntil { !iterator.hasSuspendedNext }
+        XCTAssertEqual(iterator.maximumConcurrentCalls, 1)
+    }
+
+    func testTokenizeReentryDoesNotCommitStaleForwardUtterances() async throws {
+        final class ReentrantTokenizer: @unchecked Sendable {
+            var onTokenize: ((Language?, Int) -> Void)?
+            private var count = 0
+
+            func makeTokenizer(language: Language?) -> ContentTokenizer {
+                { [self] element in
+                    try self.tokenize(element, language: language)
+                }
+            }
+
+            private func tokenize(_ element: ContentElement, language: Language?) throws -> [ContentElement] {
+                count += 1
+                onTokenize?(language, count)
+                guard var textElement = element as? TextContentElement else {
+                    return [element]
+                }
+                // Observable config effect: French default language prefixes text.
+                if language?.code.bcp47.lowercased().hasPrefix("fr") == true {
+                    textElement.segments = textElement.segments.map { segment in
+                        var segment = segment
+                        if !segment.text.hasPrefix("fr ") {
+                            segment.text = "fr " + segment.text
+                        }
+                        return segment
+                    }
+                }
+                return [textElement]
+            }
+        }
+
+        let tokenizer = ReentrantTokenizer()
+        let engine = PrefetchingTTSEngine()
+        let synthesizer = try makeSynthesizer(
+            elements: [
+                textElement("first", href: "first.xhtml"),
+                textElement("second", href: "second.xhtml"),
+            ],
+            engine: engine,
+            tokenizerFactory: { language in tokenizer.makeTokenizer(language: language) }
+        )
+        tokenizer.onTokenize = { [weak synthesizer] _, count in
+            // Second tokenize is the forward look-ahead of "second". Invalidate
+            // under the in-flight call so a stale EN result must not be committed.
+            if count == 2 {
+                synthesizer?.config.defaultLanguage = Language("fr")
+            }
+        }
+
+        synthesizer.start()
+        try await waitUntil { engine.spokenTexts == ["first"] }
+        engine.completeSpeech()
+        // Live path after discard must re-tokenize under fr → "fr second".
+        // Committing the stale EN "second" would fail this assertion.
+        try await waitUntil { engine.spokenTexts == ["first", "fr second"] }
         synthesizer.stop()
     }
 
@@ -288,6 +684,10 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
     }
 
     func testCancellingPreparedPrefetchDoesNotInvalidatePlaybackCache() async throws {
+        // `prefetch` returns after the first utterance; forward waterline continues
+        // on a background/unstructured task (MainActor-inherited, not detached).
+        // Cancelling the completed caller Task must not wipe prepared audio that
+        // `start` is about to consume.
         let engine = PrefetchingTTSEngine(
             deferPrefetchOnCall: 2,
             cancelsPendingPrefetch: true
@@ -298,6 +698,9 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         )
 
         let prefetchTask = Task { await synthesizer.prefetch() }
+        let didPrefetch = await prefetchTask.value
+        XCTAssertTrue(didPrefetch)
+
         try await waitUntil {
             engine.prefetchedTexts == ["first", "second"] && engine.hasPendingPrefetch
         }
@@ -307,8 +710,6 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
 
         XCTAssertEqual(engine.cancelPrefetchCount, 0)
         engine.completePrefetch()
-        let didPrefetch = await prefetchTask.value
-        XCTAssertFalse(didPrefetch)
         synthesizer.stop()
     }
 
@@ -369,6 +770,8 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         synthesizer.start()
         try await waitUntil { engine.prefetchedTexts == ["second"] }
         engine.completeSpeech()
+        // Rejected look-ahead ends the forward task without invalidate; second is
+        // spoken live, then a new forward task prefetches third (deferred).
         try await waitUntil {
             engine.spokenTexts == ["first", "second"] &&
                 engine.prefetchedTexts == ["second", "third"] &&
@@ -376,7 +779,8 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         }
 
         synthesizer.stop()
-        try await waitUntil { engine.cancelPrefetchCount == 2 }
+        // Only stop cancels the in-flight third (no cancel on the rejected second).
+        try await waitUntil { engine.cancelPrefetchCount == 1 }
     }
 
     func testPreviousRollsBackUnconsumedPrefetch() async throws {
@@ -406,7 +810,7 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         synthesizer.stop()
     }
 
-    func testAutomaticContinuationCancelsSuspendedPrefetchIteratorAdvance() async throws {
+    func testAutomaticContinuationWaitsForSuspendedPrefetchIteratorAdvance() async throws {
         let iterator = GatedArrayContentIterator(
             elements: [
                 textElement("first", href: "first.xhtml"),
@@ -428,9 +832,18 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
                 iterator.hasSuspendedNext
         }
         engine.completeSpeech()
+        try await waitUntil { synthesizer.isWaitingForForwardPrefetchForTesting }
 
+        // Continuation waits for the in-flight look-ahead iterator instead of
+        // cancelling it; second must not speak until the gate opens.
+        XCTAssertEqual(engine.spokenTexts, ["first"])
+        XCTAssertEqual(engine.cancelPrefetchCount, 0)
+        XCTAssertTrue(iterator.hasSuspendedNext)
+
+        iterator.openGate()
         try await waitUntil { engine.spokenTexts == ["first", "second"] }
         XCTAssertEqual(iterator.maximumConcurrentCalls, 1)
+        XCTAssertEqual(engine.cancelPrefetchCount, 0)
         try await waitUntil { engine.prefetchedTexts.contains("third") }
         engine.completeSpeech()
         try await waitUntil { engine.spokenTexts == ["first", "second", "third"] }
@@ -1339,6 +1752,9 @@ private final class GatedArrayContentIterator: ContentIterator, @unchecked Senda
     private let gatedPreviousCall: Int?
     private let throwingNextCall: Int?
     private let returnsElementOnCancellation: Bool
+    /// When true, a cancelled gated `next` waits on `openCleanupGate` before
+    /// throwing — holding the "task slot cleared, body still in next" window.
+    private let delaysCancellationExit: Bool
     private var index: Int
     private var nextCalls = 0
     private var previousCalls = 0
@@ -1346,6 +1762,8 @@ private final class GatedArrayContentIterator: ContentIterator, @unchecked Senda
     private var maximumActiveCalls = 0
     private var gateContinuation: CheckedContinuation<Void, Never>?
     private var gateCancelled = false
+    private var cleanupContinuation: CheckedContinuation<Void, Never>?
+    private var cleanupReleased = false
     private var previousGateContinuation: CheckedContinuation<Void, Never>?
     private var previousGateCancelled = false
 
@@ -1355,7 +1773,8 @@ private final class GatedArrayContentIterator: ContentIterator, @unchecked Senda
         gatedNextCall: Int,
         gatedPreviousCall: Int? = nil,
         throwingNextCall: Int? = nil,
-        returnsElementOnCancellation: Bool = false
+        returnsElementOnCancellation: Bool = false,
+        delaysCancellationExit: Bool = false
     ) {
         self.elements = elements
         index = startIndex - 1
@@ -1363,6 +1782,7 @@ private final class GatedArrayContentIterator: ContentIterator, @unchecked Senda
         self.gatedPreviousCall = gatedPreviousCall
         self.throwingNextCall = throwingNextCall
         self.returnsElementOnCancellation = returnsElementOnCancellation
+        self.delaysCancellationExit = delaysCancellationExit
     }
 
     var nextCallCount: Int {
@@ -1377,8 +1797,16 @@ private final class GatedArrayContentIterator: ContentIterator, @unchecked Senda
         lock.withLock { maximumActiveCalls }
     }
 
+    var activeCallCount: Int {
+        lock.withLock { activeCalls }
+    }
+
     var hasSuspendedNext: Bool {
         lock.withLock { gateContinuation != nil }
+    }
+
+    var hasSuspendedCleanup: Bool {
+        lock.withLock { cleanupContinuation != nil }
     }
 
     var hasSuspendedPrevious: Bool {
@@ -1414,6 +1842,20 @@ private final class GatedArrayContentIterator: ContentIterator, @unchecked Senda
                     return gateContinuation
                 }
                 continuation?.resume()
+            }
+            if delaysCancellationExit, Task.isCancelled {
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    let resumeImmediately = lock.withLock {
+                        if cleanupReleased {
+                            return true
+                        }
+                        cleanupContinuation = continuation
+                        return false
+                    }
+                    if resumeImmediately {
+                        continuation.resume()
+                    }
+                }
             }
             if !returnsElementOnCancellation {
                 try Task.checkCancellation()
@@ -1468,6 +1910,15 @@ private final class GatedArrayContentIterator: ContentIterator, @unchecked Senda
         let continuation = lock.withLock {
             defer { gateContinuation = nil }
             return gateContinuation
+        }
+        continuation?.resume()
+    }
+
+    func openCleanupGate() {
+        let continuation = lock.withLock {
+            cleanupReleased = true
+            defer { cleanupContinuation = nil }
+            return cleanupContinuation
         }
         continuation?.resume()
     }
@@ -1622,8 +2073,8 @@ private final class PrefetchingTTSEngine: TTSPrefetchingEngine {
         speechContinuations.removeFirst().resume(returning: .success(()))
     }
 
-    func completePrefetch() {
-        prefetchContinuation?.resume(returning: 5)
+    func completePrefetch(returning duration: TimeInterval? = 5) {
+        prefetchContinuation?.resume(returning: duration)
         prefetchContinuation = nil
     }
 }
@@ -1638,6 +2089,58 @@ private func waitUntil(
         guard Date() < deadline else {
             XCTFail("Timed out waiting for condition")
             throw CancellationError()
+        }
+        try await Task.sleep(nanoseconds: 1_000_000)
+    }
+}
+
+private struct TestTimeoutError: Error {}
+
+private final class TimeoutResultBox<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value?
+
+    func set(_ value: Value) {
+        lock.lock()
+        self.value = value
+        lock.unlock()
+    }
+
+    func get() -> Value? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
+/// Hard timeout that does **not** wait for a hung operation to finish.
+///
+/// Unlike `withThrowingTaskGroup`, returning on timeout does not join the
+/// operation task. `onTimeout` should unblock fake engines / gated iterators
+/// so the orphaned task can eventually exit without blocking the test process.
+@MainActor
+private func withHardTimeout<T: Sendable>(
+    _ timeout: TimeInterval,
+    onTimeout: @MainActor @escaping () -> Void = {},
+    operation: @MainActor @escaping () async -> T
+) async throws -> T {
+    let box = TimeoutResultBox<T>()
+    let task = Task { @MainActor in
+        let value = await operation()
+        box.set(value)
+    }
+
+    let deadline = Date().addingTimeInterval(timeout)
+    while true {
+        if let value = box.get() {
+            _ = await task.value
+            return value
+        }
+        if Date() >= deadline {
+            task.cancel()
+            onTimeout()
+            XCTFail("Hard-timed out after \(timeout)s")
+            throw TestTimeoutError()
         }
         try await Task.sleep(nanoseconds: 1_000_000)
     }

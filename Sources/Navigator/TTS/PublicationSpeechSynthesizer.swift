@@ -165,6 +165,19 @@ public class PublicationSpeechSynthesizer: Loggable {
 
     deinit {
         audioSession.end(for: audioSessionUser)
+        // Cancel look-ahead even if the task only weakly references `self` and is
+        // still suspended (e.g. on `iterator.next()`). Without this, a released
+        // synthesizer can leave engine work and iterator advances running.
+        //
+        // Only `Task.cancel()` runs here synchronously. `cancelPrefetch()` is
+        // `@MainActor` — hop explicitly and retain the engine for that hop so
+        // the call is not made from a nonisolated deinit context.
+        forwardPrefetchLifecycle.cancelTask()
+        if let engine = engineStorage as? TTSPrefetchingEngine {
+            Task { @MainActor in
+                engine.cancelPrefetch()
+            }
+        }
     }
 
     /// The default content tokenizer will split the `Content.Element` items into individual sentences.
@@ -180,6 +193,10 @@ public class PublicationSpeechSynthesizer: Loggable {
 
     private var currentTask: Task<Void, Never>?
     private var forwardPrefetchTask: Task<Void, Never>?
+    private var forwardPrefetchTaskID: UInt64 = 0
+    /// Keeps a cancellable handle to the look-ahead task so `deinit` can stop it
+    /// without going through MainActor-isolated state after teardown begins.
+    private let forwardPrefetchLifecycle = ForwardPrefetchLifecycleHandle()
     private var prefetchCancellationTask: Task<Void, Never>?
     private var operationGeneration: UInt64 = 0
     private var prefetchGeneration: UInt64 = 0
@@ -191,7 +208,17 @@ public class PublicationSpeechSynthesizer: Loggable {
     }
 
     private var readyForwardPrefetches: [ForwardPrefetch] = []
+    /// Continuations for `play` suspended on the next look-ahead ready/finished
+    /// event. Generation checks happen in the waiter *after* resume using its
+    /// own captured parameters — not stored here.
+    private var forwardPrefetchWaiters: [CheckedContinuation<Void, Never>] = []
     private var engineStorage: TTSEngine?
+
+    /// Whether `play` is suspended waiting for the next look-ahead item (or
+    /// look-ahead end). Used by tests instead of fixed `Task.sleep` delays.
+    var isWaitingForForwardPrefetchForTesting: Bool {
+        !forwardPrefetchWaiters.isEmpty
+    }
 
     private var engine: TTSEngine {
         if let engineStorage {
@@ -574,14 +601,35 @@ public class PublicationSpeechSynthesizer: Loggable {
 
         switch result {
         case .success:
-            let canContinueImmediately = !readyForwardPrefetches.isEmpty
-            if canContinueImmediately {
-                readyForwardPrefetches.removeFirst()
-            } else {
-                let oldPrefetchTask = invalidatePrefetch()
-                await oldPrefetchTask?.value
+            // Prefer waiting for an in-flight look-ahead item over cancel+resynth.
+            // Only wait for the *next* ready event (or task end) — never the full waterline.
+            if readyForwardPrefetches.isEmpty, forwardPrefetchTask != nil {
+                await waitUntilNextForwardReadyOrFinished(
+                    operationGeneration: generation,
+                    prefetchGeneration: prefetchGeneration
+                )
             }
-            guard generation == operationGeneration else { return }
+
+            guard !Task.isCancelled, generation == operationGeneration else {
+                return
+            }
+
+            // Always drain look-ahead cancellation before exclusive iterator /
+            // engine use. Config mid-utterance already advances
+            // `prefetchGeneration` and nils `forwardPrefetchTask` while the
+            // cancelled body may still be inside `iterator.next` or
+            // `engine.prefetch`. Comparing generations *after* speak therefore
+            // cannot see that invalidation (both sides already show the new epoch).
+            await prefetchCancellationTask?.value
+
+            guard !Task.isCancelled, generation == operationGeneration else {
+                return
+            }
+
+            if !readyForwardPrefetches.isEmpty {
+                readyForwardPrefetches.removeFirst()
+            }
+
             await playNextUtterance(.forward, generation: generation)
         case let .failure(error):
             invalidatePrefetch()
@@ -763,163 +811,360 @@ public class PublicationSpeechSynthesizer: Loggable {
             prefetchGeneration = self.prefetchGeneration
         }
         let cancellationTask = prefetchCancellationTask
-        forwardPrefetchTask = Task { [weak self] in
-            guard let self else { return }
+        forwardPrefetchTaskID &+= 1
+        let taskID = forwardPrefetchTaskID
+        let maximumPrefetchDuration = Self.maximumPrefetchDuration
+        let maximumSingleDuration = Self.maximumSingleUtterancePrefetchDuration
+        // Unstructured, MainActor-inherited task. Re-resolve `self` weakly around
+        // every suspension (`iterator.next` and `engine.prefetch`) so neither a
+        // gated content load nor multi-second neural synth pins the synthesizer
+        // via self → task → self.
+        let task = Task { [weak self] in
             await cancellationTask?.value
-            guard
-                operationGeneration == self.operationGeneration,
-                prefetchGeneration == self.prefetchGeneration
-            else {
-                return
-            }
-            await self.prefetchForward(
-                operationGeneration: generation,
-                prefetchGeneration: prefetchGeneration
-            )
-            guard
-                operationGeneration == self.operationGeneration,
-                prefetchGeneration == self.prefetchGeneration
-            else {
-                return
-            }
-            self.forwardPrefetchTask = nil
-        }
-    }
+            defer { self?.finishForwardPrefetch(taskID: taskID) }
 
-    private func prefetchForward(
-        operationGeneration: UInt64,
-        prefetchGeneration: UInt64
-    ) async {
-        guard let engine = engine as? TTSPrefetchingEngine else { return }
-        var candidates = Array(utterances.elementsAfterCurrent()) +
-            forwardGroups.flatMap { $0.utterances ?? [] }
-        var candidateIndex = 0
-        var prefetchedIdentifiers = Set(readyForwardPrefetches.map(\.identifier))
-        var duration = readyForwardPrefetches.reduce(into: 0) { $0 += $1.duration }
+            var candidates: [Utterance] = []
+            var candidateIndex = 0
+            var prefetchedIdentifiers = Set<UUID>()
+            var duration: TimeInterval = 0
 
-        while duration < Self.maximumPrefetchDuration {
-            guard
-                !Task.isCancelled,
-                operationGeneration == self.operationGeneration,
-                prefetchGeneration == self.prefetchGeneration
-            else {
-                return
-            }
-
-            if candidateIndex == candidates.count {
+            if let self {
                 guard
-                    let group = await loadForwardGroupForPrefetch(
-                        operationGeneration: operationGeneration,
+                    generation == self.operationGeneration,
+                    prefetchGeneration == self.prefetchGeneration
+                else {
+                    return
+                }
+                candidates = Array(self.utterances.elementsAfterCurrent()) +
+                    self.forwardGroups.flatMap { $0.utterances ?? [] }
+                prefetchedIdentifiers = Set(self.readyForwardPrefetches.map(\.identifier))
+                duration = self.readyForwardPrefetches.reduce(into: 0) { $0 += $1.duration }
+            } else {
+                return
+            }
+
+            while duration < maximumPrefetchDuration {
+                if candidateIndex == candidates.count {
+                    let loaded = await Self.loadNextForwardGroup(
+                        weakSynthesizer: WeakPublicationSpeechSynthesizer(self),
+                        operationGeneration: generation,
                         prefetchGeneration: prefetchGeneration
                     )
+                    switch loaded {
+                    case let .group(utterances):
+                        candidates.append(contentsOf: utterances)
+                        continue
+                    case .finished:
+                        // End of content, cancel, or failure — defer wakes waiters.
+                        return
+                    }
+                }
+
+                let utterance = candidates[candidateIndex]
+                candidateIndex += 1
+                guard prefetchedIdentifiers.insert(utterance.prefetchIdentifier).inserted else {
+                    continue
+                }
+
+                // Build locals under a short strong-self scope so `self` is not
+                // retained across the engine.prefetch suspension.
+                struct PreparedPrefetch {
+                    let engine: TTSPrefetchingEngine
+                    let utterance: TTSUtterance
+                    let identifier: UUID
+                }
+
+                let prepared: PreparedPrefetch
+                if let self {
+                    guard
+                        !Task.isCancelled,
+                        generation == self.operationGeneration,
+                        prefetchGeneration == self.prefetchGeneration
+                    else {
+                        return
+                    }
+                    guard let engine = self.engine as? TTSPrefetchingEngine else {
+                        return
+                    }
+                    prepared = PreparedPrefetch(
+                        engine: engine,
+                        utterance: self.ttsUtterance(for: utterance),
+                        identifier: utterance.prefetchIdentifier
+                    )
+                } else {
+                    return
+                }
+
+                let prefetchedDuration = await prepared.engine.prefetch(
+                    prepared.utterance,
+                    maximumDuration: maximumSingleDuration
+                )
+
+                guard let self else { return }
+                guard let prefetchedDuration else {
+                    // Prefetch failure — defer wakes waiters for live fallback.
+                    return
+                }
+                guard
+                    prefetchedDuration.isFinite,
+                    prefetchedDuration > 0,
+                    prefetchedDuration <= maximumSingleDuration
                 else {
                     return
                 }
                 guard
                     !Task.isCancelled,
-                    operationGeneration == self.operationGeneration,
+                    generation == self.operationGeneration,
                     prefetchGeneration == self.prefetchGeneration
                 else {
                     return
                 }
-                candidates.append(contentsOf: group.utterances ?? [])
+                self.readyForwardPrefetches.append(
+                    ForwardPrefetch(
+                        identifier: prepared.identifier,
+                        duration: prefetchedDuration
+                    )
+                )
+                duration += prefetchedDuration
+                // Wake consumers waiting for the next item only — do not make
+                // them await the rest of the waterline.
+                self.notifyForwardPrefetchWaiters()
+                // Let resumed waiters run on MainActor before more look-ahead.
+                await Task.yield()
+            }
+        }
+        forwardPrefetchTask = task
+        forwardPrefetchLifecycle.setTask(task)
+    }
+
+    private enum ForwardGroupLoadResult {
+        case group([Utterance])
+        case finished
+    }
+
+    /// Loads the next content group for look-ahead without retaining the
+    /// synthesizer across `iterator.next()` suspensions (only a weak box is held).
+    private static func loadNextForwardGroup(
+        weakSynthesizer: WeakPublicationSpeechSynthesizer,
+        operationGeneration: UInt64,
+        prefetchGeneration: UInt64
+    ) async -> ForwardGroupLoadResult {
+        let iterator: ContentIterator
+        var advanceCount: Int
+        if let synthesizer = weakSynthesizer.value {
+            guard
+                !Task.isCancelled,
+                operationGeneration == synthesizer.operationGeneration,
+                prefetchGeneration == synthesizer.prefetchGeneration,
+                let currentIterator = synthesizer.publicationIterator
+            else {
+                return .finished
+            }
+            iterator = currentIterator
+            advanceCount = synthesizer.trailingForwardAdvanceCount
+            synthesizer.trailingForwardAdvanceCount = 0
+        } else {
+            return .finished
+        }
+
+        var contentToPreserve: ContentElement?
+        while true {
+            if let synthesizer = weakSynthesizer.value {
+                guard
+                    synthesizer.publicationIterator === iterator,
+                    !Task.isCancelled,
+                    operationGeneration == synthesizer.operationGeneration,
+                    prefetchGeneration == synthesizer.prefetchGeneration
+                else {
+                    if synthesizer.publicationIterator === iterator {
+                        synthesizer.trailingForwardAdvanceCount = advanceCount
+                    }
+                    return .finished
+                }
+            } else {
+                return .finished
             }
 
-            let utterance = candidates[candidateIndex]
-            candidateIndex += 1
-            guard prefetchedIdentifiers.insert(utterance.prefetchIdentifier).inserted else {
-                continue
+            // No strong synthesizer across the iterator suspension.
+            let content: ContentElement?
+            do {
+                content = try await iterator.next()
+            } catch is CancellationError {
+                if let synthesizer = weakSynthesizer.value,
+                   synthesizer.publicationIterator === iterator
+                {
+                    if let preserved = contentToPreserve {
+                        synthesizer.forwardGroups.append(
+                            BufferedUtteranceGroup(
+                                content: preserved,
+                                utterances: nil,
+                                iteratorAdvanceCount: advanceCount
+                            )
+                        )
+                    } else {
+                        synthesizer.trailingForwardAdvanceCount = advanceCount
+                    }
+                }
+                return .finished
+            } catch {
+                if let synthesizer = weakSynthesizer.value {
+                    synthesizer.log(.error, error)
+                    if let preserved = contentToPreserve, synthesizer.publicationIterator === iterator {
+                        synthesizer.forwardGroups.append(
+                            BufferedUtteranceGroup(
+                                content: preserved,
+                                utterances: nil,
+                                iteratorAdvanceCount: advanceCount
+                            )
+                        )
+                    } else if synthesizer.publicationIterator === iterator {
+                        synthesizer.trailingForwardAdvanceCount = advanceCount
+                    }
+                }
+                return .finished
             }
-            guard let prefetchedDuration = await engine.prefetch(
-                ttsUtterance(for: utterance),
-                maximumDuration: Self.maximumSingleUtterancePrefetchDuration
-            ) else {
-                return
+
+            guard let content else {
+                if let synthesizer = weakSynthesizer.value,
+                   synthesizer.publicationIterator === iterator
+                {
+                    synthesizer.trailingForwardAdvanceCount = advanceCount
+                }
+                return .finished
             }
+            advanceCount += 1
+            contentToPreserve = content
+
+            // Re-check after the suspension: cancel/config may have invalidated
+            // look-ahead while `next()` was in flight. Do not tokenize/commit
+            // into a superseded generation (avoids racing playNext on the iterator).
+            guard let synthesizer = weakSynthesizer.value else { return .finished }
             guard
-                prefetchedDuration.isFinite,
-                prefetchedDuration > 0,
-                prefetchedDuration <= Self.maximumSingleUtterancePrefetchDuration
+                synthesizer.publicationIterator === iterator,
+                !Task.isCancelled,
+                operationGeneration == synthesizer.operationGeneration,
+                prefetchGeneration == synthesizer.prefetchGeneration
             else {
-                return
+                if synthesizer.publicationIterator === iterator {
+                    synthesizer.forwardGroups.append(
+                        BufferedUtteranceGroup(
+                            content: content,
+                            utterances: nil,
+                            iteratorAdvanceCount: advanceCount
+                        )
+                    )
+                }
+                return .finished
             }
+
+            // `tokenize` / `utterances(for:)` may re-enter the synthesizer (config
+            // change, next/previous) and invalidate this look-ahead generation.
+            // Capture results first, then re-validate before committing.
+            let nextUtterances: [Utterance]
+            do {
+                nextUtterances = try synthesizer.tokenize(content)
+                    .flatMap { synthesizer.utterances(for: $0) }
+            } catch {
+                if let synthesizer = weakSynthesizer.value {
+                    synthesizer.log(.error, error)
+                    if synthesizer.publicationIterator === iterator {
+                        synthesizer.forwardGroups.append(
+                            BufferedUtteranceGroup(
+                                content: content,
+                                utterances: nil,
+                                iteratorAdvanceCount: advanceCount
+                            )
+                        )
+                    }
+                }
+                return .finished
+            }
+
+            guard let synthesizer = weakSynthesizer.value else { return .finished }
+            guard
+                synthesizer.publicationIterator === iterator,
+                !Task.isCancelled,
+                operationGeneration == synthesizer.operationGeneration,
+                prefetchGeneration == synthesizer.prefetchGeneration
+            else {
+                // Superseded after tokenize: keep iterator accounting, drop stale
+                // utterances produced under a previous configuration.
+                if synthesizer.publicationIterator === iterator {
+                    synthesizer.forwardGroups.append(
+                        BufferedUtteranceGroup(
+                            content: content,
+                            utterances: nil,
+                            iteratorAdvanceCount: advanceCount
+                        )
+                    )
+                }
+                return .finished
+            }
+
+            if !nextUtterances.isEmpty {
+                let group = BufferedUtteranceGroup(
+                    content: content,
+                    utterances: nextUtterances,
+                    iteratorAdvanceCount: advanceCount
+                )
+                synthesizer.forwardGroups.append(group)
+                return .group(nextUtterances)
+            }
+
+            guard
+                synthesizer.publicationIterator === iterator,
+                !Task.isCancelled,
+                operationGeneration == synthesizer.operationGeneration,
+                prefetchGeneration == synthesizer.prefetchGeneration
+            else {
+                synthesizer.trailingForwardAdvanceCount = advanceCount
+                return .finished
+            }
+        }
+    }
+
+    /// Marks the forward task finished and wakes waiters. No-ops when superseded
+    /// by `invalidatePrefetch` (task id mismatch).
+    private func finishForwardPrefetch(taskID: UInt64) {
+        guard taskID == forwardPrefetchTaskID else {
+            return
+        }
+        forwardPrefetchTask = nil
+        forwardPrefetchLifecycle.clearTask()
+        notifyForwardPrefetchWaiters()
+    }
+
+    private func notifyForwardPrefetchWaiters() {
+        let waiters = forwardPrefetchWaiters
+        forwardPrefetchWaiters.removeAll(keepingCapacity: false)
+        for continuation in waiters {
+            continuation.resume()
+        }
+    }
+
+    /// Suspends until the next forward item is ready, the forward task ends
+    /// (failure / end of content / cancel), or generations no longer match.
+    ///
+    /// Check-and-register runs in one MainActor-synchronous section so a ready
+    /// or finished event cannot slip between the empty check and the waiter list.
+    private func waitUntilNextForwardReadyOrFinished(
+        operationGeneration: UInt64,
+        prefetchGeneration: UInt64
+    ) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             guard
                 !Task.isCancelled,
                 operationGeneration == self.operationGeneration,
                 prefetchGeneration == self.prefetchGeneration
             else {
+                continuation.resume()
                 return
             }
-            readyForwardPrefetches.append(
-                ForwardPrefetch(
-                    identifier: utterance.prefetchIdentifier,
-                    duration: prefetchedDuration
-                )
-            )
-            duration += prefetchedDuration
-        }
-    }
-
-    private func loadForwardGroupForPrefetch(
-        operationGeneration: UInt64,
-        prefetchGeneration: UInt64
-    ) async -> BufferedUtteranceGroup? {
-        guard let iterator = publicationIterator else { return nil }
-        var contentToPreserve: ContentElement?
-        var advanceCount = 0
-        do {
-            advanceCount = trailingForwardAdvanceCount
-            trailingForwardAdvanceCount = 0
-            while true {
-                guard publicationIterator === iterator else {
-                    return nil
-                }
-                guard let content = try await iterator.next() else {
-                    if publicationIterator === iterator {
-                        trailingForwardAdvanceCount = advanceCount
-                    }
-                    return nil
-                }
-                advanceCount += 1
-                guard publicationIterator === iterator else {
-                    return nil
-                }
-                contentToPreserve = content
-                let nextUtterances = try tokenize(content)
-                    .flatMap { utterances(for: $0) }
-                if !nextUtterances.isEmpty {
-                    let group = BufferedUtteranceGroup(
-                        content: content,
-                        utterances: nextUtterances,
-                        iteratorAdvanceCount: advanceCount
-                    )
-                    forwardGroups.append(group)
-                    return group
-                }
-                guard
-                    publicationIterator === iterator,
-                    prefetchGeneration == self.prefetchGeneration
-                else {
-                    trailingForwardAdvanceCount = advanceCount
-                    return nil
-                }
+            if !readyForwardPrefetches.isEmpty || forwardPrefetchTask == nil {
+                continuation.resume()
+                return
             }
-        } catch {
-            if !(error is CancellationError) {
-                log(.error, error)
-            }
-            if let content = contentToPreserve, publicationIterator === iterator {
-                forwardGroups.append(
-                    BufferedUtteranceGroup(
-                        content: content,
-                        utterances: nil,
-                        iteratorAdvanceCount: advanceCount
-                    )
-                )
-            } else if publicationIterator === iterator {
-                trailingForwardAdvanceCount = advanceCount
-            }
-            return nil
+            forwardPrefetchWaiters.append(continuation)
         }
     }
 
@@ -941,12 +1186,19 @@ public class PublicationSpeechSynthesizer: Loggable {
     @discardableResult
     private func invalidatePrefetch() -> Task<Void, Never>? {
         prefetchGeneration &+= 1
+        forwardPrefetchTaskID &+= 1
         readyForwardPrefetches = []
         preparedStartLocator = nil
         preparedUtterance = nil
         let task = forwardPrefetchTask
         forwardPrefetchTask = nil
+        // Drop lifecycle ownership before cancel so deinit of a racing release
+        // does not double-cancel after we finish sequencing below.
+        forwardPrefetchLifecycle.clearTask()
         task?.cancel()
+        // Always wake waiters: stop/pause/next/previous/config must not deadlock
+        // on a pending forward-ready continuation.
+        notifyForwardPrefetchWaiters()
         guard
             task != nil ||
             engineStorage is TTSPrefetchingEngine ||
@@ -954,6 +1206,7 @@ public class PublicationSpeechSynthesizer: Loggable {
         else {
             return nil
         }
+        // Still on MainActor here — call the isolated engine API directly.
         let engine = engineStorage as? TTSPrefetchingEngine
         engine?.cancelPrefetch()
         let previousCancellation = prefetchCancellationTask
@@ -1160,6 +1413,50 @@ public class PublicationSpeechSynthesizer: Loggable {
         }
 
         func play() {}
+    }
+}
+
+/// Holds the forward look-ahead task independently of MainActor teardown so
+/// releasing `PublicationSpeechSynthesizer` always cancels outstanding work.
+///
+/// Only stores `Task` cancellation (thread-safe). Never wraps `@MainActor`
+/// `cancelPrefetch()` — that must be invoked on the MainActor by the synthesizer.
+private final class ForwardPrefetchLifecycleHandle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+
+    func setTask(_ task: Task<Void, Never>) {
+        lock.lock()
+        self.task = task
+        lock.unlock()
+    }
+
+    func clearTask() {
+        lock.lock()
+        task = nil
+        lock.unlock()
+    }
+
+    func cancelTask() {
+        lock.lock()
+        let task = self.task
+        self.task = nil
+        lock.unlock()
+        task?.cancel()
+    }
+
+    deinit {
+        cancelTask()
+    }
+}
+
+/// Weak box so look-ahead helpers can re-resolve the synthesizer after awaits
+/// without the parameter list itself retaining it.
+private final class WeakPublicationSpeechSynthesizer: @unchecked Sendable {
+    weak var value: PublicationSpeechSynthesizer?
+
+    init(_ value: PublicationSpeechSynthesizer?) {
+        self.value = value
     }
 }
 
