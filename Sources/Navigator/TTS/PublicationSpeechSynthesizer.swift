@@ -928,7 +928,20 @@ public class PublicationSpeechSynthesizer: Loggable {
             return .ready
         }
 
-        // Retokenize with config-epoch capture; retry if config changes mid-flight.
+        // Apply locator trim once, then re-run only the config-sensitive tokenizer
+        // if config re-enters. Bounded retries prevent MainActor livelock.
+        let preparedContent: ContentElement
+        if let self = weakSynthesizer.value {
+            guard self.isCurrentOperation(generation, iterator: iterator) else {
+                restorePending(nil)
+                return .failed
+            }
+            preparedContent = self.applyingStartTextIfNeeded(group.content)
+        } else {
+            return .failed
+        }
+
+        var configRetries = 0
         while true {
             let prefetchEpoch: UInt64
             let tokenized: [Utterance]
@@ -939,7 +952,7 @@ public class PublicationSpeechSynthesizer: Loggable {
                 }
                 prefetchEpoch = self.prefetchGeneration
                 do {
-                    tokenized = try self.tokenize(group.content)
+                    tokenized = try self.tokenizePrepared(preparedContent)
                         .flatMap { self.utterances(for: $0) }
                 } catch {
                     if let self = weakSynthesizer.value, self.publicationIterator === iterator {
@@ -959,7 +972,12 @@ public class PublicationSpeechSynthesizer: Loggable {
             }
             // Config change only bumps prefetchGeneration — must not commit stale tokens.
             if prefetchEpoch != self.prefetchGeneration {
-                // Group was already removed; keep as pending nil and retry with new config.
+                configRetries += 1
+                if configRetries > Self.maximumConfigTokenizeRetries {
+                    // Leave group pending for a later epoch; do not spin on MainActor.
+                    restorePending(nil)
+                    return .failed
+                }
                 continue
             }
 
@@ -1087,7 +1105,22 @@ public class PublicationSpeechSynthesizer: Loggable {
                 usesPendingResult = false
             }
 
-            // Tokenize with config-epoch capture; retry on config reentry.
+            // Locator trim once per content; config-sensitive tokenize may retry
+            // a bounded number of times without spinning MainActor forever.
+            let preparedContent: ContentElement
+            if let self = weakSynthesizer.value {
+                guard self.isCurrentOperation(generation, iterator: iterator) else {
+                    if self.publicationIterator === iterator {
+                        self.pendingIteratorResult = (iterator, direction, content)
+                    }
+                    return false
+                }
+                preparedContent = self.applyingStartTextIfNeeded(content)
+            } else {
+                return false
+            }
+
+            var configRetries = 0
             while true {
                 let prefetchEpoch: UInt64
                 let tokenized: [Utterance]
@@ -1100,7 +1133,7 @@ public class PublicationSpeechSynthesizer: Loggable {
                     }
                     prefetchEpoch = self.prefetchGeneration
                     do {
-                        tokenized = try self.tokenize(content)
+                        tokenized = try self.tokenizePrepared(preparedContent)
                             .flatMap { self.utterances(for: $0) }
                     } catch {
                         if let self = weakSynthesizer.value {
@@ -1120,8 +1153,14 @@ public class PublicationSpeechSynthesizer: Loggable {
                     return false
                 }
                 if prefetchEpoch != self.prefetchGeneration {
-                    // Config changed during tokenize — keep content, retokenize
-                    // with the new configuration instead of committing stale text.
+                    configRetries += 1
+                    if configRetries > Self.maximumConfigTokenizeRetries {
+                        // Abort this load; content preserved via pending if needed.
+                        if self.publicationIterator === iterator {
+                            self.pendingIteratorResult = (iterator, direction, content)
+                        }
+                        return false
+                    }
                     continue
                 }
 
@@ -1543,29 +1582,40 @@ public class PublicationSpeechSynthesizer: Loggable {
 
             // Capture epoch before tokenize; config reentry only bumps prefetchGeneration.
             let content = group.content
-            let epochAtStart = self.prefetchGeneration
-            let nextUtterances = try tokenize(content)
-                .flatMap { utterances(for: $0) }
+            // Trim once per group content; config-only retries re-run tokenizer.
+            let prepared = applyingStartTextIfNeeded(content)
+            var configRetries = 0
+            let nextUtterances: [Utterance]
+            while true {
+                let epochAtStart = self.prefetchGeneration
+                let tokenized = try tokenizePrepared(prepared)
+                    .flatMap { utterances(for: $0) }
 
-            // Tokenizer may re-enter (config / stop / next). Never write using a
-            // captured index without re-validating identity and generations.
-            guard
-                !Task.isCancelled,
-                operationGeneration == self.operationGeneration,
-                forwardGroups.indices.contains(index),
-                forwardGroups[index].utterances == nil
-            else {
-                return nil
-            }
+                guard
+                    !Task.isCancelled,
+                    operationGeneration == self.operationGeneration,
+                    forwardGroups.indices.contains(index),
+                    forwardGroups[index].utterances == nil
+                else {
+                    return nil
+                }
 
-            // Config changed during tokenize: caller’s look-ahead epoch is stale.
-            // Abort this collect so a newer forward task retokenizes cleanly.
-            // (Do not write tokens produced under a superseded config.)
-            guard
-                epochAtStart == self.prefetchGeneration,
-                prefetchGeneration == self.prefetchGeneration
-            else {
-                return nil
+                if epochAtStart != self.prefetchGeneration ||
+                    prefetchGeneration != self.prefetchGeneration
+                {
+                    configRetries += 1
+                    if configRetries > Self.maximumConfigTokenizeRetries {
+                        return nil
+                    }
+                    // Caller epoch may be stale; abort so a newer task restarts.
+                    if prefetchGeneration != self.prefetchGeneration {
+                        return nil
+                    }
+                    continue
+                }
+
+                nextUtterances = tokenized
+                break
             }
 
             forwardGroups[index] = BufferedUtteranceGroup(
@@ -1747,25 +1797,39 @@ public class PublicationSpeechSynthesizer: Loggable {
         }
     }
 
-    /// Splits a publication `ContentElement` item into smaller chunks using the provided tokenizer.
-    ///
-    /// This is used to split a paragraph into sentences, for example.
-    func tokenize(_ element: ContentElement) throws -> [ContentElement] {
+    /// Maximum times a single content block may re-tokenize after config reentry
+    /// during one load. Prevents a hostile/custom tokenizer from livelocking the
+    /// MainActor by flipping config on every call.
+    private static let maximumConfigTokenizeRetries = 8
+
+    /// Applies locator `startText` trimming at most once per synthesizer start
+    /// position, producing content that can be re-tokenized under changing
+    /// configs without losing the trim.
+    private func applyingStartTextIfNeeded(_ element: ContentElement) -> ContentElement {
         guard
             let startText,
             var first = element as? TextContentElement
         else {
-            let tokenizer = tokenizerFactory(config.defaultLanguage ?? publication.metadata.language)
-            return try tokenizer(element)
+            return element
         }
-        defer { self.startText = nil }
-
+        self.startText = nil
         if let offset = textOffset(in: first, for: startText) {
             first.segments = trimming(first.segments, before: offset)
         }
+        return first
+    }
 
+    /// Config-sensitive sentence split only (no locator trim).
+    private func tokenizePrepared(_ element: ContentElement) throws -> [ContentElement] {
         let tokenizer = tokenizerFactory(config.defaultLanguage ?? publication.metadata.language)
-        return try tokenizer(first)
+        return try tokenizer(element)
+    }
+
+    /// Splits a publication `ContentElement` item into smaller chunks using the provided tokenizer.
+    ///
+    /// This is used to split a paragraph into sentences, for example.
+    func tokenize(_ element: ContentElement) throws -> [ContentElement] {
+        try tokenizePrepared(applyingStartTextIfNeeded(element))
     }
 
     private func textOffset(in element: TextContentElement, for startText: Locator.Text) -> Int? {

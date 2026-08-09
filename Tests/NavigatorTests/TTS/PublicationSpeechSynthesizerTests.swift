@@ -1546,7 +1546,9 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
     }
 
     func testEmptyBufferedGroupDoesNotRetainAcrossSubsequentIteratorHang() async throws {
-        // "vanish" retokenizes to empty under fr; next content load hangs on the gate.
+        // Fill the entire forward waterline with "vanish" (15s) so forward stops
+        // without hanging on a later next(). Live load after empty drain is the
+        // gated call that must not pin self.
         let iterator = GatedArrayContentIterator(
             elements: [
                 textElement("first", href: "first.xhtml"),
@@ -1554,11 +1556,16 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
                 textElement("second", href: "second.xhtml"),
             ],
             startIndex: 0,
+            // call 1: first (play), call 2: vanish (forward waterline), call 3: live second
             gatedNextCall: 3,
             delaysCancellationExit: true
         )
         let french = Language("fr")
-        let engine = PrefetchingTTSEngine(prefetchResult: 5)
+        var vanishRetokenizedEmpty = false
+        let engine = PrefetchingTTSEngine(
+            prefetchDurations: ["vanish": 15],
+            clampsPrefetchDuration: true
+        )
         var synthesizer: PublicationSpeechSynthesizer? = try makeSynthesizer(
             contentService: IteratorContentService(iteratorFactory: { iterator }),
             engine: engine,
@@ -1570,6 +1577,7 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
                     let raw = text.segments.map(\.text).joined()
                     if language?.code.bcp47.lowercased().hasPrefix("fr") == true {
                         if raw == "vanish" {
+                            vanishRetokenizedEmpty = true
                             return [] // empty after config retokenize
                         }
                         text.segments = text.segments.map { segment in
@@ -1587,15 +1595,19 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         synthesizer?.start()
         try await waitUntil {
             engine.spokenTexts == ["first"] &&
-                engine.prefetchedTexts.contains("vanish")
+                engine.prefetchedTexts.contains("vanish") &&
+                // Forward waterline full — must not still be suspended on call 3.
+                !iterator.hasSuspendedNext
         }
-        // Invalidate buffered "vanish"; forward may be hung on call 3.
+        XCTAssertEqual(iterator.nextCallCount, 2)
+
         synthesizer?.config.defaultLanguage = french
         engine.completeSpeech()
-        // Empty group drain must not pin self across the following iterator hang.
+        // Live path: empty vanish group drained, then hang on live second (call 3).
         try await waitUntil {
-            iterator.hasSuspendedNext || iterator.hasSuspendedCleanup
+            vanishRetokenizedEmpty && iterator.hasSuspendedNext && iterator.nextCallCount == 3
         }
+        XCTAssertFalse(iterator.hasSuspendedCleanup)
 
         synthesizer = nil
         try await waitUntil { weakSynthesizer == nil }
@@ -1605,6 +1617,131 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
             }
             return iterator.activeCallCount == 0
         }
+    }
+
+    func testConfigTokenizeRetryDoesNotSpinForever() async throws {
+        final class FlipFlopTokenizer: @unchecked Sendable {
+            weak var synthesizer: PublicationSpeechSynthesizer?
+            var calls = 0
+
+            func makeTokenizer(language: Language?) -> ContentTokenizer {
+                { [self] element in
+                    calls += 1
+                    let raw = (element as? TextContentElement)?.segments.map(\.text).joined() ?? ""
+                    // Only flip on "second" so first can start; unbounded flip would
+                    // livelock MainActor without a retry cap.
+                    if raw == "second" {
+                        if language?.code.bcp47.lowercased().hasPrefix("fr") == true {
+                            synthesizer?.config.defaultLanguage = Language("en")
+                        } else {
+                            synthesizer?.config.defaultLanguage = Language("fr")
+                        }
+                    }
+                    return [element]
+                }
+            }
+        }
+
+        let tokenizer = FlipFlopTokenizer()
+        let engine = PrefetchingTTSEngine()
+        let synthesizer = try makeSynthesizer(
+            elements: [textElement("first"), textElement("second")],
+            engine: engine,
+            tokenizerFactory: { language in tokenizer.makeTokenizer(language: language) }
+        )
+        tokenizer.synthesizer = synthesizer
+
+        synthesizer.start()
+        try await waitUntil { engine.spokenTexts == ["first"] }
+        let callsAfterFirst = tokenizer.calls
+        engine.completeSpeech()
+        // Must return to a stable state without hanging the MainActor.
+        try await waitUntil(timeout: 2) {
+            synthesizer.state == .stopped || engine.spokenTexts.count >= 2
+        }
+        // Bounded retries: far fewer than an unbounded spin.
+        XCTAssertLessThan(tokenizer.calls - callsAfterFirst, 40)
+        synthesizer.stop()
+    }
+
+    func testStartTextTrimSurvivesConfigReentryDuringTokenize() async throws {
+        final class ReentrantTokenizer: @unchecked Sendable {
+            weak var synthesizer: PublicationSpeechSynthesizer?
+            private var didFlip = false
+
+            func makeTokenizer(language: Language?) -> ContentTokenizer {
+                { [self] element in
+                    if !didFlip {
+                        didFlip = true
+                        synthesizer?.config.defaultLanguage = Language("fr")
+                    }
+                    return [element]
+                }
+            }
+        }
+
+        let full = "prefix kept body"
+        let tokenizer = ReentrantTokenizer()
+        let engine = PrefetchingTTSEngine()
+        let start = locator(text: .init(before: "prefix ", highlight: "kept body"))
+        let element = TextContentElement(
+            locator: start,
+            role: .body,
+            segments: [.init(locator: start, text: full)]
+        )
+        let synthesizer = try makeSynthesizer(
+            elements: [element],
+            engine: engine,
+            tokenizerFactory: { language in tokenizer.makeTokenizer(language: language) }
+        )
+        tokenizer.synthesizer = synthesizer
+
+        synthesizer.start(from: start)
+        try await waitUntil { engine.spokenTexts.count == 1 }
+        // Trim must still apply after config reentry discarded the first tokenize.
+        XCTAssertEqual(engine.spokenTexts[0], "kept body")
+        synthesizer.stop()
+    }
+
+    func testPendingOppositeUndoAccountsForCancelThatStillReturnsElement() async throws {
+        let iterator = GatedArrayContentIterator(
+            elements: [
+                textElement("first", href: "a.xhtml"),
+                textElement("second", href: "b.xhtml"),
+                textElement("third", href: "c.xhtml"),
+            ],
+            startIndex: 0,
+            gatedNextCall: 2,
+            gatedPreviousCall: 1,
+            returnsElementOnCancellation: true
+        )
+        let engine = SpeechEngine()
+        let synthesizer = try makeSynthesizer(
+            contentService: IteratorContentService(iteratorFactory: { iterator }),
+            engine: engine
+        )
+
+        synthesizer.start()
+        try await waitUntil { engine.spokenTexts == ["first"] }
+        synthesizer.next()
+        try await waitUntil { iterator.hasSuspendedNext }
+        // Cancelled next still returns second (returnsElementOnCancellation).
+        synthesizer.previous()
+        try await waitUntil { iterator.hasSuspendedPrevious || engine.spokenTexts.count >= 1 }
+        // Continuous direction changes must not double-undo or skip.
+        synthesizer.next()
+        try await waitUntil { engine.spokenTexts.contains("second") }
+        XCTAssertEqual(iterator.maximumConcurrentCalls, 1)
+        // Should speak second once, not jump to third due to double undo.
+        engine.completeSpeech()
+        try await waitUntil {
+            engine.spokenTexts == ["first", "second"] ||
+                engine.spokenTexts == ["first", "second", "third"] ||
+                engine.spokenTexts.contains("second")
+        }
+        let secondCount = engine.spokenTexts.filter { $0 == "second" }.count
+        XCTAssertEqual(secondCount, 1)
+        synthesizer.stop()
     }
 
     func testBufferedGroupRetokenizeReentryStopDoesNotCrash() async throws {
@@ -2219,7 +2356,11 @@ private final class GatedArrayContentIterator: ContentIterator, @unchecked Senda
                 }
                 continuation?.resume()
             }
-            try Task.checkCancellation()
+            // Match next(): when returnsElementOnCancellation, still return the
+            // element after a successful gate resume even if the task is cancelled.
+            if !returnsElementOnCancellation {
+                try Task.checkCancellation()
+            }
         }
         return lock.withLock {
             guard index - 1 >= 0 else { return nil }
