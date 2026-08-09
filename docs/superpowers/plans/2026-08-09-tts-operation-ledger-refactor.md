@@ -64,19 +64,19 @@ func testConfigRetryExhaustionRetainsPreparedStartText() async throws {
 }
 ```
 
-- [ ] **Step 4: Write the failing stable-slot test and run all three**
+- [ ] **Step 4: Strengthen the existing stable-slot characterization and run the red tests**
 
-During retokenization of a buffered second group, synchronously call `stop()` from the tokenizer and then return the stale tokenizer result. Assert no stale third utterance is prefetched or spoken and a later restart speaks its new first item exactly once. Do not describe this as asynchronously releasing a gate: the custom tokenizer is MainActor-synchronous.
+Extend `testBufferedGroupRetokenizeReentryStopDoesNotCrash` so its synchronous `stop()` reentry also asserts that no stale buffered utterance is prefetched or spoken after the stale tokenizer result returns. This is a green characterization: the current implementation already rejects this stale commit, so it must pass rather than be forced into an invalid timeout. Keep the red cycle focused on the two raw/prepared persistence regressions above.
 
 ```swift
-func testRetokenizationStopCannotCommitToShiftedForwardGroup() async throws {
-    // Stop from tokenizer re-entry after a forward destination was captured.
+func testBufferedGroupRetokenizeReentryStopDoesNotCommitStaleResult() async throws {
+    // Return a stale result after synchronous stop and assert it remains unobservable.
 }
 ```
 
 Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests`
 
-Expected: these new tests fail while unrelated existing tests pass.
+Expected: the two prepared-content tests fail for `prefix kept body`; the strengthened existing stable-slot characterization passes.
 
 - [ ] **Step 5: Commit the red tests**
 
