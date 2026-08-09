@@ -1589,6 +1589,68 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         try await waitUntil { weakSynthesizer == nil }
     }
 
+    func testReleasingSynthesizerDuringForwardPrefetchWaitAllowsDeinit() async throws {
+        let engine = PrefetchingTTSEngine(
+            defersPrefetch: true,
+            cancelsPendingPrefetch: true
+        )
+        var synthesizer: PublicationSpeechSynthesizer? = try makeSynthesizer(
+            elements: [textElement("first"), textElement("second")],
+            engine: engine
+        )
+        weak let weakSynthesizer = synthesizer
+
+        synthesizer?.start()
+        try await waitUntil {
+            engine.spokenTexts == ["first"] && engine.hasPendingPrefetch
+        }
+        engine.completeSpeech()
+        try await waitUntil {
+            synthesizer?.isWaitingForForwardPrefetchForTesting == true
+        }
+
+        // Hung on inter-sentence waiter; weak worker + independent registry
+        // must allow deinit (which resumes waiters / cancels tasks).
+        synthesizer = nil
+        try await waitUntil { weakSynthesizer == nil }
+        try await waitUntil { engine.cancelPrefetchCount >= 1 || !engine.hasPendingPrefetch }
+    }
+
+    func testReleasingSynthesizerDuringLiveIteratorLoadAllowsDeinit() async throws {
+        let iterator = GatedArrayContentIterator(
+            elements: [
+                textElement("first", href: "first.xhtml"),
+                textElement("second", href: "second.xhtml"),
+            ],
+            startIndex: 0,
+            gatedNextCall: 2,
+            delaysCancellationExit: true
+        )
+        // Non-prefetching engine so continuation uses live iterator load.
+        let engine = SpeechEngine()
+        var synthesizer: PublicationSpeechSynthesizer? = try makeSynthesizer(
+            contentService: IteratorContentService(iteratorFactory: { iterator }),
+            engine: engine
+        )
+        weak let weakSynthesizer = synthesizer
+
+        synthesizer?.start()
+        try await waitUntil { engine.spokenTexts == ["first"] }
+        engine.completeSpeech()
+        // After first ends with no waterline, live load of second suspends on gate.
+        try await waitUntil { iterator.hasSuspendedNext }
+
+        synthesizer = nil
+        try await waitUntil { weakSynthesizer == nil }
+        // Cancelled playback may still be draining a delayed-cancellation next().
+        try await waitUntil {
+            if iterator.hasSuspendedCleanup {
+                iterator.openCleanupGate()
+            }
+            return !iterator.hasSuspendedNext && iterator.activeCallCount == 0
+        }
+    }
+
     func testPrefetchTokenizationFailureDoesNotSkipContent() async throws {
         let tokenizer = FailingOnceTokenizer(failingText: "second")
         let engine = PrefetchingTTSEngine()
