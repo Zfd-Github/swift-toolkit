@@ -1471,27 +1471,34 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
 
     func testBufferedGroupRetokenizeReentryConfigDoesNotCommitStaleResult() async throws {
         let french = Language("fr")
+        let german = Language("de")
         final class ReentrantTokenizer: @unchecked Sendable {
-            var onRetokenize: (() -> Void)?
-            private var retokenizeCount = 0
+            var onCollectRetokenize: (() -> Void)?
+            private var frenchTokenizeCount = 0
 
             func makeTokenizer(language: Language?) -> ContentTokenizer {
                 { [self] element in
                     guard var text = element as? TextContentElement else {
                         return [element]
                     }
-                    // Buffered-group retokenize after config invalidation uses fr.
-                    if language?.code.bcp47.lowercased().hasPrefix("fr") == true {
-                        retokenizeCount += 1
-                        if retokenizeCount == 1 {
-                            // Re-enter: invalidate again under the in-flight tokenize.
-                            onRetokenize?()
+                    let code = language?.code.bcp47.lowercased() ?? ""
+                    if code.hasPrefix("fr") {
+                        frenchTokenizeCount += 1
+                        // Second French tokenize is collectForwardPrefetchCandidates
+                        // retokenizing the remaining invalidated "third" group while
+                        // "fr second" is already playing — not the live second consume.
+                        if frenchTokenizeCount == 2 {
+                            onCollectRetokenize?()
                         }
                         text.segments = text.segments.map { segment in
                             var segment = segment
-                            if !segment.text.hasPrefix("fr ") {
-                                segment.text = "fr " + segment.text
-                            }
+                            segment.text = "fr " + segment.text
+                            return segment
+                        }
+                    } else if code.hasPrefix("de") {
+                        text.segments = text.segments.map { segment in
+                            var segment = segment
+                            segment.text = "de " + segment.text
                             return segment
                         }
                     }
@@ -1511,21 +1518,93 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
             engine: engine,
             tokenizerFactory: { language in tokenizer.makeTokenizer(language: language) }
         )
-        tokenizer.onRetokenize = { [weak synthesizer] in
-            // Bump generation / re-invalidate groups while first retokenize is mid-flight.
-            synthesizer?.config.defaultLanguage = Language("de")
-            synthesizer?.config.defaultLanguage = french
+        tokenizer.onCollectRetokenize = { [weak synthesizer] in
+            // Mid-collect reentry: final config is German — stale "fr third" must not win.
+            synthesizer?.config.defaultLanguage = german
         }
 
         synthesizer.start()
         try await waitUntil {
-            engine.spokenTexts == ["first"] && engine.prefetchedTexts.contains("second")
+            engine.spokenTexts == ["first"] &&
+                engine.prefetchedTexts.contains("second") &&
+                engine.prefetchedTexts.contains("third")
         }
+        // Invalidate buffered groups; live path consumes second under French
+        // (frenchTokenizeCount == 1). While second speaks, collect retokenizes
+        // remaining "third" (count == 2) and re-enters to German.
         synthesizer.config.defaultLanguage = french
         engine.completeSpeech()
-        // Must still play correctly under the latest config without crashing.
-        try await waitUntil { engine.spokenTexts.contains(where: { $0.contains("second") }) }
+        try await waitUntil { engine.spokenTexts == ["first", "fr second"] }
+
+        // Stale "fr third" from the interrupted collect must not be committed;
+        // after second ends, live load uses German.
+        engine.completeSpeech()
+        try await waitUntil { engine.spokenTexts == ["first", "fr second", "de third"] }
+        XCTAssertFalse(engine.spokenTexts.contains("fr third"))
+        XCTAssertFalse(engine.prefetchedTexts.contains("fr third"))
         synthesizer.stop()
+    }
+
+    func testEmptyBufferedGroupDoesNotRetainAcrossSubsequentIteratorHang() async throws {
+        // "vanish" retokenizes to empty under fr; next content load hangs on the gate.
+        let iterator = GatedArrayContentIterator(
+            elements: [
+                textElement("first", href: "first.xhtml"),
+                textElement("vanish", href: "vanish.xhtml"),
+                textElement("second", href: "second.xhtml"),
+            ],
+            startIndex: 0,
+            gatedNextCall: 3,
+            delaysCancellationExit: true
+        )
+        let french = Language("fr")
+        let engine = PrefetchingTTSEngine(prefetchResult: 5)
+        var synthesizer: PublicationSpeechSynthesizer? = try makeSynthesizer(
+            contentService: IteratorContentService(iteratorFactory: { iterator }),
+            engine: engine,
+            tokenizerFactory: { language in
+                { content in
+                    guard var text = content as? TextContentElement else {
+                        return [content]
+                    }
+                    let raw = text.segments.map(\.text).joined()
+                    if language?.code.bcp47.lowercased().hasPrefix("fr") == true {
+                        if raw == "vanish" {
+                            return [] // empty after config retokenize
+                        }
+                        text.segments = text.segments.map { segment in
+                            var segment = segment
+                            segment.text = "fr " + segment.text
+                            return segment
+                        }
+                    }
+                    return [text]
+                }
+            }
+        )
+        weak let weakSynthesizer = synthesizer
+
+        synthesizer?.start()
+        try await waitUntil {
+            engine.spokenTexts == ["first"] &&
+                engine.prefetchedTexts.contains("vanish")
+        }
+        // Invalidate buffered "vanish"; forward may be hung on call 3.
+        synthesizer?.config.defaultLanguage = french
+        engine.completeSpeech()
+        // Empty group drain must not pin self across the following iterator hang.
+        try await waitUntil {
+            iterator.hasSuspendedNext || iterator.hasSuspendedCleanup
+        }
+
+        synthesizer = nil
+        try await waitUntil { weakSynthesizer == nil }
+        try await waitUntil {
+            if iterator.hasSuspendedCleanup {
+                iterator.openCleanupGate()
+            }
+            return iterator.activeCallCount == 0
+        }
     }
 
     func testBufferedGroupRetokenizeReentryStopDoesNotCrash() async throws {

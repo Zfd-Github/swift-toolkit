@@ -820,95 +820,162 @@ public class PublicationSpeechSynthesizer: Loggable {
 
     /// Loads the next content block for playback without retaining the
     /// synthesizer across `iterator.next` / `previous` suspensions.
+    ///
+    /// Empty buffered groups are drained iteratively (never via a recursive
+    /// await under a strong `self` binding) so a subsequent hanging
+    /// `iterator.next` cannot re-form self → currentTask → self.
     private static func loadNextUtterances(
         weakSynthesizer: WeakPublicationSpeechSynthesizer,
         direction: Direction,
         generation: UInt64
     ) async -> Bool {
-        // Prefer buffered forward groups when playing forward.
-        if direction == .forward {
-            enum GroupStep {
-                case use(BufferedUtteranceGroup, ContentIterator)
-                case none
-                case abort
-            }
-            let step: GroupStep
-            if let self = weakSynthesizer.value {
-                guard self.isCurrentOperation(generation) else { return false }
-                if self.forwardGroups.isEmpty {
-                    step = .none
-                } else if let iterator = self.publicationIterator {
-                    step = .use(self.forwardGroups.removeFirst(), iterator)
-                } else {
-                    return false
+        while true {
+            if direction == .forward {
+                enum GroupStep {
+                    case use(BufferedUtteranceGroup, ContentIterator)
+                    case none
                 }
-            } else {
-                return false
-            }
-
-            switch step {
-            case .none:
-                break
-            case .abort:
-                return false
-            case let .use(group, iterator):
-                let nextUtterances: [Utterance]
-                if let existing = group.utterances {
-                    nextUtterances = existing
-                } else if let self = weakSynthesizer.value {
-                    do {
-                        nextUtterances = try self.tokenize(group.content)
-                            .flatMap { self.utterances(for: $0) }
-                    } catch {
-                        if let self = weakSynthesizer.value, self.publicationIterator === iterator {
-                            self.forwardGroups.insert(group, at: 0)
-                            self.log(.error, error)
-                        }
+                let step: GroupStep
+                if let self = weakSynthesizer.value {
+                    guard self.isCurrentOperation(generation) else { return false }
+                    if self.forwardGroups.isEmpty {
+                        step = .none
+                    } else if let iterator = self.publicationIterator {
+                        step = .use(self.forwardGroups.removeFirst(), iterator)
+                    } else {
                         return false
                     }
                 } else {
                     return false
                 }
 
-                guard let self = weakSynthesizer.value else { return false }
-                guard self.isCurrentOperation(generation, iterator: iterator) else {
-                    if self.publicationIterator === iterator {
-                        self.forwardGroups.insert(
-                            BufferedUtteranceGroup(
-                                content: group.content,
-                                utterances: group.utterances,
-                                iteratorAdvanceCount: group.iteratorAdvanceCount
-                            ),
-                            at: 0
-                        )
-                    }
-                    return false
-                }
+                switch step {
+                case .none:
+                    break // fall through to iterator load
 
-                guard !nextUtterances.isEmpty else {
-                    if self.forwardGroups.isEmpty {
-                        self.trailingForwardAdvanceCount += group.iteratorAdvanceCount
-                    } else {
-                        self.forwardGroups[0] = self.forwardGroups[0]
-                            .addingIteratorAdvanceCount(group.iteratorAdvanceCount)
-                    }
-                    return await loadNextUtterances(
+                case let .use(group, iterator):
+                    // Retokenize under short self scopes; may loop if config re-enters.
+                    let committed = await consumeForwardGroup(
                         weakSynthesizer: weakSynthesizer,
-                        direction: direction,
+                        group: group,
+                        iterator: iterator,
                         generation: generation
                     )
+                    switch committed {
+                    case .ready:
+                        return true
+                    case .emptyContinue:
+                        // Strong self already dropped — iterate to next group / iterator.
+                        continue
+                    case .failed:
+                        return false
+                    }
                 }
-
-                self.utterances = CursorList(list: nextUtterances, startIndex: 0)
-                return true
             }
+
+            return await loadNextUtterancesFromIterator(
+                weakSynthesizer: weakSynthesizer,
+                direction: direction,
+                generation: generation
+            )
+        }
+    }
+
+    private enum ForwardGroupConsumeResult {
+        case ready
+        case emptyContinue
+        case failed
+    }
+
+    /// Consumes one buffered forward group. Retokenizes when `utterances == nil`,
+    /// re-checking operation + config (prefetch) epochs after tokenizer reentry.
+    private static func consumeForwardGroup(
+        weakSynthesizer: WeakPublicationSpeechSynthesizer,
+        group: BufferedUtteranceGroup,
+        iterator: ContentIterator,
+        generation: UInt64
+    ) async -> ForwardGroupConsumeResult {
+        func restorePending(_ utterances: [Utterance]?) {
+            guard let self = weakSynthesizer.value, self.publicationIterator === iterator else {
+                return
+            }
+            self.forwardGroups.insert(
+                BufferedUtteranceGroup(
+                    content: group.content,
+                    utterances: utterances,
+                    iteratorAdvanceCount: group.iteratorAdvanceCount
+                ),
+                at: 0
+            )
         }
 
-        return await loadNextUtterancesFromIterator(
-            weakSynthesizer: weakSynthesizer,
-            direction: direction,
-            generation: generation
-        )
+        if let existing = group.utterances {
+            guard let self = weakSynthesizer.value else { return .failed }
+            guard self.isCurrentOperation(generation, iterator: iterator) else {
+                restorePending(existing)
+                return .failed
+            }
+            if existing.isEmpty {
+                if self.forwardGroups.isEmpty {
+                    self.trailingForwardAdvanceCount += group.iteratorAdvanceCount
+                } else {
+                    self.forwardGroups[0] = self.forwardGroups[0]
+                        .addingIteratorAdvanceCount(group.iteratorAdvanceCount)
+                }
+                return .emptyContinue
+            }
+            self.utterances = CursorList(list: existing, startIndex: 0)
+            return .ready
+        }
+
+        // Retokenize with config-epoch capture; retry if config changes mid-flight.
+        while true {
+            let prefetchEpoch: UInt64
+            let tokenized: [Utterance]
+            if let self = weakSynthesizer.value {
+                guard self.isCurrentOperation(generation, iterator: iterator) else {
+                    restorePending(nil)
+                    return .failed
+                }
+                prefetchEpoch = self.prefetchGeneration
+                do {
+                    tokenized = try self.tokenize(group.content)
+                        .flatMap { self.utterances(for: $0) }
+                } catch {
+                    if let self = weakSynthesizer.value, self.publicationIterator === iterator {
+                        self.forwardGroups.insert(group, at: 0)
+                        self.log(.error, error)
+                    }
+                    return .failed
+                }
+            } else {
+                return .failed
+            }
+
+            guard let self = weakSynthesizer.value else { return .failed }
+            guard self.isCurrentOperation(generation, iterator: iterator) else {
+                restorePending(nil)
+                return .failed
+            }
+            // Config change only bumps prefetchGeneration — must not commit stale tokens.
+            if prefetchEpoch != self.prefetchGeneration {
+                // Group was already removed; keep as pending nil and retry with new config.
+                continue
+            }
+
+            if tokenized.isEmpty {
+                if self.forwardGroups.isEmpty {
+                    self.trailingForwardAdvanceCount += group.iteratorAdvanceCount
+                } else {
+                    self.forwardGroups[0] = self.forwardGroups[0]
+                        .addingIteratorAdvanceCount(group.iteratorAdvanceCount)
+                }
+                return .emptyContinue
+            }
+
+            self.utterances = CursorList(list: tokenized, startIndex: 0)
+            return .ready
+        }
     }
 
     private static func loadNextUtterancesFromIterator(
@@ -932,7 +999,8 @@ public class PublicationSpeechSynthesizer: Loggable {
             enum ContentLoad {
                 case ready(ContentElement, usesPending: Bool)
                 case fetch
-                case opposite(Direction)
+                /// Opposite step to undo a pending advance from a cancelled load.
+                case opposite(undoDirection: Direction, expectedPendingDirection: Direction)
             }
 
             let load: ContentLoad
@@ -947,9 +1015,10 @@ public class PublicationSpeechSynthesizer: Loggable {
                     if pending.direction == direction {
                         load = .ready(pending.content, usesPending: true)
                     } else {
-                        // Undo without clearing pending until opposite move succeeds
-                        // (matches pre-refactor semantics for cancelled navigation).
-                        load = .opposite(pending.direction.opposite)
+                        load = .opposite(
+                            undoDirection: pending.direction.opposite,
+                            expectedPendingDirection: pending.direction
+                        )
                     }
                 } else {
                     self.pendingIteratorResult = nil
@@ -965,12 +1034,11 @@ public class PublicationSpeechSynthesizer: Loggable {
                 content = readyContent
                 usesPendingResult = usesPending
 
-            case let .opposite(opposite):
-                // Bidirectional undo of a pending result from a cancelled load.
-                // Do not hold synthesizer across the iterator suspension.
+            case let .opposite(undoDirection, expectedPendingDirection):
+                // Iterator may return the element even when the task is cancelled.
                 let moved: ContentElement?
                 do {
-                    moved = try await iterator.next(opposite)
+                    moved = try await iterator.next(undoDirection)
                 } catch {
                     if !(error is CancellationError), let self = weakSynthesizer.value {
                         self.log(.error, error)
@@ -978,12 +1046,23 @@ public class PublicationSpeechSynthesizer: Loggable {
                     return false
                 }
                 guard moved != nil else { return false }
+
+                // Accounting first: clear pending only if it still matches this
+                // undo, then check generation. Cursor already moved.
+                if let self = weakSynthesizer.value {
+                    if
+                        let pending = self.pendingIteratorResult,
+                        pending.iterator === iterator,
+                        pending.direction == expectedPendingDirection
+                    {
+                        self.pendingIteratorResult = nil
+                    }
+                }
+
                 guard let self = weakSynthesizer.value else { return false }
                 guard self.isCurrentOperation(generation, iterator: iterator) else {
                     return false
                 }
-                // Only clear pending after a successful opposite step.
-                self.pendingIteratorResult = nil
                 continue
 
             case .fetch:
@@ -999,7 +1078,6 @@ public class PublicationSpeechSynthesizer: Loggable {
                 guard let nextContent else { return false }
                 guard let self = weakSynthesizer.value else { return false }
                 guard self.isCurrentOperation(generation, iterator: iterator) else {
-                    // Preserve element returned after cancellation for the next op.
                     if self.publicationIterator === iterator {
                         self.pendingIteratorResult = (iterator, direction, nextContent)
                     }
@@ -1009,33 +1087,49 @@ public class PublicationSpeechSynthesizer: Loggable {
                 usesPendingResult = false
             }
 
-            let tokenized: [Utterance]
-            if let self = weakSynthesizer.value {
-                do {
-                    tokenized = try self.tokenize(content)
-                        .flatMap { self.utterances(for: $0) }
-                } catch {
-                    if let self = weakSynthesizer.value {
-                        self.log(.error, error)
+            // Tokenize with config-epoch capture; retry on config reentry.
+            while true {
+                let prefetchEpoch: UInt64
+                let tokenized: [Utterance]
+                if let self = weakSynthesizer.value {
+                    guard self.isCurrentOperation(generation, iterator: iterator) else {
+                        if self.publicationIterator === iterator {
+                            self.pendingIteratorResult = (iterator, direction, content)
+                        }
+                        return false
+                    }
+                    prefetchEpoch = self.prefetchGeneration
+                    do {
+                        tokenized = try self.tokenize(content)
+                            .flatMap { self.utterances(for: $0) }
+                    } catch {
+                        if let self = weakSynthesizer.value {
+                            self.log(.error, error)
+                        }
+                        return false
+                    }
+                } else {
+                    return false
+                }
+
+                guard let self = weakSynthesizer.value else { return false }
+                guard self.isCurrentOperation(generation, iterator: iterator) else {
+                    if self.publicationIterator === iterator {
+                        self.pendingIteratorResult = (iterator, direction, content)
                     }
                     return false
                 }
-            } else {
-                return false
-            }
-
-            // Re-validate after tokenizer reentrancy before committing cursor.
-            guard let self = weakSynthesizer.value else { return false }
-            guard self.isCurrentOperation(generation, iterator: iterator) else {
-                if self.publicationIterator === iterator {
-                    self.pendingIteratorResult = (iterator, direction, content)
+                if prefetchEpoch != self.prefetchGeneration {
+                    // Config changed during tokenize — keep content, retokenize
+                    // with the new configuration instead of committing stale text.
+                    continue
                 }
-                return false
-            }
 
-            nextUtterances = tokenized
-            if usesPendingResult, nextUtterances.isEmpty {
-                self.pendingIteratorResult = nil
+                nextUtterances = tokenized
+                if usesPendingResult, nextUtterances.isEmpty {
+                    self.pendingIteratorResult = nil
+                }
+                break
             }
         }
 
@@ -1431,8 +1525,8 @@ public class PublicationSpeechSynthesizer: Loggable {
     /// Does not advance the publication iterator.
     ///
     /// Returns `nil` when reentrant tokenizer work invalidated this look-ahead
-    /// epoch (config/stop/navigation) so callers abort instead of committing
-    /// stale results or writing past a cleared buffer.
+    /// epoch (stop/navigation or superseded prefetch generation) so callers
+    /// abort instead of committing stale results or writing past a cleared buffer.
     private func collectForwardPrefetchCandidates(
         operationGeneration: UInt64,
         prefetchGeneration: UInt64
@@ -1447,7 +1541,9 @@ public class PublicationSpeechSynthesizer: Loggable {
                 continue
             }
 
+            // Capture epoch before tokenize; config reentry only bumps prefetchGeneration.
             let content = group.content
+            let epochAtStart = self.prefetchGeneration
             let nextUtterances = try tokenize(content)
                 .flatMap { utterances(for: $0) }
 
@@ -1456,9 +1552,18 @@ public class PublicationSpeechSynthesizer: Loggable {
             guard
                 !Task.isCancelled,
                 operationGeneration == self.operationGeneration,
-                prefetchGeneration == self.prefetchGeneration,
                 forwardGroups.indices.contains(index),
                 forwardGroups[index].utterances == nil
+            else {
+                return nil
+            }
+
+            // Config changed during tokenize: caller’s look-ahead epoch is stale.
+            // Abort this collect so a newer forward task retokenizes cleanly.
+            // (Do not write tokens produced under a superseded config.)
+            guard
+                epochAtStart == self.prefetchGeneration,
+                prefetchGeneration == self.prefetchGeneration
             else {
                 return nil
             }
