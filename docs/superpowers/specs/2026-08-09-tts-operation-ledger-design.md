@@ -35,7 +35,7 @@ private struct IteratorLedger {
 }
 ```
 
-The lifecycle handles remain independently owned so `deinit` can cancel suspended tasks without a MainActor hop. A replaced operation is cancelled before its lifecycle ownership is cleared. `PlaybackOperation` and `ForwardPrefetchOperation` are the sole source of truth for their task identities and queues.
+The lifecycle handles remain independently owned so `deinit` can cancel suspended tasks without a MainActor hop. A replaced operation is cancelled before its lifecycle ownership is cleared. `prefetch(from:)` is a preparation phase of `PlaybackOperation`, so its task, cancellation, iterator movement, and prepared result have the same owner as playback rather than a separate request-generation field. `PlaybackOperation` and `ForwardPrefetchOperation` are the sole source of truth for their task identities and queues.
 
 ## Iterator Ledger
 
@@ -50,9 +50,9 @@ private enum IteratorState {
 }
 ```
 
-Only the ledger may record a content element after an iterator movement. Any successful `next` or `previous` result is recorded before checking whether its initiating operation is still current. This makes a cancellation that still returns content recoverable by type, rather than relying on an optional tuple.
+Only the ledger may record a content element after an iterator movement. Each record receives a movement ID. Any successful `next` or `previous` result is recorded before checking whether its initiating operation is still current. This makes a cancellation that still returns content recoverable by type, rather than relying on an optional tuple.
 
-Buffered forward groups and trailing advances remain ledger properties. Empty groups merge their advance count into the next group or trailing count through ledger methods; no caller directly combines counts or toggles a rollback Boolean.
+Buffered forward groups and trailing advances remain ledger properties. A buffered group carries a stable group ID, movement ID, raw content, and prepared content; invalidation, cancellation, retry exhaustion, and recovery preserve its prepared content. A freshly moved forward element becomes a ledger-owned placeholder before tokenization, and a consumer leases that placeholder rather than removing it. Empty groups merge their advance count into the next group or trailing count through ledger methods; no caller directly combines counts or toggles a rollback Boolean.
 
 ## Operation Tokens and Unified Tokenization Commit
 
@@ -63,6 +63,7 @@ private struct OperationToken {
     let playbackGeneration: UInt64
     let prefetchGeneration: UInt64
     let iterator: ContentIterator
+    let movementID: UUID
     let destination: TokenizationDestination
     let raw: ContentElement
     let prepared: ContentElement
@@ -81,7 +82,7 @@ private enum TokenCommitResult {
 }
 ```
 
-The exact destination representation may use a stable buffered-group identifier rather than a mutable array index. It must identify one buffer slot across tokenizer re-entry and must not permit a result to be written to a different group after an array mutation.
+The exact destination representation uses a stable buffered-group identifier rather than a mutable array index. Along with the movement ID, it identifies one leased buffer slot across tokenizer re-entry and cannot permit a result to be written to a different group after an array mutation.
 
 All tokenization paths (`consumeForwardGroup`, playback iterator loading, forward group loading, and forward candidate collection) prepare content once, call the tokenizer, and delegate every state write to:
 
@@ -95,13 +96,13 @@ private func commitTokenization(
 
 `commitTokenization` validates the playback generation, prefetch/config generation, iterator identity, destination identity, and raw/prepared ledger identity. It is the only code permitted to write playback utterances, buffered-group utterances, or tokenization-related pending ledger state.
 
-When only configuration changes during tokenization, it returns `.retryWithNewConfig`; the caller retries with the token's existing `prepared` content. When playback, iterator, or destination no longer matches, it returns `.superseded` without committing stale output. Supersession, tokenizer failure, cancellation, and retry exhaustion use ledger transitions to preserve the prepared content needed for later recovery. No path may replace it with raw content.
+When configuration changes during a still-current live playback operation, it returns `.retryWithNewConfig`; the caller retries with the token's existing `prepared` content. A configuration change that invalidates a forward operation supersedes its worker; its successor restarts from the preserved placeholder. When playback, iterator, movement, or destination no longer matches, it returns `.superseded` without committing stale output. Supersession, tokenizer failure, cancellation, and retry exhaustion use ledger transitions to preserve the prepared content needed for later recovery. No path may replace it with raw content.
 
 ## Lifecycle Rules
 
 `start`, `resume`, `next`, `previous`, `pause`, and `stop` create, replace, or cancel `PlaybackOperation` through dedicated helpers. Configuration changes and navigation invalidate a complete `ForwardPrefetchOperation`: its task, ready queue, cancellation drain, and waiters move together.
 
-Forward-prefetch waiters continue to be held in the independent continuation registry. Invalidating prefetch and `deinit` always resume all waiters. Worker tasks retain the synthesizer weakly across `speak`, iterator movement, prefetching, cancellation drains, and waiter suspension.
+Each forward operation owns generation-tagged waiters alongside its ready queue. Invalidating prefetch detaches the old operation, resumes its waiters immediately, and retains it until its owned cancellation drain completes; a successor awaits that drain before engine work. `deinit` resumes waiters from active and retired operations. Worker tasks retain the synthesizer weakly across `speak`, iterator movement, prefetching, cancellation drains, and waiter suspension.
 
 ## Error Handling
 
