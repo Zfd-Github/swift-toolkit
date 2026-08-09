@@ -1723,24 +1723,31 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
 
         synthesizer.start()
         try await waitUntil { engine.spokenTexts == ["first"] }
+        // Cancel first speech is implicit when navigating; still one spoken so far.
+        XCTAssertEqual(engine.spokenTexts, ["first"])
+
         synthesizer.next()
         try await waitUntil { iterator.hasSuspendedNext }
-        // Cancelled next still returns second (returnsElementOnCancellation).
+        XCTAssertEqual(iterator.nextCallCount, 2)
+
+        // Cancelled next still returns second (returnsElementOnCancellation) and
+        // must leave pending accounting consistent for the opposite undo.
         synthesizer.previous()
-        try await waitUntil { iterator.hasSuspendedPrevious || engine.spokenTexts.count >= 1 }
-        // Continuous direction changes must not double-undo or skip.
+        try await waitUntil { iterator.hasSuspendedPrevious }
+        XCTAssertEqual(iterator.previousCallCount, 1)
+        // Must not already be speaking second before opposite/next completes.
+        XCTAssertEqual(engine.spokenTexts, ["first"])
+
         synthesizer.next()
-        try await waitUntil { engine.spokenTexts.contains("second") }
+        // After pending-preserving cancel + opposite accounting, next must land
+        // on second exactly once — never skip to third via double undo.
+        try await waitUntil { engine.spokenTexts == ["first", "second"] }
         XCTAssertEqual(iterator.maximumConcurrentCalls, 1)
-        // Should speak second once, not jump to third due to double undo.
+        XCTAssertEqual(engine.spokenTexts.filter { $0 == "second" }.count, 1)
+        XCTAssertFalse(engine.spokenTexts.contains("third"))
+
         engine.completeSpeech()
-        try await waitUntil {
-            engine.spokenTexts == ["first", "second"] ||
-                engine.spokenTexts == ["first", "second", "third"] ||
-                engine.spokenTexts.contains("second")
-        }
-        let secondCount = engine.spokenTexts.filter { $0 == "second" }.count
-        XCTAssertEqual(secondCount, 1)
+        try await waitUntil { engine.spokenTexts == ["first", "second", "third"] }
         synthesizer.stop()
     }
 

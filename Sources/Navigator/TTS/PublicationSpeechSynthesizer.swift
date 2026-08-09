@@ -191,6 +191,32 @@ public class PublicationSpeechSynthesizer: Loggable {
         )
     }
 
+    // MARK: - Playback / prefetch state machine
+    //
+    // Invariants (review every entry point against these — do not update fields ad hoc):
+    //
+    // 1. Playback operation: identified by `operationGeneration`, owned by
+    //    `currentTask` / `playbackTaskLifecycle`. Bumped on start(without prepared),
+    //    stop, pause, next, previous. Task bodies must not strongly retain self
+    //    across speak / wait / iterator / cancel-drain suspensions.
+    // 2. Prefetch operation: identified by `prefetchGeneration`, owned by
+    //    `forwardPrefetchTask` / `forwardPrefetchLifecycle` (+ optional
+    //    `prefetchCancellationTask` while draining). Bumped on invalidate
+    //    (config, stop, pause, navigation, failed look-ahead). Ready queue and
+    //    in-flight forward work share this epoch.
+    // 3. Iterator accounting: `publicationIterator` position, `pendingIteratorResult`,
+    //    `forwardGroups` / `iteratorAdvanceCount` / `trailingForwardAdvanceCount`
+    //    describe one logical cursor. A successful `next`/`previous` that returns
+    //    an element (including after cancel) must update accounting before any
+    //    generation-failure return.
+    // 4. Tokenizer commit: after any user tokenizer call, re-check operation
+    //    generation, prefetch/config epoch, iterator identity, and buffer index
+    //    before writing `utterances` / `forwardGroups`. Locator trim
+    //    (`applyingStartTextIfNeeded`) is applied once per content block and
+    //    must not re-run on config-only retries.
+    // 5. Waiters: `forwardPrefetchWaiters` outlives MainActor teardown; invalidate
+    //    and deinit always `resumeAll()`.
+
     private var currentTask: Task<Void, Never>?
     private var forwardPrefetchTask: Task<Void, Never>?
     private var forwardPrefetchTaskID: UInt64 = 0
@@ -1478,16 +1504,38 @@ public class PublicationSpeechSynthesizer: Loggable {
                 return .finished
             }
 
-            // `tokenize` / `utterances(for:)` may re-enter the synthesizer (config
-            // change, next/previous) and invalidate this look-ahead generation.
-            // Capture results first, then re-validate before committing.
+            // Locator trim once; config-sensitive tokenize with bounded epoch retries.
+            let prepared = synthesizer.applyingStartTextIfNeeded(content)
+            var configRetries = 0
             let nextUtterances: [Utterance]
-            do {
-                nextUtterances = try synthesizer.tokenize(content)
-                    .flatMap { synthesizer.utterances(for: $0) }
-            } catch {
-                if let synthesizer = weakSynthesizer.value {
-                    synthesizer.log(.error, error)
+            while true {
+                let epochAtStart = synthesizer.prefetchGeneration
+                let tokenized: [Utterance]
+                do {
+                    tokenized = try synthesizer.tokenizePrepared(prepared)
+                        .flatMap { synthesizer.utterances(for: $0) }
+                } catch {
+                    if let synthesizer = weakSynthesizer.value {
+                        synthesizer.log(.error, error)
+                        if synthesizer.publicationIterator === iterator {
+                            synthesizer.forwardGroups.append(
+                                BufferedUtteranceGroup(
+                                    content: content,
+                                    utterances: nil,
+                                    iteratorAdvanceCount: advanceCount
+                                )
+                            )
+                        }
+                    }
+                    return .finished
+                }
+
+                guard let synthesizer = weakSynthesizer.value else { return .finished }
+                guard
+                    synthesizer.publicationIterator === iterator,
+                    !Task.isCancelled,
+                    operationGeneration == synthesizer.operationGeneration
+                else {
                     if synthesizer.publicationIterator === iterator {
                         synthesizer.forwardGroups.append(
                             BufferedUtteranceGroup(
@@ -1497,8 +1545,31 @@ public class PublicationSpeechSynthesizer: Loggable {
                             )
                         )
                     }
+                    return .finished
                 }
-                return .finished
+
+                if epochAtStart != synthesizer.prefetchGeneration ||
+                    prefetchGeneration != synthesizer.prefetchGeneration
+                {
+                    configRetries += 1
+                    if configRetries > Self.maximumConfigTokenizeRetries ||
+                        prefetchGeneration != synthesizer.prefetchGeneration
+                    {
+                        // Superseded look-ahead epoch — keep accounting, drop tokens.
+                        synthesizer.forwardGroups.append(
+                            BufferedUtteranceGroup(
+                                content: content,
+                                utterances: nil,
+                                iteratorAdvanceCount: advanceCount
+                            )
+                        )
+                        return .finished
+                    }
+                    continue
+                }
+
+                nextUtterances = tokenized
+                break
             }
 
             guard let synthesizer = weakSynthesizer.value else { return .finished }
@@ -1508,8 +1579,6 @@ public class PublicationSpeechSynthesizer: Loggable {
                 operationGeneration == synthesizer.operationGeneration,
                 prefetchGeneration == synthesizer.prefetchGeneration
             else {
-                // Superseded after tokenize: keep iterator accounting, drop stale
-                // utterances produced under a previous configuration.
                 if synthesizer.publicationIterator === iterator {
                     synthesizer.forwardGroups.append(
                         BufferedUtteranceGroup(
