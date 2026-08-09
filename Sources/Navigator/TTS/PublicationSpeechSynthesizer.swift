@@ -110,7 +110,7 @@ public class PublicationSpeechSynthesizer: Loggable {
         didSet {
             guard oldValue != config else { return }
             invalidatePrefetch()
-            forwardGroups = forwardGroups.map { $0.invalidatingPrefetch() }
+            iteratorLedger.invalidateForwardGroups()
         }
     }
 
@@ -209,14 +209,21 @@ public class PublicationSpeechSynthesizer: Loggable {
     //    active/ready/retired `ForwardPrefetchOperation` slots. Bumped on invalidate
     //    (config, stop, pause, navigation, failed look-ahead). Ready queue and
     //    in-flight forward work share this epoch.
-    // 3. Iterator accounting: `publicationIterator` position, `pendingIteratorResult`,
-    //    `forwardGroups` / `iteratorAdvanceCount` / `trailingForwardAdvanceCount`
-    //    describe one logical cursor. A successful `next`/`previous` that returns
-    //    an element (including after cancel) must update accounting before any
-    //    generation-failure return.
+    // 3. Iterator accounting: `iteratorLedger` is the only owner of iterator
+    //    position, pending fetched content, forward placeholders, and rollback.
+    //    Every non-nil movement is recorded with a UUID before generation checks.
+    //    Transition table:
+    //      - fetched -> undoing before awaiting an opposite movement;
+    //      - a non-nil opposite result clears undo before generation validation;
+    //      - rollbackRequired(n) decrements after every non-nil reverse movement,
+    //        before generation validation;
+    //      - an empty token result transfers its placeholder advances exactly once
+    //        to the next placeholder or the trailing count;
+    //      - token error, supersession, or retry exhaustion restores the same
+    //        prepared placeholder to pending state.
     // 4. Tokenizer commit: after any user tokenizer call, re-check operation
     //    generation, prefetch/config epoch, iterator identity, and buffer index
-    //    before writing `utterances` / `forwardGroups`. Locator trim
+    //    before writing `utterances` or ledger placeholders. Locator trim
     //    (`applyingStartTextIfNeeded`) is applied once per content block and
     //    must not re-run on config-only retries.
     // 5. Waiters: each forward operation owns a `ContinuationRegistry`; invalidate
@@ -241,6 +248,351 @@ public class PublicationSpeechSynthesizer: Loggable {
         var ready: [ForwardPrefetch]
         let waiters: ContinuationRegistry
         var cancellationTask: Task<Void, Never>?
+    }
+
+    private enum IteratorState {
+        case synchronized
+        case fetched(
+            movementID: UUID,
+            direction: Direction,
+            raw: ContentElement,
+            prepared: ContentElement
+        )
+        case undoing(movementID: UUID, originalDirection: Direction, prepared: ContentElement)
+        case rollbackRequired(count: Int)
+    }
+
+    private struct IteratorLedger {
+        enum LiveStep {
+            case ready(FetchedMovement)
+            case fetch
+            case opposite(UndoMovement)
+            case unavailable
+        }
+
+        enum ForwardStep {
+            case placeholder(GroupLease)
+            case fetch
+            case unavailable
+        }
+
+        struct FetchedMovement {
+            let movementID: UUID
+            let direction: Direction
+            let raw: ContentElement
+            let prepared: ContentElement
+        }
+
+        struct UndoMovement {
+            let movementID: UUID
+            let originalDirection: Direction
+            let raw: ContentElement
+            let prepared: ContentElement
+        }
+
+        struct GroupLease {
+            let groupID: UUID
+            let raw: ContentElement
+            let prepared: ContentElement
+            let utterances: [Utterance]?
+        }
+
+        private(set) var iterator: ContentIterator?
+        private(set) var state: IteratorState = .synchronized
+        private var forwardGroups: [BufferedUtteranceGroup] = []
+        private var trailingForwardAdvanceCount = 0
+
+        mutating func reset(iterator: ContentIterator?) {
+            self.iterator = iterator
+            state = .synchronized
+            forwardGroups = []
+            trailingForwardAdvanceCount = 0
+        }
+
+        func owns(_ iterator: ContentIterator) -> Bool {
+            self.iterator === iterator
+        }
+
+        mutating func invalidateForwardGroups() {
+            for index in forwardGroups.indices {
+                forwardGroups[index].utterances = nil
+            }
+        }
+
+        mutating func recordFetched(
+            movementID: UUID,
+            direction: Direction,
+            raw: ContentElement,
+            prepared: ContentElement
+        ) {
+            state = .fetched(
+                movementID: movementID,
+                direction: direction,
+                raw: raw,
+                prepared: prepared
+            )
+        }
+
+        mutating func beginLiveStep(direction: Direction) -> LiveStep {
+            switch state {
+            case let .fetched(movementID, fetchedDirection, raw, prepared):
+                let movement = FetchedMovement(
+                    movementID: movementID,
+                    direction: fetchedDirection,
+                    raw: raw,
+                    prepared: prepared
+                )
+                if fetchedDirection == direction {
+                    return .ready(movement)
+                }
+                state = .undoing(
+                    movementID: movementID,
+                    originalDirection: fetchedDirection,
+                    prepared: prepared
+                )
+                return .opposite(UndoMovement(
+                    movementID: movementID,
+                    originalDirection: fetchedDirection,
+                    raw: raw,
+                    prepared: prepared
+                ))
+
+            case .synchronized:
+                return .fetch
+
+            case .undoing, .rollbackRequired:
+                return .unavailable
+            }
+        }
+
+        mutating func beginForwardStep() -> ForwardStep {
+            switch state {
+            case let .fetched(movementID, direction, _, _) where direction == .forward:
+                guard let placeholder = createForwardPlaceholder(movementID: movementID) else {
+                    return .unavailable
+                }
+                return .placeholder(placeholder)
+
+            case .synchronized:
+                return .fetch
+
+            case .fetched, .undoing, .rollbackRequired:
+                return .unavailable
+            }
+        }
+
+        mutating func beginFetchedUndoForRollback() -> UndoMovement? {
+            guard case let .fetched(movementID, direction, raw, prepared) = state,
+                  direction == .forward
+            else {
+                return nil
+            }
+            state = .undoing(
+                movementID: movementID,
+                originalDirection: direction,
+                prepared: prepared
+            )
+            return UndoMovement(
+                movementID: movementID,
+                originalDirection: direction,
+                raw: raw,
+                prepared: prepared
+            )
+        }
+
+        mutating func restoreUndo(_ movement: UndoMovement) {
+            guard case let .undoing(movementID, _, _) = state,
+                  movementID == movement.movementID
+            else {
+                return
+            }
+            recordFetched(
+                movementID: movement.movementID,
+                direction: movement.originalDirection,
+                raw: movement.raw,
+                prepared: movement.prepared
+            )
+        }
+
+        mutating func completeUndo(movementID: UUID) {
+            guard case let .undoing(currentID, _, _) = state,
+                  currentID == movementID
+            else {
+                return
+            }
+            state = .synchronized
+        }
+
+        mutating func completeFetched(movementID: UUID, direction: Direction) -> Bool {
+            guard case let .fetched(currentID, _, _, _) = state,
+                  currentID == movementID
+            else {
+                return false
+            }
+            state = .synchronized
+            if direction == .forward {
+                trailingForwardAdvanceCount = 0
+            }
+            return true
+        }
+
+        @discardableResult
+        mutating func createForwardPlaceholder(movementID: UUID) -> GroupLease? {
+            guard case let .fetched(currentID, direction, raw, prepared) = state,
+                  currentID == movementID,
+                  direction == .forward
+            else {
+                return nil
+            }
+            let group = BufferedUtteranceGroup(
+                groupID: UUID(),
+                movementID: movementID,
+                raw: raw,
+                prepared: prepared,
+                utterances: nil,
+                iteratorAdvanceCount: trailingForwardAdvanceCount + 1,
+                isLeased: true
+            )
+            trailingForwardAdvanceCount = 0
+            forwardGroups.append(group)
+            state = .synchronized
+            return GroupLease(
+                groupID: group.groupID,
+                raw: raw,
+                prepared: prepared,
+                utterances: nil
+            )
+        }
+
+        var hasForwardGroups: Bool {
+            !forwardGroups.isEmpty
+        }
+
+        mutating func leaseFirstForwardGroup() -> GroupLease? {
+            guard !forwardGroups.isEmpty, !forwardGroups[0].isLeased else {
+                return nil
+            }
+            forwardGroups[0].isLeased = true
+            return lease(forwardGroups[0])
+        }
+
+        mutating func leaseForwardGroup(groupID: UUID) -> GroupLease? {
+            guard let index = forwardGroups.firstIndex(where: { $0.groupID == groupID }),
+                  !forwardGroups[index].isLeased
+            else {
+                return nil
+            }
+            forwardGroups[index].isLeased = true
+            return lease(forwardGroups[index])
+        }
+
+        func forwardGroupIDs() -> [UUID] {
+            forwardGroups.map(\.groupID)
+        }
+
+        func forwardGroup(groupID: UUID) -> GroupLease? {
+            forwardGroups.first(where: { $0.groupID == groupID }).map(lease)
+        }
+
+        mutating func restoreForwardGroup(groupID: UUID) {
+            guard let index = forwardGroups.firstIndex(where: { $0.groupID == groupID }) else {
+                return
+            }
+            forwardGroups[index].isLeased = false
+        }
+
+        mutating func fillForwardPlaceholder(
+            groupID: UUID,
+            utterances: [Utterance]
+        ) -> Bool {
+            guard let index = forwardGroups.firstIndex(where: { $0.groupID == groupID }),
+                  forwardGroups[index].isLeased
+            else {
+                return false
+            }
+            if utterances.isEmpty {
+                mergeEmptyForwardGroup(at: index)
+                return true
+            }
+            forwardGroups[index].utterances = utterances
+            forwardGroups[index].isLeased = false
+            return true
+        }
+
+        mutating func consumeForwardGroup(
+            groupID: UUID,
+            utterances: [Utterance]
+        ) -> Bool {
+            guard let index = forwardGroups.firstIndex(where: { $0.groupID == groupID }),
+                  forwardGroups[index].isLeased
+            else {
+                return false
+            }
+            if utterances.isEmpty {
+                mergeEmptyForwardGroup(at: index)
+            } else {
+                forwardGroups.remove(at: index)
+            }
+            return true
+        }
+
+        mutating func beginRollback() -> (iterator: ContentIterator, count: Int)? {
+            guard let iterator else { return nil }
+            switch state {
+            case .synchronized, .rollbackRequired:
+                break
+            case .fetched, .undoing:
+                return nil
+            }
+            let bufferedCount = forwardGroups.reduce(trailingForwardAdvanceCount) {
+                $0 + $1.iteratorAdvanceCount
+            }
+            let interruptedCount: Int
+            if case let .rollbackRequired(count) = state {
+                interruptedCount = count
+            } else {
+                interruptedCount = 0
+            }
+            let count = bufferedCount + interruptedCount
+            forwardGroups = []
+            trailingForwardAdvanceCount = 0
+            if count > 0 {
+                state = .rollbackRequired(count: count)
+            } else if case .rollbackRequired = state {
+                state = .synchronized
+            }
+            return (iterator, count)
+        }
+
+        var requiresRollback: Bool {
+            if case let .rollbackRequired(count) = state {
+                return count > 0
+            }
+            return false
+        }
+
+        mutating func completeRollbackMovement() {
+            guard case let .rollbackRequired(count) = state else { return }
+            state = count > 1 ? .rollbackRequired(count: count - 1) : .synchronized
+        }
+
+        private func lease(_ group: BufferedUtteranceGroup) -> GroupLease {
+            GroupLease(
+                groupID: group.groupID,
+                raw: group.raw,
+                prepared: group.prepared,
+                utterances: group.utterances
+            )
+        }
+
+        private mutating func mergeEmptyForwardGroup(at index: Int) {
+            let advanceCount = forwardGroups.remove(at: index).iteratorAdvanceCount
+            if forwardGroups.indices.contains(index) {
+                forwardGroups[index].iteratorAdvanceCount += advanceCount
+            } else {
+                trailingForwardAdvanceCount += advanceCount
+            }
+        }
     }
 
     private var playbackOperation: PlaybackOperation?
@@ -335,7 +687,7 @@ public class PublicationSpeechSynthesizer: Loggable {
         prefetchRequestGeneration &+= 1
         let prefetchRequestGeneration = self.prefetchRequestGeneration
         setStartText(from: startLocator)
-        publicationIterator = nil
+        resetIterator(nil)
         return await withTaskCancellationHandler(
             operation: {
                 await self.prefetchInitial(
@@ -387,7 +739,7 @@ public class PublicationSpeechSynthesizer: Loggable {
         else {
             return false
         }
-        publicationIterator = publication.content(from: startLocator)?.iterator()
+        resetIterator(publication.content(from: startLocator)?.iterator())
         guard let utterance = await Self.nextUtterance(
             weakSynthesizer: WeakPublicationSpeechSynthesizer(self),
             direction: .forward,
@@ -470,14 +822,14 @@ public class PublicationSpeechSynthesizer: Loggable {
         let generation = operationGeneration
         let oldPrefetchTask = invalidatePrefetch()
         setStartText(from: startLocator)
-        publicationIterator = nil
+        resetIterator(nil)
         let task = Task { [weak self] in
             await oldPlaybackTask?.value
             await oldPrefetchTask?.value
             let weakSynthesizer: WeakPublicationSpeechSynthesizer
             if let self {
                 guard generation == self.operationGeneration else { return }
-                self.publicationIterator = self.publication.content(from: startLocator)?.iterator()
+                self.resetIterator(self.publication.content(from: startLocator)?.iterator())
                 weakSynthesizer = WeakPublicationSpeechSynthesizer(self)
             } else {
                 return
@@ -546,7 +898,7 @@ public class PublicationSpeechSynthesizer: Loggable {
         operationGeneration &+= 1
         invalidatePrefetch()
         state = .stopped
-        publicationIterator = nil
+        resetIterator(nil)
     }
 
     /// Interrupts a played utterance.
@@ -572,11 +924,19 @@ public class PublicationSpeechSynthesizer: Loggable {
                 await oldPlaybackTask?.value
                 await oldPrefetchTask?.value
                 let weakSynthesizer: WeakPublicationSpeechSynthesizer
+                let needsRollback: Bool
                 if let self {
                     guard generation == self.operationGeneration else { return }
+                    needsRollback = self.iteratorLedger.requiresRollback
                     weakSynthesizer = WeakPublicationSpeechSynthesizer(self)
                 } else {
                     return
+                }
+                if needsRollback {
+                    await Self.rollbackForwardBuffer(
+                        weakSynthesizer: weakSynthesizer,
+                        generation: generation
+                    )
                 }
                 await Self.continuePlaying(
                     weakSynthesizer: weakSynthesizer,
@@ -640,7 +1000,7 @@ public class PublicationSpeechSynthesizer: Loggable {
             let needsRollback: Bool
             if let self {
                 guard generation == self.operationGeneration else { return }
-                needsRollback = self.requiresForwardBufferRollback
+                needsRollback = self.iteratorLedger.requiresRollback
                 weakSynthesizer = WeakPublicationSpeechSynthesizer(self)
             } else {
                 return
@@ -660,15 +1020,11 @@ public class PublicationSpeechSynthesizer: Loggable {
         setPlaybackOperation(generation: generation, phase: .playing, task: task)
     }
 
-    /// `Content.Iterator` used to iterate through the `publication`.
-    private var publicationIterator: ContentIterator? {
-        didSet {
-            utterances = CursorList()
-            forwardGroups = []
-            trailingForwardAdvanceCount = 0
-            requiresForwardBufferRollback = false
-            pendingIteratorResult = nil
-        }
+    private var iteratorLedger = IteratorLedger()
+
+    private func resetIterator(_ iterator: ContentIterator?) {
+        utterances = CursorList()
+        iteratorLedger.reset(iterator: iterator)
     }
 
     private var startText: Locator.Text?
@@ -677,14 +1033,6 @@ public class PublicationSpeechSynthesizer: Loggable {
 
     /// Utterances for the current publication `ContentElement` item.
     private var utterances: CursorList<Utterance> = CursorList()
-    private var forwardGroups: [BufferedUtteranceGroup] = []
-    private var trailingForwardAdvanceCount = 0
-    private var requiresForwardBufferRollback = false
-    private var pendingIteratorResult: (
-        iterator: ContentIterator,
-        direction: Direction,
-        content: ContentElement
-    )?
 
     private func isCurrentOperation(
         _ generation: UInt64,
@@ -693,7 +1041,7 @@ public class PublicationSpeechSynthesizer: Loggable {
         !Task.isCancelled &&
             generation == operationGeneration &&
             playbackOperation?.generation == generation &&
-            (iterator == nil || publicationIterator === iterator)
+            (iterator == nil || iteratorLedger.iterator === iterator)
     }
 
     private func isCurrentPlayingOperation(_ generation: UInt64) -> Bool {
@@ -933,16 +1281,19 @@ public class PublicationSpeechSynthesizer: Loggable {
         while true {
             if direction == .forward {
                 enum GroupStep {
-                    case use(BufferedUtteranceGroup, ContentIterator)
+                    case use(IteratorLedger.GroupLease, ContentIterator)
                     case none
                 }
                 let step: GroupStep
                 if let self = weakSynthesizer.value {
                     guard self.isCurrentOperation(generation) else { return false }
-                    if self.forwardGroups.isEmpty {
+                    if !self.iteratorLedger.hasForwardGroups {
                         step = .none
-                    } else if let iterator = self.publicationIterator {
-                        step = .use(self.forwardGroups.removeFirst(), iterator)
+                    } else if
+                        let iterator = self.iteratorLedger.iterator,
+                        let group = self.iteratorLedger.leaseFirstForwardGroup()
+                    {
+                        step = .use(group, iterator)
                     } else {
                         return false
                     }
@@ -992,72 +1343,54 @@ public class PublicationSpeechSynthesizer: Loggable {
     /// re-checking operation + config (prefetch) epochs after tokenizer reentry.
     private static func consumeForwardGroup(
         weakSynthesizer: WeakPublicationSpeechSynthesizer,
-        group: BufferedUtteranceGroup,
+        group: IteratorLedger.GroupLease,
         iterator: ContentIterator,
         generation: UInt64
     ) async -> ForwardGroupConsumeResult {
-        func restorePending(_ utterances: [Utterance]?) {
-            guard let self = weakSynthesizer.value, self.publicationIterator === iterator else {
+        func restorePending() {
+            guard let self = weakSynthesizer.value, self.iteratorLedger.owns(iterator) else {
                 return
             }
-            self.forwardGroups.insert(
-                BufferedUtteranceGroup(
-                    content: group.content,
-                    utterances: utterances,
-                    iteratorAdvanceCount: group.iteratorAdvanceCount
-                ),
-                at: 0
-            )
+            self.iteratorLedger.restoreForwardGroup(groupID: group.groupID)
         }
 
         if let existing = group.utterances {
             guard let self = weakSynthesizer.value else { return .failed }
             guard self.isCurrentOperation(generation, iterator: iterator) else {
-                restorePending(existing)
+                restorePending()
+                return .failed
+            }
+            guard self.iteratorLedger.consumeForwardGroup(
+                groupID: group.groupID,
+                utterances: existing
+            ) else {
                 return .failed
             }
             if existing.isEmpty {
-                if self.forwardGroups.isEmpty {
-                    self.trailingForwardAdvanceCount += group.iteratorAdvanceCount
-                } else {
-                    self.forwardGroups[0] = self.forwardGroups[0]
-                        .addingIteratorAdvanceCount(group.iteratorAdvanceCount)
-                }
                 return .emptyContinue
             }
             self.utterances = CursorList(list: existing, startIndex: 0)
             return .ready
         }
 
-        // Apply locator trim once, then re-run only the config-sensitive tokenizer
-        // if config re-enters. Bounded retries prevent MainActor livelock.
-        let preparedContent: ContentElement
-        if let self = weakSynthesizer.value {
-            guard self.isCurrentOperation(generation, iterator: iterator) else {
-                restorePending(nil)
-                return .failed
-            }
-            preparedContent = self.applyingStartTextIfNeeded(group.content)
-        } else {
-            return .failed
-        }
-
+        // The ledger placeholder already owns the once-prepared content. Config
+        // retries re-run only the config-sensitive tokenizer.
         var configRetries = 0
         while true {
             let prefetchEpoch: UInt64
             let tokenized: [Utterance]
             if let self = weakSynthesizer.value {
                 guard self.isCurrentOperation(generation, iterator: iterator) else {
-                    restorePending(nil)
+                    restorePending()
                     return .failed
                 }
                 prefetchEpoch = self.prefetchGeneration
                 do {
-                    tokenized = try self.tokenizePrepared(preparedContent)
+                    tokenized = try self.tokenizePrepared(group.prepared)
                         .flatMap { self.utterances(for: $0) }
                 } catch {
-                    if let self = weakSynthesizer.value, self.publicationIterator === iterator {
-                        self.forwardGroups.insert(group, at: 0)
+                    if let self = weakSynthesizer.value, self.iteratorLedger.owns(iterator) {
+                        self.iteratorLedger.restoreForwardGroup(groupID: group.groupID)
                         self.log(.error, error)
                     }
                     return .failed
@@ -1068,7 +1401,7 @@ public class PublicationSpeechSynthesizer: Loggable {
 
             guard let self = weakSynthesizer.value else { return .failed }
             guard self.isCurrentOperation(generation, iterator: iterator) else {
-                restorePending(nil)
+                restorePending()
                 return .failed
             }
             // Config change only bumps prefetchGeneration — must not commit stale tokens.
@@ -1076,19 +1409,19 @@ public class PublicationSpeechSynthesizer: Loggable {
                 configRetries += 1
                 if configRetries > Self.maximumConfigTokenizeRetries {
                     // Leave group pending for a later epoch; do not spin on MainActor.
-                    restorePending(nil)
+                    restorePending()
                     return .failed
                 }
                 continue
             }
 
+            guard self.iteratorLedger.consumeForwardGroup(
+                groupID: group.groupID,
+                utterances: tokenized
+            ) else {
+                return .failed
+            }
             if tokenized.isEmpty {
-                if self.forwardGroups.isEmpty {
-                    self.trailingForwardAdvanceCount += group.iteratorAdvanceCount
-                } else {
-                    self.forwardGroups[0] = self.forwardGroups[0]
-                        .addingIteratorAdvanceCount(group.iteratorAdvanceCount)
-                }
                 return .emptyContinue
             }
 
@@ -1105,79 +1438,57 @@ public class PublicationSpeechSynthesizer: Loggable {
         let iterator: ContentIterator
         if let self = weakSynthesizer.value {
             guard self.isCurrentOperation(generation) else { return false }
-            guard let current = self.publicationIterator else { return false }
+            guard let current = self.iteratorLedger.iterator else { return false }
             iterator = current
         } else {
             return false
         }
 
         var nextUtterances: [Utterance] = []
-        var usesPendingResult = false
+        var completedMovementID: UUID?
 
-        while nextUtterances.isEmpty {
-            enum ContentLoad {
-                case ready(ContentElement, usesPending: Bool)
-                case fetch
-                /// Opposite step to undo a pending advance from a cancelled load.
-                case opposite(undoDirection: Direction, expectedPendingDirection: Direction)
-            }
-
-            let load: ContentLoad
+        contentLoop: while nextUtterances.isEmpty {
+            let load: IteratorLedger.LiveStep
             if let self = weakSynthesizer.value {
                 guard self.isCurrentOperation(generation, iterator: iterator) else {
                     return false
                 }
-                if
-                    let pending = self.pendingIteratorResult,
-                    pending.iterator === iterator
-                {
-                    if pending.direction == direction {
-                        load = .ready(pending.content, usesPending: true)
-                    } else {
-                        load = .opposite(
-                            undoDirection: pending.direction.opposite,
-                            expectedPendingDirection: pending.direction
-                        )
-                    }
-                } else {
-                    self.pendingIteratorResult = nil
-                    load = .fetch
-                }
+                load = self.iteratorLedger.beginLiveStep(direction: direction)
             } else {
                 return false
             }
 
-            let content: ContentElement
+            let movement: IteratorLedger.FetchedMovement
             switch load {
-            case let .ready(readyContent, usesPending):
-                content = readyContent
-                usesPendingResult = usesPending
+            case let .ready(readyMovement):
+                movement = readyMovement
 
-            case let .opposite(undoDirection, expectedPendingDirection):
+            case let .opposite(undo):
                 // Iterator may return the element even when the task is cancelled.
                 let moved: ContentElement?
                 do {
-                    moved = try await iterator.next(undoDirection)
+                    moved = try await iterator.next(undo.originalDirection.opposite)
                 } catch {
-                    if !(error is CancellationError), let self = weakSynthesizer.value {
-                        self.log(.error, error)
+                    if let self = weakSynthesizer.value, self.iteratorLedger.owns(iterator) {
+                        self.iteratorLedger.restoreUndo(undo)
+                        if !(error is CancellationError) {
+                            self.log(.error, error)
+                        }
                     }
                     return false
                 }
-                guard moved != nil else { return false }
-
-                // Accounting first: clear pending only if it still matches this
-                // undo, then check generation. Cursor already moved.
-                if let self = weakSynthesizer.value {
-                    if
-                        let pending = self.pendingIteratorResult,
-                        pending.iterator === iterator,
-                        pending.direction == expectedPendingDirection
-                    {
-                        self.pendingIteratorResult = nil
+                guard moved != nil else {
+                    if let self = weakSynthesizer.value, self.iteratorLedger.owns(iterator) {
+                        self.iteratorLedger.restoreUndo(undo)
                     }
+                    return false
                 }
 
+                // The cursor moved: clear undo accounting before validating the
+                // operation that awaited it.
+                if let self = weakSynthesizer.value, self.iteratorLedger.owns(iterator) {
+                    self.iteratorLedger.completeUndo(movementID: undo.movementID)
+                }
                 guard let self = weakSynthesizer.value else { return false }
                 guard self.isCurrentOperation(generation, iterator: iterator) else {
                     return false
@@ -1185,39 +1496,40 @@ public class PublicationSpeechSynthesizer: Loggable {
                 continue
 
             case .fetch:
-                let nextContent: ContentElement?
+                let raw: ContentElement?
                 do {
-                    nextContent = try await iterator.next(direction)
+                    raw = try await iterator.next(direction)
                 } catch {
                     if !(error is CancellationError), let self = weakSynthesizer.value {
                         self.log(.error, error)
                     }
                     return false
                 }
-                guard let nextContent else { return false }
+                guard let raw else { return false }
                 guard let self = weakSynthesizer.value else { return false }
-                guard self.isCurrentOperation(generation, iterator: iterator) else {
-                    if self.publicationIterator === iterator {
-                        self.pendingIteratorResult = (iterator, direction, nextContent)
-                    }
-                    return false
-                }
-                content = nextContent
-                usesPendingResult = false
-            }
+                guard self.iteratorLedger.owns(iterator) else { return false }
 
-            // Locator trim once per content; config-sensitive tokenize may retry
-            // a bounded number of times without spinning MainActor forever.
-            let preparedContent: ContentElement
-            if let self = weakSynthesizer.value {
+                // Preparation and movement accounting happen exactly once and
+                // before any stale-generation exit.
+                let prepared = self.applyingStartTextIfNeeded(raw)
+                let movementID = UUID()
+                self.iteratorLedger.recordFetched(
+                    movementID: movementID,
+                    direction: direction,
+                    raw: raw,
+                    prepared: prepared
+                )
+                movement = IteratorLedger.FetchedMovement(
+                    movementID: movementID,
+                    direction: direction,
+                    raw: raw,
+                    prepared: prepared
+                )
                 guard self.isCurrentOperation(generation, iterator: iterator) else {
-                    if self.publicationIterator === iterator {
-                        self.pendingIteratorResult = (iterator, direction, content)
-                    }
                     return false
                 }
-                preparedContent = self.applyingStartTextIfNeeded(content)
-            } else {
+
+            case .unavailable:
                 return false
             }
 
@@ -1227,14 +1539,11 @@ public class PublicationSpeechSynthesizer: Loggable {
                 let tokenized: [Utterance]
                 if let self = weakSynthesizer.value {
                     guard self.isCurrentOperation(generation, iterator: iterator) else {
-                        if self.publicationIterator === iterator {
-                            self.pendingIteratorResult = (iterator, direction, content)
-                        }
                         return false
                     }
                     prefetchEpoch = self.prefetchGeneration
                     do {
-                        tokenized = try self.tokenizePrepared(preparedContent)
+                        tokenized = try self.tokenizePrepared(movement.prepared)
                             .flatMap { self.utterances(for: $0) }
                     } catch {
                         if let self = weakSynthesizer.value {
@@ -1248,33 +1557,42 @@ public class PublicationSpeechSynthesizer: Loggable {
 
                 guard let self = weakSynthesizer.value else { return false }
                 guard self.isCurrentOperation(generation, iterator: iterator) else {
-                    if self.publicationIterator === iterator {
-                        self.pendingIteratorResult = (iterator, direction, content)
-                    }
                     return false
                 }
                 if prefetchEpoch != self.prefetchGeneration {
                     configRetries += 1
                     if configRetries > Self.maximumConfigTokenizeRetries {
-                        // Abort this load; content preserved via pending if needed.
-                        if self.publicationIterator === iterator {
-                            self.pendingIteratorResult = (iterator, direction, content)
-                        }
+                        // The same prepared fetched movement remains recoverable.
                         return false
                     }
                     continue
                 }
 
                 nextUtterances = tokenized
-                if usesPendingResult, nextUtterances.isEmpty {
-                    self.pendingIteratorResult = nil
+                if nextUtterances.isEmpty {
+                    guard self.iteratorLedger.completeFetched(
+                        movementID: movement.movementID,
+                        direction: direction
+                    ) else {
+                        return false
+                    }
+                    continue contentLoop
                 }
+                completedMovementID = movement.movementID
                 break
             }
         }
 
         guard let self = weakSynthesizer.value else { return false }
         guard self.isCurrentOperation(generation, iterator: iterator) else {
+            return false
+        }
+        guard let completedMovementID,
+              self.iteratorLedger.completeFetched(
+                  movementID: completedMovementID,
+                  direction: direction
+              )
+        else {
             return false
         }
 
@@ -1287,12 +1605,6 @@ public class PublicationSpeechSynthesizer: Loggable {
                 }
             }()
         )
-        if direction == .forward {
-            self.trailingForwardAdvanceCount = 0
-        }
-        if usesPendingResult {
-            self.pendingIteratorResult = nil
-        }
         return true
     }
 
@@ -1505,7 +1817,6 @@ public class PublicationSpeechSynthesizer: Loggable {
         forwardTaskID: UInt64
     ) async -> ForwardGroupLoadResult {
         let iterator: ContentIterator
-        var advanceCount: Int
         if let synthesizer = weakSynthesizer.value {
             guard
                 !Task.isCancelled,
@@ -1515,22 +1826,20 @@ public class PublicationSpeechSynthesizer: Loggable {
                     taskID: forwardTaskID,
                     generation: prefetchGeneration
                 ),
-                let currentIterator = synthesizer.publicationIterator
+                let currentIterator = synthesizer.iteratorLedger.iterator
             else {
                 return .finished
             }
             iterator = currentIterator
-            advanceCount = synthesizer.trailingForwardAdvanceCount
-            synthesizer.trailingForwardAdvanceCount = 0
         } else {
             return .finished
         }
 
-        var contentToPreserve: ContentElement?
         while true {
+            let step: IteratorLedger.ForwardStep
             if let synthesizer = weakSynthesizer.value {
                 guard
-                    synthesizer.publicationIterator === iterator,
+                    synthesizer.iteratorLedger.owns(iterator),
                     !Task.isCancelled,
                     operationGeneration == synthesizer.operationGeneration,
                     prefetchGeneration == synthesizer.prefetchGeneration,
@@ -1539,71 +1848,61 @@ public class PublicationSpeechSynthesizer: Loggable {
                         generation: prefetchGeneration
                     )
                 else {
-                    if synthesizer.publicationIterator === iterator {
-                        synthesizer.trailingForwardAdvanceCount = advanceCount
-                    }
                     return .finished
                 }
+                step = synthesizer.iteratorLedger.beginForwardStep()
             } else {
                 return .finished
             }
 
-            // No strong synthesizer across the iterator suspension.
-            let content: ContentElement?
-            do {
-                content = try await iterator.next()
-            } catch is CancellationError {
-                if let synthesizer = weakSynthesizer.value,
-                   synthesizer.publicationIterator === iterator
-                {
-                    if let preserved = contentToPreserve {
-                        synthesizer.forwardGroups.append(
-                            BufferedUtteranceGroup(
-                                content: preserved,
-                                utterances: nil,
-                                iteratorAdvanceCount: advanceCount
-                            )
-                        )
-                    } else {
-                        synthesizer.trailingForwardAdvanceCount = advanceCount
-                    }
-                }
+            let placeholder: IteratorLedger.GroupLease
+            switch step {
+            case let .placeholder(existing):
+                placeholder = existing
+
+            case .unavailable:
                 return .finished
-            } catch {
-                if let synthesizer = weakSynthesizer.value {
-                    synthesizer.log(.error, error)
-                    if let preserved = contentToPreserve, synthesizer.publicationIterator === iterator {
-                        synthesizer.forwardGroups.append(
-                            BufferedUtteranceGroup(
-                                content: preserved,
-                                utterances: nil,
-                                iteratorAdvanceCount: advanceCount
-                            )
-                        )
-                    } else if synthesizer.publicationIterator === iterator {
-                        synthesizer.trailingForwardAdvanceCount = advanceCount
+
+            case .fetch:
+                // No strong synthesizer across the iterator suspension.
+                let content: ContentElement?
+                do {
+                    content = try await iterator.next()
+                } catch is CancellationError {
+                    return .finished
+                } catch {
+                    if let synthesizer = weakSynthesizer.value {
+                        synthesizer.log(.error, error)
                     }
+                    return .finished
                 }
-                return .finished
+
+                guard let content else { return .finished }
+
+                guard let synthesizer = weakSynthesizer.value else { return .finished }
+                guard synthesizer.iteratorLedger.owns(iterator) else { return .finished }
+
+                // Prepare and record the movement before looking at stale operation
+                // generations, then install a stable ledger placeholder before any
+                // tokenizer can re-enter.
+                let prepared = synthesizer.applyingStartTextIfNeeded(content)
+                let movementID = UUID()
+                synthesizer.iteratorLedger.recordFetched(
+                    movementID: movementID,
+                    direction: .forward,
+                    raw: content,
+                    prepared: prepared
+                )
+                guard let created = synthesizer.iteratorLedger.createForwardPlaceholder(
+                    movementID: movementID
+                ) else {
+                    return .finished
+                }
+                placeholder = created
             }
 
-            guard let content else {
-                if let synthesizer = weakSynthesizer.value,
-                   synthesizer.publicationIterator === iterator
-                {
-                    synthesizer.trailingForwardAdvanceCount = advanceCount
-                }
-                return .finished
-            }
-            advanceCount += 1
-            contentToPreserve = content
-
-            // Re-check after the suspension: cancel/config may have invalidated
-            // look-ahead while `next()` was in flight. Do not tokenize/commit
-            // into a superseded generation (avoids racing playNext on the iterator).
             guard let synthesizer = weakSynthesizer.value else { return .finished }
             guard
-                synthesizer.publicationIterator === iterator,
                 !Task.isCancelled,
                 operationGeneration == synthesizer.operationGeneration,
                 prefetchGeneration == synthesizer.prefetchGeneration,
@@ -1612,38 +1911,24 @@ public class PublicationSpeechSynthesizer: Loggable {
                     generation: prefetchGeneration
                 )
             else {
-                if synthesizer.publicationIterator === iterator {
-                    synthesizer.forwardGroups.append(
-                        BufferedUtteranceGroup(
-                            content: content,
-                            utterances: nil,
-                            iteratorAdvanceCount: advanceCount
-                        )
-                    )
-                }
+                synthesizer.iteratorLedger.restoreForwardGroup(groupID: placeholder.groupID)
                 return .finished
             }
 
-            // Locator trim once; config-sensitive tokenize with bounded epoch retries.
-            let prepared = synthesizer.applyingStartTextIfNeeded(content)
             var configRetries = 0
             let nextUtterances: [Utterance]
             while true {
                 let epochAtStart = synthesizer.prefetchGeneration
                 let tokenized: [Utterance]
                 do {
-                    tokenized = try synthesizer.tokenizePrepared(prepared)
+                    tokenized = try synthesizer.tokenizePrepared(placeholder.prepared)
                         .flatMap { synthesizer.utterances(for: $0) }
                 } catch {
                     if let synthesizer = weakSynthesizer.value {
                         synthesizer.log(.error, error)
-                        if synthesizer.publicationIterator === iterator {
-                            synthesizer.forwardGroups.append(
-                                BufferedUtteranceGroup(
-                                    content: content,
-                                    utterances: nil,
-                                    iteratorAdvanceCount: advanceCount
-                                )
+                        if synthesizer.iteratorLedger.owns(iterator) {
+                            synthesizer.iteratorLedger.restoreForwardGroup(
+                                groupID: placeholder.groupID
                             )
                         }
                     }
@@ -1652,7 +1937,7 @@ public class PublicationSpeechSynthesizer: Loggable {
 
                 guard let synthesizer = weakSynthesizer.value else { return .finished }
                 guard
-                    synthesizer.publicationIterator === iterator,
+                    synthesizer.iteratorLedger.owns(iterator),
                     !Task.isCancelled,
                     operationGeneration == synthesizer.operationGeneration,
                     synthesizer.isCurrentForwardPrefetch(
@@ -1660,15 +1945,7 @@ public class PublicationSpeechSynthesizer: Loggable {
                         generation: prefetchGeneration
                     )
                 else {
-                    if synthesizer.publicationIterator === iterator {
-                        synthesizer.forwardGroups.append(
-                            BufferedUtteranceGroup(
-                                content: content,
-                                utterances: nil,
-                                iteratorAdvanceCount: advanceCount
-                            )
-                        )
-                    }
+                    synthesizer.iteratorLedger.restoreForwardGroup(groupID: placeholder.groupID)
                     return .finished
                 }
 
@@ -1679,13 +1956,8 @@ public class PublicationSpeechSynthesizer: Loggable {
                     if configRetries > Self.maximumConfigTokenizeRetries ||
                         prefetchGeneration != synthesizer.prefetchGeneration
                     {
-                        // Superseded look-ahead epoch — keep accounting, drop tokens.
-                        synthesizer.forwardGroups.append(
-                            BufferedUtteranceGroup(
-                                content: content,
-                                utterances: nil,
-                                iteratorAdvanceCount: advanceCount
-                            )
+                        synthesizer.iteratorLedger.restoreForwardGroup(
+                            groupID: placeholder.groupID
                         )
                         return .finished
                     }
@@ -1698,7 +1970,7 @@ public class PublicationSpeechSynthesizer: Loggable {
 
             guard let synthesizer = weakSynthesizer.value else { return .finished }
             guard
-                synthesizer.publicationIterator === iterator,
+                synthesizer.iteratorLedger.owns(iterator),
                 !Task.isCancelled,
                 operationGeneration == synthesizer.operationGeneration,
                 prefetchGeneration == synthesizer.prefetchGeneration,
@@ -1707,40 +1979,18 @@ public class PublicationSpeechSynthesizer: Loggable {
                     generation: prefetchGeneration
                 )
             else {
-                if synthesizer.publicationIterator === iterator {
-                    synthesizer.forwardGroups.append(
-                        BufferedUtteranceGroup(
-                            content: content,
-                            utterances: nil,
-                            iteratorAdvanceCount: advanceCount
-                        )
-                    )
-                }
+                synthesizer.iteratorLedger.restoreForwardGroup(groupID: placeholder.groupID)
                 return .finished
             }
 
+            guard synthesizer.iteratorLedger.fillForwardPlaceholder(
+                groupID: placeholder.groupID,
+                utterances: nextUtterances
+            ) else {
+                return .finished
+            }
             if !nextUtterances.isEmpty {
-                let group = BufferedUtteranceGroup(
-                    content: content,
-                    utterances: nextUtterances,
-                    iteratorAdvanceCount: advanceCount
-                )
-                synthesizer.forwardGroups.append(group)
                 return .group(nextUtterances)
-            }
-
-            guard
-                synthesizer.publicationIterator === iterator,
-                !Task.isCancelled,
-                operationGeneration == synthesizer.operationGeneration,
-                prefetchGeneration == synthesizer.prefetchGeneration,
-                synthesizer.isCurrentForwardPrefetch(
-                    taskID: forwardTaskID,
-                    generation: prefetchGeneration
-                )
-            else {
-                synthesizer.trailingForwardAdvanceCount = advanceCount
-                return .finished
             }
         }
     }
@@ -1809,7 +2059,7 @@ public class PublicationSpeechSynthesizer: Loggable {
             .cancellationTask
     }
 
-    /// Builds look-ahead candidates from the current cursor and `forwardGroups`,
+    /// Builds look-ahead candidates from the current cursor and ledger groups,
     /// re-tokenizing any groups whose utterances were cleared by a config change.
     /// Does not advance the publication iterator.
     ///
@@ -1822,25 +2072,31 @@ public class PublicationSpeechSynthesizer: Loggable {
         forwardTaskID: UInt64
     ) throws -> [Utterance]? {
         var candidates = Array(utterances.elementsAfterCurrent())
-        var index = 0
-        while index < forwardGroups.count {
-            let group = forwardGroups[index]
+        let groupIDs = iteratorLedger.forwardGroupIDs()
+        for groupID in groupIDs {
+            guard let group = iteratorLedger.forwardGroup(groupID: groupID) else {
+                continue
+            }
             if let existing = group.utterances {
                 candidates.append(contentsOf: existing)
-                index += 1
                 continue
             }
 
-            // Capture epoch before tokenize; config reentry only bumps prefetchGeneration.
-            let content = group.content
-            // Trim once per group content; config-only retries re-run tokenizer.
-            let prepared = applyingStartTextIfNeeded(content)
+            guard let leased = iteratorLedger.leaseForwardGroup(groupID: groupID) else {
+                return nil
+            }
             var configRetries = 0
             let nextUtterances: [Utterance]
             while true {
                 let epochAtStart = self.prefetchGeneration
-                let tokenized = try tokenizePrepared(prepared)
-                    .flatMap { utterances(for: $0) }
+                let tokenized: [Utterance]
+                do {
+                    tokenized = try tokenizePrepared(leased.prepared)
+                        .flatMap { utterances(for: $0) }
+                } catch {
+                    iteratorLedger.restoreForwardGroup(groupID: groupID)
+                    throw error
+                }
 
                 guard
                     !Task.isCancelled,
@@ -1848,10 +2104,9 @@ public class PublicationSpeechSynthesizer: Loggable {
                     isCurrentForwardPrefetch(
                         taskID: forwardTaskID,
                         generation: prefetchGeneration
-                    ),
-                    forwardGroups.indices.contains(index),
-                    forwardGroups[index].utterances == nil
+                    )
                 else {
+                    iteratorLedger.restoreForwardGroup(groupID: groupID)
                     return nil
                 }
 
@@ -1860,10 +2115,12 @@ public class PublicationSpeechSynthesizer: Loggable {
                 {
                     configRetries += 1
                     if configRetries > Self.maximumConfigTokenizeRetries {
+                        iteratorLedger.restoreForwardGroup(groupID: groupID)
                         return nil
                     }
                     // Caller epoch may be stale; abort so a newer task restarts.
                     if prefetchGeneration != self.prefetchGeneration {
+                        iteratorLedger.restoreForwardGroup(groupID: groupID)
                         return nil
                     }
                     continue
@@ -1873,13 +2130,13 @@ public class PublicationSpeechSynthesizer: Loggable {
                 break
             }
 
-            forwardGroups[index] = BufferedUtteranceGroup(
-                content: forwardGroups[index].content,
-                utterances: nextUtterances,
-                iteratorAdvanceCount: forwardGroups[index].iteratorAdvanceCount
-            )
+            guard iteratorLedger.fillForwardPlaceholder(
+                groupID: groupID,
+                utterances: nextUtterances
+            ) else {
+                return nil
+            }
             candidates.append(contentsOf: nextUtterances)
-            index += 1
         }
         return candidates
     }
@@ -1998,30 +2255,61 @@ public class PublicationSpeechSynthesizer: Loggable {
         generation: UInt64
     ) async {
         let iterator: ContentIterator
-        let advanceCount: Int
+        let fetchedUndo: IteratorLedger.UndoMovement?
         if let self = weakSynthesizer.value {
             guard self.isCurrentOperation(generation) else { return }
-            advanceCount = self.forwardGroups.reduce(self.trailingForwardAdvanceCount) {
-                $0 + $1.iteratorAdvanceCount
-            }
-            self.forwardGroups = []
-            self.trailingForwardAdvanceCount = 0
-            guard let current = self.publicationIterator else { return }
+            guard let current = self.iteratorLedger.iterator else { return }
             iterator = current
+            fetchedUndo = self.iteratorLedger.beginFetchedUndoForRollback()
         } else {
             return
         }
 
-        var completed = 0
+        if let fetchedUndo {
+            let moved: ContentElement?
+            do {
+                moved = try await iterator.previous()
+            } catch {
+                if let self = weakSynthesizer.value, self.iteratorLedger.owns(iterator) {
+                    self.iteratorLedger.restoreUndo(fetchedUndo)
+                    if !(error is CancellationError) {
+                        self.log(.error, error)
+                    }
+                }
+                return
+            }
+            guard moved != nil else {
+                if let self = weakSynthesizer.value, self.iteratorLedger.owns(iterator) {
+                    self.iteratorLedger.restoreUndo(fetchedUndo)
+                }
+                return
+            }
+            // Clear the fetched undo before checking whether this rollback was
+            // superseded. Buffered/trailing work remains ledger-owned for the
+            // current or successor operation.
+            if let self = weakSynthesizer.value, self.iteratorLedger.owns(iterator) {
+                self.iteratorLedger.completeUndo(movementID: fetchedUndo.movementID)
+            }
+            guard let self = weakSynthesizer.value,
+                  self.isCurrentOperation(generation, iterator: iterator)
+            else {
+                return
+            }
+        }
+
+        let advanceCount: Int
+        if let self = weakSynthesizer.value {
+            guard self.isCurrentOperation(generation, iterator: iterator) else { return }
+            guard let work = self.iteratorLedger.beginRollback() else { return }
+            guard work.iterator === iterator else { return }
+            advanceCount = work.count
+        } else {
+            return
+        }
+
         for _ in 0 ..< advanceCount {
             if let self = weakSynthesizer.value {
-                guard self.isCurrentOperation(generation, iterator: iterator) else {
-                    if self.publicationIterator === iterator {
-                        self.trailingForwardAdvanceCount = advanceCount - completed
-                        self.requiresForwardBufferRollback = (advanceCount - completed) > 0
-                    }
-                    return
-                }
+                guard self.isCurrentOperation(generation, iterator: iterator) else { return }
             } else {
                 return
             }
@@ -2030,34 +2318,20 @@ public class PublicationSpeechSynthesizer: Loggable {
             do {
                 moved = try await iterator.previous()
             } catch is CancellationError {
-                if let self = weakSynthesizer.value, self.publicationIterator === iterator {
-                    self.trailingForwardAdvanceCount = advanceCount - completed
-                    self.requiresForwardBufferRollback = (advanceCount - completed) > 0
-                }
                 return
             } catch {
                 if let self = weakSynthesizer.value {
-                    if self.publicationIterator === iterator {
-                        self.trailingForwardAdvanceCount = advanceCount - completed
-                        self.requiresForwardBufferRollback = (advanceCount - completed) > 0
-                    }
                     self.log(.error, error)
                 }
                 return
             }
 
-            guard moved != nil else {
-                if let self = weakSynthesizer.value, self.publicationIterator === iterator {
-                    self.trailingForwardAdvanceCount = advanceCount - completed
-                    self.requiresForwardBufferRollback = (advanceCount - completed) > 0
-                }
-                return
+            guard moved != nil else { return }
+            // Persist the reverse movement before checking whether the operation
+            // that awaited it was superseded.
+            if let self = weakSynthesizer.value, self.iteratorLedger.owns(iterator) {
+                self.iteratorLedger.completeRollbackMovement()
             }
-            completed += 1
-        }
-
-        if let self = weakSynthesizer.value, self.isCurrentOperation(generation, iterator: iterator) {
-            self.requiresForwardBufferRollback = false
         }
     }
 
@@ -2300,17 +2574,13 @@ private final class WeakPublicationSpeechSynthesizer: @unchecked Sendable {
 }
 
 private struct BufferedUtteranceGroup {
-    let content: ContentElement
-    let utterances: [PublicationSpeechSynthesizer.Utterance]?
-    let iteratorAdvanceCount: Int
-
-    func invalidatingPrefetch() -> Self {
-        .init(content: content, utterances: nil, iteratorAdvanceCount: iteratorAdvanceCount)
-    }
-
-    func addingIteratorAdvanceCount(_ count: Int) -> Self {
-        .init(content: content, utterances: utterances, iteratorAdvanceCount: iteratorAdvanceCount + count)
-    }
+    let groupID: UUID
+    let movementID: UUID
+    let raw: ContentElement
+    let prepared: ContentElement
+    var utterances: [PublicationSpeechSynthesizer.Utterance]?
+    var iteratorAdvanceCount: Int
+    var isLeased: Bool
 }
 
 private enum Direction: Equatable {

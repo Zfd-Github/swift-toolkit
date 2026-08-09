@@ -663,6 +663,64 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         synthesizer.stop()
     }
 
+    func testSupersededFetchIsRecordedBeforeOppositeUndo() async throws {
+        final class SupersedingTokenizer: @unchecked Sendable {
+            weak var synthesizer: PublicationSpeechSynthesizer?
+            private var didSupersede = false
+
+            func tokenize(_ content: ContentElement) -> [ContentElement] {
+                MainActor.assumeIsolated {
+                    if !didSupersede {
+                        didSupersede = true
+                        synthesizer?.config.defaultLanguage = Language("fr")
+                        synthesizer?.previous()
+                    }
+                    return [content]
+                }
+            }
+        }
+
+        let start = locator(text: .init(before: "prefix ", highlight: "second"))
+        let second = TextContentElement(
+            locator: start,
+            role: .body,
+            segments: [.init(locator: start, text: "prefix second")]
+        )
+        let iterator = GatedArrayContentIterator(
+            elements: [
+                second,
+                textElement("third", href: "c.xhtml"),
+            ],
+            startIndex: 0,
+            gatedNextCall: 99,
+            gatedPreviousCall: 1,
+            returnsElementOnCancellation: true
+        )
+        let tokenizer = SupersedingTokenizer()
+        let engine = SpeechEngine()
+        let synthesizer = try makeSynthesizer(
+            contentService: IteratorContentService(iteratorFactory: { iterator }),
+            engine: engine,
+            tokenizerFactory: { _ in tokenizer.tokenize }
+        )
+        tokenizer.synthesizer = synthesizer
+
+        synthesizer.start(from: start)
+        try await waitUntil { iterator.hasSuspendedPrevious }
+        XCTAssertEqual(engine.spokenTexts, [])
+        synthesizer.next()
+
+        try await waitUntil { engine.spokenTexts.count == 1 }
+        XCTAssertEqual(engine.spokenTexts, ["second"])
+        XCTAssertEqual(iterator.maximumConcurrentCalls, 1)
+        XCTAssertEqual(engine.spokenTexts.filter { $0 == "second" }.count, 1)
+        XCTAssertFalse(engine.spokenTexts.contains("third"))
+
+        engine.completeSpeech()
+        try await waitUntil { engine.spokenTexts == ["second", "third"] }
+        synthesizer.stop()
+    }
+
     func testNavigationWaitsForCancelledSpeechBeforeStartingNext() async throws {
         let engine = SpeechEngine(completesOnCancellation: false)
         let synthesizer = try makeSynthesizer(
@@ -1082,6 +1140,114 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         synthesizer.previous()
         try await waitUntil { engine.spokenTexts == ["first", "third first", "third second", "third first"] }
         XCTAssertEqual(iterator.previousCallCount, 0)
+        synthesizer.stop()
+    }
+
+    func testPendingLiveFetchSurvivesTrailingEmptyGroupRollback() async throws {
+        let tokenizer = ReentrantTokenizer()
+        let engine = PrefetchingTTSEngine(prefetchDurations: ["second": 15])
+        let synthesizer = try makeSynthesizer(
+            elements: [
+                textElement("first"),
+                textElement("second"),
+                textElement("third"),
+            ],
+            engine: engine,
+            tokenizerFactory: { _ in tokenizer.tokenize }
+        )
+        tokenizer.onThirdTokenization = { synthesizer.previous() }
+
+        synthesizer.start()
+        try await waitUntil {
+            engine.spokenTexts == ["first"] && engine.prefetchedTexts == ["second"]
+        }
+        synthesizer.config.defaultLanguage = Language("fr")
+        tokenizer.makeSecondEmpty = true
+        tokenizer.cancelOnThirdTokenization = true
+        engine.completeSpeech()
+
+        try await waitUntil {
+            synthesizer.state == .stopped || engine.spokenTexts.count > 1
+        }
+        XCTAssertEqual(synthesizer.state, .stopped)
+        XCTAssertEqual(engine.spokenTexts, ["first"])
+    }
+
+    func testResumeCompletesInterruptedForwardRollbackBeforePrefetch() async throws {
+        let iterator = GatedArrayContentIterator(
+            elements: [
+                textElement("first"),
+                textElement("second"),
+                textElement("third"),
+                textElement("fourth"),
+            ],
+            startIndex: 1,
+            gatedNextCall: 99,
+            gatedPreviousCall: 2
+        )
+        let engine = PrefetchingTTSEngine()
+        let synthesizer = try makeSynthesizer(
+            contentService: IteratorContentService(iteratorFactory: { iterator }),
+            engine: engine
+        )
+
+        synthesizer.start()
+        try await waitUntil {
+            engine.spokenTexts == ["second"] && engine.prefetchedTexts.contains("fourth")
+        }
+        synthesizer.previous()
+        try await waitUntil { iterator.hasSuspendedPrevious }
+
+        synthesizer.pause()
+        synthesizer.resume()
+        try await waitUntil { engine.spokenTexts == ["second", "second"] }
+        engine.completeSpeech()
+
+        try await waitUntil { engine.spokenTexts.count == 3 }
+        XCTAssertEqual(engine.spokenTexts, ["second", "second", "third"])
+        XCTAssertEqual(iterator.maximumConcurrentCalls, 1)
+        synthesizer.stop()
+    }
+
+    func testResumePrefetchUsesPendingFetchedPlaceholderBeforeAdvancing() async throws {
+        let iterator = GatedArrayContentIterator(
+            elements: [
+                textElement("first"),
+                textElement("second"),
+                textElement("third"),
+            ],
+            startIndex: 0,
+            gatedNextCall: 99,
+            throwingNextCall: 2
+        )
+        let tokenizer = ReentrantTokenizer()
+        let engine = PrefetchingTTSEngine()
+        let synthesizer = try makeSynthesizer(
+            contentService: IteratorContentService(iteratorFactory: { iterator }),
+            engine: engine,
+            tokenizerFactory: { _ in tokenizer.tokenize }
+        )
+        tokenizer.onSecondTokenization = { synthesizer.pause() }
+        tokenizer.cancelOnSecondTokenization = true
+
+        synthesizer.start()
+        try await waitUntil {
+            engine.spokenTexts == ["first"] && iterator.nextCallCount == 2
+        }
+        engine.completeSpeech()
+        try await waitUntil {
+            if case .paused = synthesizer.state { return true }
+            return false
+        }
+
+        synthesizer.resume()
+        try await waitUntil {
+            engine.spokenTexts == ["first", "first"] && engine.prefetchedTexts.contains("second")
+        }
+        XCTAssertEqual(engine.prefetchedTexts.first, "second")
+
+        engine.completeSpeech()
+        try await waitUntil { engine.spokenTexts == ["first", "first", "second"] }
         synthesizer.stop()
     }
 
