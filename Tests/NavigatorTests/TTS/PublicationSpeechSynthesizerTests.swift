@@ -683,6 +683,55 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         engine.completeSpeech()
     }
 
+    func testReplacingPlaybackOperationLeavesOnlyNewestWorkerPlayable() async throws {
+        let engine = PrefetchingTTSEngine(
+            deferPrefetchOnCalls: [2],
+            completesSpeechOnCancellation: false
+        )
+        let synthesizer = try makeSynthesizer(
+            elements: [
+                textElement("first"),
+                textElement("second"),
+                textElement("third"),
+            ],
+            engine: engine
+        )
+
+        synthesizer.start()
+        try await waitUntil {
+            engine.spokenTexts == ["first"] &&
+                engine.pendingPrefetchCalls == [2]
+        }
+        let oldPrefetchIdentifier = try XCTUnwrap(engine.prefetchedIdentifiers[1])
+
+        synthesizer.pause()
+        synthesizer.resume()
+
+        // Finishing the superseded forward worker is not enough to make the
+        // replacement playable: it must also wait for the old speech to drain.
+        engine.completePrefetch(call: 2)
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        XCTAssertEqual(engine.spokenTexts, ["first"])
+
+        engine.completeSpeech()
+        try await waitUntil {
+            engine.spokenTexts == ["first", "first"] &&
+                engine.prefetchedIdentifiers.count >= 3
+        }
+        let resumedPrefetchIdentifier = try XCTUnwrap(engine.prefetchedIdentifiers[2])
+        XCTAssertNotEqual(resumedPrefetchIdentifier, oldPrefetchIdentifier)
+
+        engine.completeSpeech()
+        try await waitUntil { engine.spokenTexts == ["first", "first", "second"] }
+        XCTAssertEqual(engine.spokenIdentifiers.last, resumedPrefetchIdentifier)
+        XCTAssertEqual(engine.maximumConcurrentPrefetches, 1)
+
+        synthesizer.stop()
+        engine.completeSpeech()
+    }
+
     func testCancellingPreparedPrefetchDoesNotInvalidatePlaybackCache() async throws {
         // `prefetch` returns after the first utterance; forward waterline continues
         // on a background/unstructured task (MainActor-inherited, not detached).
@@ -2595,14 +2644,16 @@ private final class PrefetchingTTSEngine: TTSPrefetchingEngine {
     private(set) var cancelPrefetchCount = 0
     private(set) var maximumConcurrentPrefetches = 0
     private var speechContinuations: [CheckedContinuation<Result<Void, TTSError>, Never>] = []
-    private var prefetchContinuation: CheckedContinuation<TimeInterval?, Never>?
+    private var prefetchContinuations: [Int: CheckedContinuation<TimeInterval?, Never>] = [:]
     private let defersPrefetch: Bool
     private let deferPrefetchOnCall: Int?
+    private let deferPrefetchOnCalls: Set<Int>
     private let prefetchResult: TimeInterval?
     private let prefetchDurations: [String: TimeInterval]
     private let rejectsDurationExceedingMaximum: Bool
     private let clampsPrefetchDuration: Bool
     private let cancelsPendingPrefetch: Bool
+    private let completesSpeechOnCancellation: Bool
     private var prefetchCallCount = 0
     private var activePrefetchCount = 0
 
@@ -2610,24 +2661,32 @@ private final class PrefetchingTTSEngine: TTSPrefetchingEngine {
         availableVoices: [TTSVoice] = [],
         defersPrefetch: Bool = false,
         deferPrefetchOnCall: Int? = nil,
+        deferPrefetchOnCalls: Set<Int> = [],
         prefetchResult: TimeInterval? = 5,
         prefetchDurations: [String: TimeInterval] = [:],
         rejectsDurationExceedingMaximum: Bool = false,
         clampsPrefetchDuration: Bool = true,
-        cancelsPendingPrefetch: Bool = false
+        cancelsPendingPrefetch: Bool = false,
+        completesSpeechOnCancellation: Bool = true
     ) {
         self.availableVoices = availableVoices
         self.defersPrefetch = defersPrefetch
         self.deferPrefetchOnCall = deferPrefetchOnCall
+        self.deferPrefetchOnCalls = deferPrefetchOnCalls
         self.prefetchResult = prefetchResult
         self.prefetchDurations = prefetchDurations
         self.rejectsDurationExceedingMaximum = rejectsDurationExceedingMaximum
         self.clampsPrefetchDuration = clampsPrefetchDuration
         self.cancelsPendingPrefetch = cancelsPendingPrefetch
+        self.completesSpeechOnCancellation = completesSpeechOnCancellation
     }
 
     var hasPendingPrefetch: Bool {
-        prefetchContinuation != nil
+        !prefetchContinuations.isEmpty
+    }
+
+    var pendingPrefetchCalls: [Int] {
+        prefetchContinuations.keys.sorted()
     }
 
     func speak(
@@ -2643,8 +2702,10 @@ private final class PrefetchingTTSEngine: TTSPrefetchingEngine {
                 speechContinuations.append($0)
             }
         } onCancel: {
-            Task { @MainActor [weak self] in
-                self?.completeSpeech()
+            if completesSpeechOnCancellation {
+                Task { @MainActor [weak self] in
+                    self?.completeSpeech()
+                }
             }
         }
     }
@@ -2659,8 +2720,9 @@ private final class PrefetchingTTSEngine: TTSPrefetchingEngine {
         prefetchedIdentifiers.append(utterance.prefetchIdentifier)
         prefetchedTexts.append(utterance.text)
         prefetchCallCount += 1
+        let call = prefetchCallCount
         guard
-            defersPrefetch || deferPrefetchOnCall == prefetchCallCount
+            defersPrefetch || deferPrefetchOnCall == call || deferPrefetchOnCalls.contains(call)
         else {
             let duration = prefetchDurations[utterance.text] ?? prefetchResult
             guard
@@ -2671,15 +2733,18 @@ private final class PrefetchingTTSEngine: TTSPrefetchingEngine {
             return duration.map { clampsPrefetchDuration ? min($0, maximumDuration) : $0 }
         }
         return await withCheckedContinuation {
-            prefetchContinuation = $0
+            prefetchContinuations[call] = $0
         }
     }
 
     func cancelPrefetch() {
         cancelPrefetchCount += 1
         if cancelsPendingPrefetch {
-            prefetchContinuation?.resume(returning: nil)
-            prefetchContinuation = nil
+            let continuations = prefetchContinuations.values
+            prefetchContinuations = [:]
+            for continuation in continuations {
+                continuation.resume(returning: nil)
+            }
         }
     }
 
@@ -2688,9 +2753,12 @@ private final class PrefetchingTTSEngine: TTSPrefetchingEngine {
         speechContinuations.removeFirst().resume(returning: .success(()))
     }
 
-    func completePrefetch(returning duration: TimeInterval? = 5) {
-        prefetchContinuation?.resume(returning: duration)
-        prefetchContinuation = nil
+    func completePrefetch(
+        call requestedCall: Int? = nil,
+        returning duration: TimeInterval? = 5
+    ) {
+        guard let call = requestedCall ?? prefetchContinuations.keys.min() else { return }
+        prefetchContinuations.removeValue(forKey: call)?.resume(returning: duration)
     }
 }
 
