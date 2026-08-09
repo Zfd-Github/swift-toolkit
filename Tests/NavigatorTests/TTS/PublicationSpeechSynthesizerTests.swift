@@ -1703,6 +1703,131 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         synthesizer.stop()
     }
 
+    func testNavigationSupersededTokenizationRetainsPreparedStartText() async throws {
+        final class ReentrantTokenizer: @unchecked Sendable {
+            weak var synthesizer: PublicationSpeechSynthesizer?
+            private(set) var inputs: [String] = []
+            private var didNavigate = false
+
+            func makeTokenizer() -> ContentTokenizer {
+                { [self] element in
+                    let input = (element as? TextContentElement)?.segments.map(\.text).joined() ?? ""
+                    inputs.append(input)
+                    if !didNavigate {
+                        didNavigate = true
+                        synthesizer?.next()
+                    }
+                    return [element]
+                }
+            }
+        }
+
+        let start = locator(text: .init(before: "prefix ", highlight: "kept body"))
+        let element = TextContentElement(
+            locator: start,
+            role: .body,
+            segments: [.init(locator: start, text: "prefix kept body")]
+        )
+        let iterator = GatedArrayContentIterator(
+            elements: [element],
+            startIndex: 0,
+            gatedNextCall: 99
+        )
+        let tokenizer = ReentrantTokenizer()
+        let engine = PrefetchingTTSEngine()
+        var iteratorFactoryCalls = 0
+        let synthesizer = try makeSynthesizer(
+            contentService: IteratorContentService(iteratorFactory: {
+                iteratorFactoryCalls += 1
+                return iterator
+            }),
+            engine: engine,
+            tokenizerFactory: { _ in tokenizer.makeTokenizer() }
+        )
+        tokenizer.synthesizer = synthesizer
+
+        synthesizer.start(from: start)
+
+        try await waitUntil { !tokenizer.inputs.isEmpty }
+        try await waitUntil {
+            tokenizer.inputs.count >= 2 || synthesizer.state == .stopped
+        }
+        XCTAssertEqual(iteratorFactoryCalls, 1)
+        XCTAssertEqual(tokenizer.inputs, ["kept body", "kept body"])
+        XCTAssertEqual(engine.spokenTexts, ["kept body"])
+        XCTAssertFalse(tokenizer.inputs.joined().contains("prefix"))
+        XCTAssertFalse(engine.spokenTexts.joined().contains("prefix"))
+        synthesizer.stop()
+    }
+
+    func testConfigRetryExhaustionRetainsPreparedStartText() async throws {
+        final class RetryingTokenizer: @unchecked Sendable {
+            weak var synthesizer: PublicationSpeechSynthesizer?
+            private(set) var inputs: [String] = []
+            private var isExhaustingRetries = true
+
+            func makeTokenizer(language: Language?) -> ContentTokenizer {
+                { [self] element in
+                    let input = (element as? TextContentElement)?.segments.map(\.text).joined() ?? ""
+                    inputs.append(input)
+                    if isExhaustingRetries {
+                        if language?.code.bcp47.lowercased().hasPrefix("fr") == true {
+                            synthesizer?.config.defaultLanguage = Language("en")
+                        } else {
+                            synthesizer?.config.defaultLanguage = Language("fr")
+                        }
+                        // The ninth reentry exceeds the bounded retry count, leaving
+                        // this retained ledger entry to be consumed by a later next().
+                        if inputs.count == 9 {
+                            isExhaustingRetries = false
+                        }
+                    }
+                    return [element]
+                }
+            }
+        }
+
+        let start = locator(text: .init(before: "prefix ", highlight: "kept body"))
+        let element = TextContentElement(
+            locator: start,
+            role: .body,
+            segments: [.init(locator: start, text: "prefix kept body")]
+        )
+        let iterator = GatedArrayContentIterator(
+            elements: [element],
+            startIndex: 0,
+            gatedNextCall: 99
+        )
+        let tokenizer = RetryingTokenizer()
+        let engine = PrefetchingTTSEngine()
+        var iteratorFactoryCalls = 0
+        let synthesizer = try makeSynthesizer(
+            contentService: IteratorContentService(iteratorFactory: {
+                iteratorFactoryCalls += 1
+                return iterator
+            }),
+            engine: engine,
+            tokenizerFactory: { language in tokenizer.makeTokenizer(language: language) }
+        )
+        tokenizer.synthesizer = synthesizer
+
+        synthesizer.start(from: start)
+        try await waitUntil {
+            tokenizer.inputs.count == 9 && synthesizer.state == .stopped
+        }
+        let postExhaustionInputIndex = tokenizer.inputs.count
+
+        synthesizer.next()
+        try await waitUntil { engine.spokenTexts.count == 1 }
+
+        XCTAssertEqual(iteratorFactoryCalls, 1)
+        XCTAssertEqual(tokenizer.inputs[postExhaustionInputIndex], "kept body")
+        XCTAssertEqual(engine.spokenTexts, ["kept body"])
+        XCTAssertFalse(tokenizer.inputs[postExhaustionInputIndex].contains("prefix"))
+        XCTAssertFalse(engine.spokenTexts.joined().contains("prefix"))
+        synthesizer.stop()
+    }
+
     func testPendingOppositeUndoAccountsForCancelThatStillReturnsElement() async throws {
         let iterator = GatedArrayContentIterator(
             elements: [
@@ -1751,10 +1876,11 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         synthesizer.stop()
     }
 
-    func testBufferedGroupRetokenizeReentryStopDoesNotCrash() async throws {
+    func testBufferedGroupRetokenizeReentryStopDoesNotCommitStaleResult() async throws {
         final class ReentrantTokenizer: @unchecked Sendable {
             weak var synthesizer: PublicationSpeechSynthesizer?
             private var didStop = false
+            private(set) var didReturnStaleResult = false
 
             func makeTokenizer(language: Language?) -> ContentTokenizer {
                 { [self] element in
@@ -1765,6 +1891,16 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
                         didStop = true
                         // Clears forwardGroups via iterator reset paths / stop.
                         synthesizer?.stop()
+                        didReturnStaleResult = true
+                        guard var text = element as? TextContentElement else {
+                            return [element]
+                        }
+                        text.segments = text.segments.map { segment in
+                            var segment = segment
+                            segment.text = "stale " + segment.text
+                            return segment
+                        }
+                        return [text]
                     }
                     return [element]
                 }
@@ -1789,10 +1925,19 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         try await waitUntil {
             engine.spokenTexts == ["first"] && engine.prefetchedTexts.contains("second")
         }
+        let prefetchedBeforeStop = engine.prefetchedTexts
         synthesizer.config.defaultLanguage = french
         engine.completeSpeech()
-        // stop() from inside retokenize must not trap on forwardGroups[index].
-        try await waitUntil { synthesizer.state == .stopped }
+        // The tokenizer synchronously stops, then returns stale tokens. They must
+        // never become observable as look-ahead audio or speech.
+        try await waitUntil {
+            tokenizer.didReturnStaleResult && synthesizer.state == .stopped
+        }
+        await Task.yield()
+        XCTAssertEqual(engine.prefetchedTexts, prefetchedBeforeStop)
+        XCTAssertEqual(engine.spokenTexts, ["first"])
+        XCTAssertFalse(engine.prefetchedTexts.joined().contains("stale"))
+        XCTAssertFalse(engine.spokenTexts.joined().contains("stale"))
     }
 
     func testReleasingSynthesizerDuringSpeechAllowsDeinitAndCancelsPlayback() async throws {
