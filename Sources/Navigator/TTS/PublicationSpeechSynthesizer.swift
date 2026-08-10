@@ -786,6 +786,8 @@ public class PublicationSpeechSynthesizer: Loggable {
                 await result.value()
             },
             onCancel: {
+                task.cancel()
+                result.finish(false)
                 Task { @MainActor in
                     weakSynthesizer.value?.cancelInitialPrefetchIfCurrent(
                         operationGeneration: generation,

@@ -571,6 +571,24 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         synthesizer.stop()
     }
 
+    func testAlreadyCancelledCallerRejectsSynchronousInitialPrefetchCompletion() async throws {
+        var prefetchTask: Task<Bool, Never>!
+        let engine = PrefetchingTTSEngine(onPrefetch: {
+            prefetchTask.cancel()
+        })
+        let synthesizer = try makeSynthesizer(
+            elements: [textElement("first")],
+            engine: engine
+        )
+
+        prefetchTask = Task { await synthesizer.prefetch() }
+
+        let didPrefetch = await prefetchTask.value
+        XCTAssertFalse(didPrefetch)
+        XCTAssertEqual(engine.prefetchedTexts, ["first"])
+        synthesizer.stop()
+    }
+
     func testStartDrainsSuspendedInitialIteratorBeforeLoadingReplacement() async throws {
         let iterator = GatedArrayContentIterator(
             elements: [textElement("first"), textElement("second")],
@@ -3038,6 +3056,7 @@ private final class PrefetchingTTSEngine: TTSPrefetchingEngine {
     private let clampsPrefetchDuration: Bool
     private let cancelsPendingPrefetch: Bool
     private let completesSpeechOnCancellation: Bool
+    private let onPrefetch: (() -> Void)?
     private var prefetchCallCount = 0
     private var activePrefetchCount = 0
 
@@ -3051,7 +3070,8 @@ private final class PrefetchingTTSEngine: TTSPrefetchingEngine {
         rejectsDurationExceedingMaximum: Bool = false,
         clampsPrefetchDuration: Bool = true,
         cancelsPendingPrefetch: Bool = false,
-        completesSpeechOnCancellation: Bool = true
+        completesSpeechOnCancellation: Bool = true,
+        onPrefetch: (() -> Void)? = nil
     ) {
         self.availableVoices = availableVoices
         self.defersPrefetch = defersPrefetch
@@ -3063,6 +3083,7 @@ private final class PrefetchingTTSEngine: TTSPrefetchingEngine {
         self.clampsPrefetchDuration = clampsPrefetchDuration
         self.cancelsPendingPrefetch = cancelsPendingPrefetch
         self.completesSpeechOnCancellation = completesSpeechOnCancellation
+        self.onPrefetch = onPrefetch
     }
 
     var hasPendingPrefetch: Bool {
@@ -3108,6 +3129,7 @@ private final class PrefetchingTTSEngine: TTSPrefetchingEngine {
         prefetchedIdentifiers.append(utterance.prefetchIdentifier)
         prefetchedTexts.append(utterance.text)
         prefetchCallCount += 1
+        onPrefetch?()
         let call = prefetchCallCount
         guard
             defersPrefetch || deferPrefetchOnCall == call || deferPrefetchOnCalls.contains(call)
