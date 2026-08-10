@@ -201,14 +201,15 @@ public class PublicationSpeechSynthesizer: Loggable {
     //
     // Invariants (review every entry point against these — do not update fields ad hoc):
     //
-    // 1. Playback operation: identified by `operationGeneration`, owned by
-    //    `playbackOperation`. Bumped on start(without prepared),
-    //    stop, pause, next, previous. Task bodies must not strongly retain self
+    // 1. Playback operation: identified by `operationGeneration` and owned by
+    //    `playbackOperation`, including the initial `.preparing` phase and the
+    //    matching prepared cache. Task bodies must not strongly retain self
     //    across speak / wait / iterator / cancel-drain suspensions.
-    // 2. Prefetch operation: identified by `prefetchGeneration`, owned by the
-    //    active/ready/retired `ForwardPrefetchOperation` slots. Bumped on invalidate
-    //    (config, stop, pause, navigation, failed look-ahead). Ready queue and
-    //    in-flight forward work share this epoch.
+    // 2. Forward-prefetch operation: identified by `(prefetchGeneration, taskID)`
+    //    and owned by the active/ready/retired `ForwardPrefetchOperation` slots.
+    //    Its task, ready queue, waiter registry, and cancellation drain move
+    //    together. Invalidation resumes the detached waiters immediately and a
+    //    successor retains the latest retired drain before doing engine work.
     // 3. Iterator accounting: `iteratorLedger` is the only owner of iterator
     //    position, pending fetched content, forward placeholders, and rollback.
     //    Every non-nil movement is recorded with a UUID before generation checks.
@@ -221,11 +222,11 @@ public class PublicationSpeechSynthesizer: Loggable {
     //        to the next placeholder or the trailing count;
     //      - token error, supersession, or retry exhaustion restores the same
     //        prepared placeholder to pending state.
-    // 4. Tokenizer commit: after any user tokenizer call, re-check operation
-    //    generation, prefetch/config epoch, iterator identity, and buffer index
-    //    before writing `utterances` or ledger placeholders. Locator trim
-    //    (`applyingStartTextIfNeeded`) is applied once per content block and
-    //    must not re-run on config-only retries.
+    // 4. Unified tokenizer commit: after any user tokenizer call, re-check the
+    //    immutable operation token's playback/forward identity, iterator,
+    //    movement, and stable ledger destination before writing `utterances` or
+    //    placeholders. Locator trim (`applyingStartTextIfNeeded`) is applied once
+    //    per content block and must not re-run on config-only retries.
     // 5. Waiters: each forward operation owns a `ContinuationRegistry`; invalidate
     //    and deinit always resume the detached operation's registry.
 
@@ -691,7 +692,8 @@ public class PublicationSpeechSynthesizer: Loggable {
     /// Whether `play` is suspended waiting for the next look-ahead item (or
     /// look-ahead end). Used by tests instead of fixed `Task.sleep` delays.
     var isWaitingForForwardPrefetchForTesting: Bool {
-        forwardPrefetchOperation?.waiters.hasWaiters == true
+        forwardPrefetchOperation?.waiters.hasWaiters == true ||
+            retiredForwardPrefetchOperations.values.contains { $0.waiters.hasWaiters }
     }
 
     private var engine: TTSEngine {
@@ -1830,7 +1832,12 @@ public class PublicationSpeechSynthesizer: Loggable {
         // via self → task → self.
         let task = Task { [weak self] in
             await predecessorDrain?.value
-            defer { self?.finishForwardPrefetch(taskID: taskID) }
+            defer {
+                self?.finishForwardPrefetch(
+                    taskID: taskID,
+                    generation: prefetchGeneration
+                )
+            }
 
             var candidates: [Utterance] = []
             var candidateIndex = 0
@@ -1874,7 +1881,12 @@ public class PublicationSpeechSynthesizer: Loggable {
                 else {
                     return
                 }
-                guard let operation = self.forwardPrefetchOperation else { return }
+                guard let operation = self.activeForwardPrefetchOperation(
+                    taskID: taskID,
+                    generation: prefetchGeneration
+                ) else {
+                    return
+                }
                 prefetchedIdentifiers = Set(operation.ready.map(\.identifier))
                 duration = operation.ready.reduce(into: 0) { $0 += $1.duration }
             } else {
@@ -1943,7 +1955,6 @@ public class PublicationSpeechSynthesizer: Loggable {
                     maximumDuration: maximumSingleDuration
                 )
 
-                guard let self else { return }
                 guard let prefetchedDuration else {
                     // Prefetch failure — defer wakes waiters for live fallback.
                     return
@@ -1955,29 +1966,22 @@ public class PublicationSpeechSynthesizer: Loggable {
                 else {
                     return
                 }
-                guard
-                    !Task.isCancelled,
-                    generation == self.operationGeneration,
-                    prefetchGeneration == self.prefetchGeneration,
-                    self.isCurrentForwardPrefetch(
+                let didAppend: Bool
+                if let self {
+                    didAppend = self.appendReadyForwardPrefetch(
+                        ForwardPrefetch(
+                            identifier: prepared.identifier,
+                            duration: prefetchedDuration
+                        ),
+                        operationGeneration: generation,
                         taskID: taskID,
                         generation: prefetchGeneration
                     )
-                else {
+                } else {
                     return
                 }
-                self.appendReadyForwardPrefetch(
-                    ForwardPrefetch(
-                        identifier: prepared.identifier,
-                        duration: prefetchedDuration
-                    ),
-                    taskID: taskID,
-                    generation: prefetchGeneration
-                )
+                guard didAppend else { return }
                 duration += prefetchedDuration
-                // Wake consumers waiting for the next item only — do not make
-                // them await the rest of the waterline.
-                self.notifyForwardPrefetchWaiters(taskID: taskID)
                 // Let resumed waiters run on MainActor before more look-ahead.
                 await Task.yield()
             }
@@ -2146,10 +2150,15 @@ public class PublicationSpeechSynthesizer: Loggable {
 
     /// Marks a normally completed forward operation ready for consumption.
     /// No-ops after invalidation moved the operation into the retired collection.
-    private func finishForwardPrefetch(taskID: UInt64) {
+    private func finishForwardPrefetch(
+        taskID: UInt64,
+        generation: UInt64
+    ) {
         guard
-            let operation = forwardPrefetchOperation,
-            operation.taskID == taskID
+            let operation = activeForwardPrefetchOperation(
+                taskID: taskID,
+                generation: generation
+            )
         else {
             return
         }
@@ -2165,38 +2174,67 @@ public class PublicationSpeechSynthesizer: Loggable {
         taskID: UInt64,
         generation: UInt64
     ) -> Bool {
-        guard let operation = forwardPrefetchOperation else { return false }
-        return operation.taskID == taskID && operation.generation == generation
+        activeForwardPrefetchOperation(
+            taskID: taskID,
+            generation: generation
+        ) != nil
     }
 
-    private func appendReadyForwardPrefetch(
-        _ ready: ForwardPrefetch,
+    private func activeForwardPrefetchOperation(
         taskID: UInt64,
         generation: UInt64
-    ) {
+    ) -> ForwardPrefetchOperation? {
         guard
-            var operation = forwardPrefetchOperation,
+            let operation = forwardPrefetchOperation,
             operation.taskID == taskID,
             operation.generation == generation
         else {
-            return
+            return nil
+        }
+        return operation
+    }
+
+    @discardableResult
+    private func appendReadyForwardPrefetch(
+        _ ready: ForwardPrefetch,
+        operationGeneration: UInt64,
+        taskID: UInt64,
+        generation: UInt64
+    ) -> Bool {
+        guard
+            !Task.isCancelled,
+            operationGeneration == self.operationGeneration,
+            generation == prefetchGeneration,
+            var operation = activeForwardPrefetchOperation(
+                taskID: taskID,
+                generation: generation
+            )
+        else {
+            return false
         }
         operation.ready.append(ready)
         forwardPrefetchOperation = operation
-    }
-
-    private func notifyForwardPrefetchWaiters(taskID: UInt64) {
-        guard forwardPrefetchOperation?.taskID == taskID else { return }
-        forwardPrefetchOperation?.waiters.resumeAll()
+        // Ready insertion and waiter lookup use the same operation identity.
+        // Resume only that operation's consumers after its queue is committed.
+        operation.waiters.resumeAll()
+        return true
     }
 
     private func consumeReadyForwardPrefetch() {
-        if var operation = forwardPrefetchOperation, !operation.ready.isEmpty {
+        if
+            var operation = forwardPrefetchOperation,
+            operation.generation == prefetchGeneration,
+            !operation.ready.isEmpty
+        {
             operation.ready.removeFirst()
             forwardPrefetchOperation = operation
             return
         }
-        if var operation = readyForwardPrefetchOperation, !operation.ready.isEmpty {
+        if
+            var operation = readyForwardPrefetchOperation,
+            operation.generation == prefetchGeneration,
+            !operation.ready.isEmpty
+        {
             operation.ready.removeFirst()
             readyForwardPrefetchOperation = operation.ready.isEmpty ? nil : operation
         }
@@ -2287,9 +2325,10 @@ public class PublicationSpeechSynthesizer: Loggable {
         forwardTaskID: UInt64
     ) async {
         guard
-            let initial = weakSynthesizer.value?.forwardPrefetchOperation,
-            initial.taskID == forwardTaskID,
-            initial.generation == prefetchGeneration
+            let initial = weakSynthesizer.value?.activeForwardPrefetchOperation(
+                taskID: forwardTaskID,
+                generation: prefetchGeneration
+            )
         else {
             return
         }
@@ -2304,13 +2343,15 @@ public class PublicationSpeechSynthesizer: Loggable {
                     !Task.isCancelled,
                     operationGeneration == self.operationGeneration,
                     prefetchGeneration == self.prefetchGeneration,
-                    self.forwardPrefetchOperation?.taskID == forwardTaskID,
-                    self.forwardPrefetchOperation?.generation == prefetchGeneration
+                    let operation = self.activeForwardPrefetchOperation(
+                        taskID: forwardTaskID,
+                        generation: prefetchGeneration
+                    )
                 else {
                     continuation.resume()
                     return
                 }
-                if self.forwardPrefetchOperation?.ready.isEmpty == false {
+                if !operation.ready.isEmpty {
                     continuation.resume()
                     return
                 }
@@ -2366,10 +2407,14 @@ public class PublicationSpeechSynthesizer: Loggable {
             return latestRetiredForwardPrefetchDrain
         }
         let taskID = retiredOperation.taskID
+        let generation = retiredOperation.generation
         let task = retiredOperation.task
         let drain = Task { [weak self] in
             await task.value
-            self?.finishRetiredForwardPrefetch(taskID: taskID)
+            self?.finishRetiredForwardPrefetch(
+                taskID: taskID,
+                generation: generation
+            )
         }
         retiredOperation.ready = []
         retiredOperation.cancellationTask = drain
@@ -2377,8 +2422,17 @@ public class PublicationSpeechSynthesizer: Loggable {
         return drain
     }
 
-    private func finishRetiredForwardPrefetch(taskID: UInt64) {
-        retiredForwardPrefetchOperations[taskID]?.waiters.resumeAll()
+    private func finishRetiredForwardPrefetch(
+        taskID: UInt64,
+        generation: UInt64
+    ) {
+        guard
+            let operation = retiredForwardPrefetchOperations[taskID],
+            operation.generation == generation
+        else {
+            return
+        }
+        operation.waiters.resumeAll()
         retiredForwardPrefetchOperations[taskID] = nil
     }
 

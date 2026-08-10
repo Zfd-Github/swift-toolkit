@@ -220,6 +220,68 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         synthesizer.stop()
     }
 
+    func testInvalidatingForwardOperationDrainsAndRejectsStaleReadyResult() async throws {
+        do {
+            let engine = PrefetchingTTSEngine(
+                defersPrefetch: true
+            )
+            let synthesizer = try makeSynthesizer(
+                elements: [
+                    textElement("first"),
+                    textElement("second"),
+                ],
+                engine: engine
+            )
+
+            synthesizer.start()
+            try await waitUntil {
+                engine.spokenTexts == ["first"] &&
+                    engine.pendingPrefetchCalls == [1]
+            }
+            engine.completeSpeech()
+            try await waitUntil { synthesizer.isWaitingForForwardPrefetchForTesting }
+
+            synthesizer.config.defaultLanguage = Language("fr")
+
+            try await waitUntil { !synthesizer.isWaitingForForwardPrefetchForTesting }
+            XCTAssertEqual(engine.pendingPrefetchCalls, [1])
+            engine.completePrefetch(call: 1)
+            try await waitUntil { engine.spokenTexts == ["first", "second"] }
+            synthesizer.stop()
+        }
+
+        do {
+            // This engine stores one continuation per numbered prefetch call, so
+            // a late old result cannot be confused with a successor's gate.
+            let engine = PrefetchingTTSEngine(deferPrefetchOnCalls: [1])
+            let synthesizer = try makeSynthesizer(
+                elements: [
+                    textElement("first"),
+                    textElement("second"),
+                    textElement("third"),
+                ],
+                engine: engine
+            )
+
+            synthesizer.start()
+            try await waitUntil {
+                engine.spokenTexts == ["first"] &&
+                    engine.pendingPrefetchCalls == [1]
+            }
+            let staleIdentifier = try XCTUnwrap(engine.prefetchedIdentifiers[0])
+
+            synthesizer.config.defaultLanguage = Language("fr")
+            synthesizer.next()
+            engine.completePrefetch(call: 1)
+
+            try await waitUntil { engine.spokenTexts.contains("second") }
+            XCTAssertFalse(engine.spokenIdentifiers.contains(staleIdentifier))
+            XCTAssertEqual(engine.spokenTexts.filter { $0 == "second" }.count, 1)
+
+            synthesizer.stop()
+        }
+    }
+
     func testInitialPrefetchReturnsAfterFirstUtteranceAndFillsForwardInBackground() async throws {
         let first = textElement("first", href: "first.xhtml")
         let second = textElement("second", href: "second.xhtml")
