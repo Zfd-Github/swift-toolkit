@@ -20,6 +20,10 @@ ARGS=(
     -scheme TestApp
     -testPlan TestApp
     -destination "$DESTINATION"
+    # UIKit/WebKit navigator suites share simulator process resources. Running
+    # them in parallel can leave a page-turn transaction test stalled after an
+    # unrelated suite and produces nondeterministic assertion failures.
+    -parallel-testing-enabled NO
 )
 [ -n "$FILTER" ] && ARGS+=(-only-testing:"$FILTER")
 
