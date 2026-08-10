@@ -250,6 +250,46 @@ public class PublicationSpeechSynthesizer: Loggable {
         var cancellationTask: Task<Void, Never>?
     }
 
+    private struct OperationToken {
+        let playbackGeneration: UInt64
+        let prefetchGeneration: UInt64
+        let forwardTaskID: UInt64?
+        let iterator: ContentIterator
+        let movementID: UUID
+        let destination: TokenizationDestination
+        let raw: ContentElement
+        let prepared: ContentElement
+    }
+
+    private enum TokenizationDestination {
+        case playbackMovement(direction: Direction)
+        case playbackGroup(id: UUID)
+        case forwardGroup(id: UUID)
+        case forwardCandidate(id: UUID)
+    }
+
+    private enum TokenizationSource {
+        case bufferedPlayback
+        case iteratorPlayback
+        case forwardGroupLoader
+        case forwardCandidateCollection
+
+        var isForwardOperation: Bool {
+            switch self {
+            case .bufferedPlayback, .iteratorPlayback:
+                return false
+            case .forwardGroupLoader, .forwardCandidateCollection:
+                return true
+            }
+        }
+    }
+
+    private enum TokenCommitResult {
+        case committed([Utterance])
+        case retryWithNewConfig
+        case superseded
+    }
+
     private enum IteratorState {
         case synchronized
         case fetched(
@@ -292,6 +332,7 @@ public class PublicationSpeechSynthesizer: Loggable {
 
         struct GroupLease {
             let groupID: UUID
+            let movementID: UUID
             let raw: ContentElement
             let prepared: ContentElement
             let utterances: [Utterance]?
@@ -458,6 +499,7 @@ public class PublicationSpeechSynthesizer: Loggable {
             state = .synchronized
             return GroupLease(
                 groupID: group.groupID,
+                movementID: group.movementID,
                 raw: raw,
                 prepared: prepared,
                 utterances: nil
@@ -492,6 +534,37 @@ public class PublicationSpeechSynthesizer: Loggable {
 
         func forwardGroup(groupID: UUID) -> GroupLease? {
             forwardGroups.first(where: { $0.groupID == groupID }).map(lease)
+        }
+
+        func matchesFetched(
+            movementID: UUID,
+            direction: Direction,
+            raw: ContentElement,
+            prepared: ContentElement
+        ) -> Bool {
+            guard case let .fetched(currentID, currentDirection, currentRaw, currentPrepared) = state else {
+                return false
+            }
+            return currentID == movementID &&
+                currentDirection == direction &&
+                currentRaw.isEqualTo(raw) &&
+                currentPrepared.isEqualTo(prepared)
+        }
+
+        func matchesForwardGroup(
+            groupID: UUID,
+            movementID: UUID,
+            raw: ContentElement,
+            prepared: ContentElement
+        ) -> Bool {
+            guard let group = forwardGroups.first(where: { $0.groupID == groupID }) else {
+                return false
+            }
+            return group.movementID == movementID &&
+                group.isLeased &&
+                group.utterances == nil &&
+                group.raw.isEqualTo(raw) &&
+                group.prepared.isEqualTo(prepared)
         }
 
         mutating func restoreForwardGroup(groupID: UUID) {
@@ -579,6 +652,7 @@ public class PublicationSpeechSynthesizer: Loggable {
         private func lease(_ group: BufferedUtteranceGroup) -> GroupLease {
             GroupLease(
                 groupID: group.groupID,
+                movementID: group.movementID,
                 raw: group.raw,
                 prepared: group.prepared,
                 utterances: group.utterances
@@ -1054,6 +1128,136 @@ public class PublicationSpeechSynthesizer: Loggable {
         return true
     }
 
+    /// Validates and commits the result of every user tokenizer call.
+    ///
+    /// Destination and movement identifiers select the ledger entry; payload
+    /// equality only verifies that the selected entry still owns the token's
+    /// once-prepared content. This is important when adjacent elements compare
+    /// equal but belong to different iterator movements.
+    private func commitTokenization(
+        _ tokenized: [Utterance],
+        source: TokenizationSource,
+        token: OperationToken
+    ) -> TokenCommitResult {
+        guard
+            !Task.isCancelled,
+            token.playbackGeneration == operationGeneration,
+            playbackOperation?.generation == token.playbackGeneration,
+            iteratorLedger.owns(token.iterator)
+        else {
+            return .superseded
+        }
+
+        switch (source, token.destination) {
+        case let (.bufferedPlayback, .playbackGroup(groupID)):
+            guard iteratorLedger.matchesForwardGroup(
+                groupID: groupID,
+                movementID: token.movementID,
+                raw: token.raw,
+                prepared: token.prepared
+            ) else {
+                return .superseded
+            }
+
+        case let (.iteratorPlayback, .playbackMovement(direction)):
+            guard iteratorLedger.matchesFetched(
+                movementID: token.movementID,
+                direction: direction,
+                raw: token.raw,
+                prepared: token.prepared
+            ) else {
+                return .superseded
+            }
+
+        case let (.forwardGroupLoader, .forwardGroup(groupID)),
+             let (.forwardCandidateCollection, .forwardCandidate(groupID)):
+            guard iteratorLedger.matchesForwardGroup(
+                groupID: groupID,
+                movementID: token.movementID,
+                raw: token.raw,
+                prepared: token.prepared
+            ) else {
+                return .superseded
+            }
+
+        default:
+            return .superseded
+        }
+
+        if source.isForwardOperation {
+            guard
+                token.prefetchGeneration == prefetchGeneration,
+                let forwardTaskID = token.forwardTaskID,
+                isCurrentForwardPrefetch(
+                    taskID: forwardTaskID,
+                    generation: token.prefetchGeneration
+                )
+            else {
+                // A forward epoch never retries inside its retired worker. Its
+                // successor will lease the preserved placeholder.
+                return .superseded
+            }
+        } else {
+            guard token.forwardTaskID == nil else { return .superseded }
+            if token.prefetchGeneration != prefetchGeneration {
+                // Config invalidation does not retire the live playback worker.
+                // Retry the same ledger entry using its prepared payload.
+                return .retryWithNewConfig
+            }
+        }
+
+        switch token.destination {
+        case let .playbackMovement(direction):
+            guard iteratorLedger.completeFetched(
+                movementID: token.movementID,
+                direction: direction
+            ) else {
+                return .superseded
+            }
+            if !tokenized.isEmpty {
+                utterances = CursorList(
+                    list: tokenized,
+                    startIndex: direction == .forward ? 0 : tokenized.count - 1
+                )
+            }
+
+        case let .playbackGroup(groupID):
+            guard iteratorLedger.consumeForwardGroup(
+                groupID: groupID,
+                utterances: tokenized
+            ) else {
+                return .superseded
+            }
+            if !tokenized.isEmpty {
+                utterances = CursorList(list: tokenized, startIndex: 0)
+            }
+
+        case let .forwardGroup(groupID), let .forwardCandidate(groupID):
+            guard iteratorLedger.fillForwardPlaceholder(
+                groupID: groupID,
+                utterances: tokenized
+            ) else {
+                return .superseded
+            }
+        }
+
+        return .committed(tokenized)
+    }
+
+    /// Releases a tokenizer lease without discarding its prepared payload.
+    /// Fetched playback movements remain in `.fetched` and need no transition.
+    private func recoverTokenizationLease(_ token: OperationToken) {
+        guard iteratorLedger.owns(token.iterator) else { return }
+        switch token.destination {
+        case let .playbackGroup(groupID),
+             let .forwardGroup(groupID),
+             let .forwardCandidate(groupID):
+            iteratorLedger.restoreForwardGroup(groupID: groupID)
+        case .playbackMovement:
+            break
+        }
+    }
+
     /// Playback worker that only weakly references the synthesizer across
     /// `engine.speak` and look-ahead waits, so releasing the last external
     /// reference can run `deinit` and cancel outstanding work.
@@ -1377,20 +1581,29 @@ public class PublicationSpeechSynthesizer: Loggable {
         // retries re-run only the config-sensitive tokenizer.
         var configRetries = 0
         while true {
-            let prefetchEpoch: UInt64
+            let token: OperationToken
             let tokenized: [Utterance]
             if let self = weakSynthesizer.value {
+                token = OperationToken(
+                    playbackGeneration: generation,
+                    prefetchGeneration: self.prefetchGeneration,
+                    forwardTaskID: nil,
+                    iterator: iterator,
+                    movementID: group.movementID,
+                    destination: .playbackGroup(id: group.groupID),
+                    raw: group.raw,
+                    prepared: group.prepared
+                )
                 guard self.isCurrentOperation(generation, iterator: iterator) else {
-                    restorePending()
+                    self.recoverTokenizationLease(token)
                     return .failed
                 }
-                prefetchEpoch = self.prefetchGeneration
                 do {
-                    tokenized = try self.tokenizePrepared(group.prepared)
+                    tokenized = try self.tokenizePrepared(token.prepared)
                         .flatMap { self.utterances(for: $0) }
                 } catch {
-                    if let self = weakSynthesizer.value, self.iteratorLedger.owns(iterator) {
-                        self.iteratorLedger.restoreForwardGroup(groupID: group.groupID)
+                    if let self = weakSynthesizer.value {
+                        self.recoverTokenizationLease(token)
                         self.log(.error, error)
                     }
                     return .failed
@@ -1400,33 +1613,27 @@ public class PublicationSpeechSynthesizer: Loggable {
             }
 
             guard let self = weakSynthesizer.value else { return .failed }
-            guard self.isCurrentOperation(generation, iterator: iterator) else {
-                restorePending()
-                return .failed
-            }
-            // Config change only bumps prefetchGeneration — must not commit stale tokens.
-            if prefetchEpoch != self.prefetchGeneration {
+            switch self.commitTokenization(
+                tokenized,
+                source: .bufferedPlayback,
+                token: token
+            ) {
+            case let .committed(committed):
+                return committed.isEmpty ? .emptyContinue : .ready
+
+            case .retryWithNewConfig:
                 configRetries += 1
                 if configRetries > Self.maximumConfigTokenizeRetries {
                     // Leave group pending for a later epoch; do not spin on MainActor.
-                    restorePending()
+                    self.recoverTokenizationLease(token)
                     return .failed
                 }
                 continue
-            }
 
-            guard self.iteratorLedger.consumeForwardGroup(
-                groupID: group.groupID,
-                utterances: tokenized
-            ) else {
+            case .superseded:
+                self.recoverTokenizationLease(token)
                 return .failed
             }
-            if tokenized.isEmpty {
-                return .emptyContinue
-            }
-
-            self.utterances = CursorList(list: tokenized, startIndex: 0)
-            return .ready
         }
     }
 
@@ -1444,10 +1651,7 @@ public class PublicationSpeechSynthesizer: Loggable {
             return false
         }
 
-        var nextUtterances: [Utterance] = []
-        var completedMovementID: UUID?
-
-        contentLoop: while nextUtterances.isEmpty {
+        contentLoop: while true {
             let load: IteratorLedger.LiveStep
             if let self = weakSynthesizer.value {
                 guard self.isCurrentOperation(generation, iterator: iterator) else {
@@ -1535,18 +1739,28 @@ public class PublicationSpeechSynthesizer: Loggable {
 
             var configRetries = 0
             while true {
-                let prefetchEpoch: UInt64
+                let token: OperationToken
                 let tokenized: [Utterance]
                 if let self = weakSynthesizer.value {
                     guard self.isCurrentOperation(generation, iterator: iterator) else {
                         return false
                     }
-                    prefetchEpoch = self.prefetchGeneration
+                    token = OperationToken(
+                        playbackGeneration: generation,
+                        prefetchGeneration: self.prefetchGeneration,
+                        forwardTaskID: nil,
+                        iterator: iterator,
+                        movementID: movement.movementID,
+                        destination: .playbackMovement(direction: direction),
+                        raw: movement.raw,
+                        prepared: movement.prepared
+                    )
                     do {
-                        tokenized = try self.tokenizePrepared(movement.prepared)
+                        tokenized = try self.tokenizePrepared(token.prepared)
                             .flatMap { self.utterances(for: $0) }
                     } catch {
                         if let self = weakSynthesizer.value {
+                            self.recoverTokenizationLease(token)
                             self.log(.error, error)
                         }
                         return false
@@ -1556,56 +1770,32 @@ public class PublicationSpeechSynthesizer: Loggable {
                 }
 
                 guard let self = weakSynthesizer.value else { return false }
-                guard self.isCurrentOperation(generation, iterator: iterator) else {
-                    return false
-                }
-                if prefetchEpoch != self.prefetchGeneration {
+                switch self.commitTokenization(
+                    tokenized,
+                    source: .iteratorPlayback,
+                    token: token
+                ) {
+                case let .committed(committed):
+                    if committed.isEmpty {
+                        continue contentLoop
+                    }
+                    return true
+
+                case .retryWithNewConfig:
                     configRetries += 1
                     if configRetries > Self.maximumConfigTokenizeRetries {
                         // The same prepared fetched movement remains recoverable.
+                        self.recoverTokenizationLease(token)
                         return false
                     }
                     continue
-                }
 
-                nextUtterances = tokenized
-                if nextUtterances.isEmpty {
-                    guard self.iteratorLedger.completeFetched(
-                        movementID: movement.movementID,
-                        direction: direction
-                    ) else {
-                        return false
-                    }
-                    continue contentLoop
+                case .superseded:
+                    self.recoverTokenizationLease(token)
+                    return false
                 }
-                completedMovementID = movement.movementID
-                break
             }
         }
-
-        guard let self = weakSynthesizer.value else { return false }
-        guard self.isCurrentOperation(generation, iterator: iterator) else {
-            return false
-        }
-        guard let completedMovementID,
-              self.iteratorLedger.completeFetched(
-                  movementID: completedMovementID,
-                  direction: direction
-              )
-        else {
-            return false
-        }
-
-        self.utterances = CursorList(
-            list: nextUtterances,
-            startIndex: {
-                switch direction {
-                case .forward: return 0
-                case .backward: return nextUtterances.count - 1
-                }
-            }()
-        )
-        return true
     }
 
     private func startForwardPrefetch(
@@ -1902,6 +2092,16 @@ public class PublicationSpeechSynthesizer: Loggable {
             }
 
             guard let synthesizer = weakSynthesizer.value else { return .finished }
+            let token = OperationToken(
+                playbackGeneration: operationGeneration,
+                prefetchGeneration: prefetchGeneration,
+                forwardTaskID: forwardTaskID,
+                iterator: iterator,
+                movementID: placeholder.movementID,
+                destination: .forwardGroup(id: placeholder.groupID),
+                raw: placeholder.raw,
+                prepared: placeholder.prepared
+            )
             guard
                 !Task.isCancelled,
                 operationGeneration == synthesizer.operationGeneration,
@@ -1911,86 +2111,35 @@ public class PublicationSpeechSynthesizer: Loggable {
                     generation: prefetchGeneration
                 )
             else {
-                synthesizer.iteratorLedger.restoreForwardGroup(groupID: placeholder.groupID)
+                synthesizer.recoverTokenizationLease(token)
                 return .finished
             }
-
-            var configRetries = 0
-            let nextUtterances: [Utterance]
-            while true {
-                let epochAtStart = synthesizer.prefetchGeneration
-                let tokenized: [Utterance]
-                do {
-                    tokenized = try synthesizer.tokenizePrepared(placeholder.prepared)
-                        .flatMap { synthesizer.utterances(for: $0) }
-                } catch {
-                    if let synthesizer = weakSynthesizer.value {
-                        synthesizer.log(.error, error)
-                        if synthesizer.iteratorLedger.owns(iterator) {
-                            synthesizer.iteratorLedger.restoreForwardGroup(
-                                groupID: placeholder.groupID
-                            )
-                        }
-                    }
-                    return .finished
+            let tokenized: [Utterance]
+            do {
+                tokenized = try synthesizer.tokenizePrepared(token.prepared)
+                    .flatMap { synthesizer.utterances(for: $0) }
+            } catch {
+                if let synthesizer = weakSynthesizer.value {
+                    synthesizer.recoverTokenizationLease(token)
+                    synthesizer.log(.error, error)
                 }
-
-                guard let synthesizer = weakSynthesizer.value else { return .finished }
-                guard
-                    synthesizer.iteratorLedger.owns(iterator),
-                    !Task.isCancelled,
-                    operationGeneration == synthesizer.operationGeneration,
-                    synthesizer.isCurrentForwardPrefetch(
-                        taskID: forwardTaskID,
-                        generation: prefetchGeneration
-                    )
-                else {
-                    synthesizer.iteratorLedger.restoreForwardGroup(groupID: placeholder.groupID)
-                    return .finished
-                }
-
-                if epochAtStart != synthesizer.prefetchGeneration ||
-                    prefetchGeneration != synthesizer.prefetchGeneration
-                {
-                    configRetries += 1
-                    if configRetries > Self.maximumConfigTokenizeRetries ||
-                        prefetchGeneration != synthesizer.prefetchGeneration
-                    {
-                        synthesizer.iteratorLedger.restoreForwardGroup(
-                            groupID: placeholder.groupID
-                        )
-                        return .finished
-                    }
-                    continue
-                }
-
-                nextUtterances = tokenized
-                break
+                return .finished
             }
 
             guard let synthesizer = weakSynthesizer.value else { return .finished }
-            guard
-                synthesizer.iteratorLedger.owns(iterator),
-                !Task.isCancelled,
-                operationGeneration == synthesizer.operationGeneration,
-                prefetchGeneration == synthesizer.prefetchGeneration,
-                synthesizer.isCurrentForwardPrefetch(
-                    taskID: forwardTaskID,
-                    generation: prefetchGeneration
-                )
-            else {
-                synthesizer.iteratorLedger.restoreForwardGroup(groupID: placeholder.groupID)
-                return .finished
-            }
+            switch synthesizer.commitTokenization(
+                tokenized,
+                source: .forwardGroupLoader,
+                token: token
+            ) {
+            case let .committed(committed):
+                if !committed.isEmpty {
+                    return .group(committed)
+                }
 
-            guard synthesizer.iteratorLedger.fillForwardPlaceholder(
-                groupID: placeholder.groupID,
-                utterances: nextUtterances
-            ) else {
+            case .retryWithNewConfig, .superseded:
+                synthesizer.recoverTokenizationLease(token)
                 return .finished
-            }
-            if !nextUtterances.isEmpty {
-                return .group(nextUtterances)
             }
         }
     }
@@ -2085,58 +2234,41 @@ public class PublicationSpeechSynthesizer: Loggable {
             guard let leased = iteratorLedger.leaseForwardGroup(groupID: groupID) else {
                 return nil
             }
-            var configRetries = 0
-            let nextUtterances: [Utterance]
-            while true {
-                let epochAtStart = self.prefetchGeneration
-                let tokenized: [Utterance]
-                do {
-                    tokenized = try tokenizePrepared(leased.prepared)
-                        .flatMap { utterances(for: $0) }
-                } catch {
-                    iteratorLedger.restoreForwardGroup(groupID: groupID)
-                    throw error
-                }
-
-                guard
-                    !Task.isCancelled,
-                    operationGeneration == self.operationGeneration,
-                    isCurrentForwardPrefetch(
-                        taskID: forwardTaskID,
-                        generation: prefetchGeneration
-                    )
-                else {
-                    iteratorLedger.restoreForwardGroup(groupID: groupID)
-                    return nil
-                }
-
-                if epochAtStart != self.prefetchGeneration ||
-                    prefetchGeneration != self.prefetchGeneration
-                {
-                    configRetries += 1
-                    if configRetries > Self.maximumConfigTokenizeRetries {
-                        iteratorLedger.restoreForwardGroup(groupID: groupID)
-                        return nil
-                    }
-                    // Caller epoch may be stale; abort so a newer task restarts.
-                    if prefetchGeneration != self.prefetchGeneration {
-                        iteratorLedger.restoreForwardGroup(groupID: groupID)
-                        return nil
-                    }
-                    continue
-                }
-
-                nextUtterances = tokenized
-                break
-            }
-
-            guard iteratorLedger.fillForwardPlaceholder(
-                groupID: groupID,
-                utterances: nextUtterances
-            ) else {
+            guard let iterator = iteratorLedger.iterator else {
+                iteratorLedger.restoreForwardGroup(groupID: groupID)
                 return nil
             }
-            candidates.append(contentsOf: nextUtterances)
+            let token = OperationToken(
+                playbackGeneration: operationGeneration,
+                prefetchGeneration: prefetchGeneration,
+                forwardTaskID: forwardTaskID,
+                iterator: iterator,
+                movementID: leased.movementID,
+                destination: .forwardCandidate(id: leased.groupID),
+                raw: leased.raw,
+                prepared: leased.prepared
+            )
+            let tokenized: [Utterance]
+            do {
+                tokenized = try tokenizePrepared(token.prepared)
+                    .flatMap { utterances(for: $0) }
+            } catch {
+                recoverTokenizationLease(token)
+                throw error
+            }
+
+            switch commitTokenization(
+                tokenized,
+                source: .forwardCandidateCollection,
+                token: token
+            ) {
+            case let .committed(committed):
+                candidates.append(contentsOf: committed)
+
+            case .retryWithNewConfig, .superseded:
+                recoverTokenizationLease(token)
+                return nil
+            }
         }
         return candidates
     }

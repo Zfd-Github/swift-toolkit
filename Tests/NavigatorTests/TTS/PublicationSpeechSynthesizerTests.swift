@@ -1684,12 +1684,13 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         synthesizer.stop()
     }
 
-    func testBufferedGroupRetokenizeReentryConfigDoesNotCommitStaleResult() async throws {
+    private func assertForwardCandidateCommitRejectsConfigSupersededToken() async throws {
         let french = Language("fr")
         let german = Language("de")
         final class ReentrantTokenizer: @unchecked Sendable {
             var onCollectRetokenize: (() -> Void)?
-            private var frenchTokenizeCount = 0
+            var isFrenchSecondPlaying: (() -> Bool)?
+            private(set) var didCollectRetokenize = false
 
             func makeTokenizer(language: Language?) -> ContentTokenizer {
                 { [self] element in
@@ -1698,11 +1699,12 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
                     }
                     let code = language?.code.bcp47.lowercased() ?? ""
                     if code.hasPrefix("fr") {
-                        frenchTokenizeCount += 1
-                        // Second French tokenize is collectForwardPrefetchCandidates
-                        // retokenizing the remaining invalidated "third" group while
-                        // "fr second" is already playing — not the live second consume.
-                        if frenchTokenizeCount == 2 {
+                        // The stable third candidate slot is retokenized by
+                        // collectForwardPrefetchCandidates while "fr second" plays.
+                        if text.segments.map(\.text).joined() == "third",
+                           isFrenchSecondPlaying?() == true
+                        {
+                            didCollectRetokenize = true
                             onCollectRetokenize?()
                         }
                         text.segments = text.segments.map { segment in
@@ -1733,6 +1735,9 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
             engine: engine,
             tokenizerFactory: { language in tokenizer.makeTokenizer(language: language) }
         )
+        tokenizer.isFrenchSecondPlaying = {
+            engine.spokenTexts.last == "fr second" && engine.hasPendingSpeech
+        }
         tokenizer.onCollectRetokenize = { [weak synthesizer] in
             // Mid-collect reentry: final config is German — stale "fr third" must not win.
             synthesizer?.config.defaultLanguage = german
@@ -1744,12 +1749,14 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
                 engine.prefetchedTexts.contains("second") &&
                 engine.prefetchedTexts.contains("third")
         }
-        // Invalidate buffered groups; live path consumes second under French
-        // (frenchTokenizeCount == 1). While second speaks, collect retokenizes
-        // remaining "third" (count == 2) and re-enters to German.
+        // Invalidate buffered groups; live path consumes second under French.
+        // While second speaks, collect retokenizes the stable "third" slot and
+        // re-enters to German.
         synthesizer.config.defaultLanguage = french
         engine.completeSpeech()
         try await waitUntil { engine.spokenTexts == ["first", "fr second"] }
+        try await waitUntil { tokenizer.didCollectRetokenize }
+        XCTAssertTrue(engine.hasPendingSpeech)
 
         // Stale "fr third" from the interrupted collect must not be committed;
         // after second ends, live load uses German.
@@ -1758,6 +1765,14 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         XCTAssertFalse(engine.spokenTexts.contains("fr third"))
         XCTAssertFalse(engine.prefetchedTexts.contains("fr third"))
         synthesizer.stop()
+    }
+
+    func testForwardCandidateCommitRejectsConfigSupersededToken() async throws {
+        try await assertForwardCandidateCommitRejectsConfigSupersededToken()
+    }
+
+    func testBufferedGroupRetokenizeReentryConfigDoesNotCommitStaleResult() async throws {
+        try await assertForwardCandidateCommitRejectsConfigSupersededToken()
     }
 
     func testEmptyBufferedGroupDoesNotRetainAcrossSubsequentIteratorHang() async throws {
@@ -2849,6 +2864,10 @@ private final class PrefetchingTTSEngine: TTSPrefetchingEngine {
 
     var hasPendingPrefetch: Bool {
         !prefetchContinuations.isEmpty
+    }
+
+    var hasPendingSpeech: Bool {
+        !speechContinuations.isEmpty
     }
 
     var pendingPrefetchCalls: [Int] {
