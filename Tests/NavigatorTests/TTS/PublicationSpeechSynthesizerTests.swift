@@ -571,6 +571,147 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         synthesizer.stop()
     }
 
+    func testStartDrainsSuspendedInitialIteratorBeforeLoadingReplacement() async throws {
+        let iterator = GatedArrayContentIterator(
+            elements: [textElement("first"), textElement("second")],
+            startIndex: 0,
+            gatedNextCall: 1,
+            delaysCancellationExit: true
+        )
+        let engine = SpeechEngine()
+        let synthesizer = try makeSynthesizer(
+            contentService: IteratorContentService(iteratorFactory: { iterator }),
+            engine: engine
+        )
+        defer {
+            iterator.openGate()
+            iterator.openCleanupGate()
+        }
+
+        let prefetchTask = Task { await synthesizer.prefetch() }
+        try await waitUntil { iterator.hasSuspendedNext }
+
+        synthesizer.start()
+        try await waitUntil { iterator.hasSuspendedCleanup }
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(iterator.nextCallCount, 1)
+        XCTAssertEqual(iterator.activeCallCount, 1)
+        XCTAssertEqual(engine.spokenTexts, [])
+
+        iterator.openCleanupGate()
+        let didPrefetch = await prefetchTask.value
+        XCTAssertFalse(didPrefetch)
+        try await waitUntil { engine.spokenTexts == ["first"] }
+        XCTAssertEqual(iterator.maximumConcurrentCalls, 1)
+        synthesizer.stop()
+    }
+
+    func testReplacementPrefetchDrainsSuspendedInitialEngineOperation() async throws {
+        let engine = PrefetchingTTSEngine(
+            deferPrefetchOnCalls: [1, 2]
+        )
+        let synthesizer = try makeSynthesizer(
+            elements: [textElement("first")],
+            engine: engine
+        )
+        let firstPrefetch = Task { await synthesizer.prefetch() }
+        var secondPrefetch: Task<Bool, Never>?
+        defer {
+            engine.completePrefetch(call: 1, returning: nil)
+            engine.completePrefetch(call: 2, returning: nil)
+            firstPrefetch.cancel()
+            secondPrefetch?.cancel()
+        }
+
+        try await waitUntil { engine.pendingPrefetchCalls == [1] }
+        secondPrefetch = Task { await synthesizer.prefetch() }
+        try await waitUntil { engine.cancelPrefetchCount == 1 }
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(engine.pendingPrefetchCalls, [1])
+        XCTAssertEqual(engine.maximumConcurrentPrefetches, 1)
+
+        engine.completePrefetch(call: 1, returning: nil)
+        let firstDidPrefetch = await firstPrefetch.value
+        XCTAssertFalse(firstDidPrefetch)
+        try await waitUntil { engine.pendingPrefetchCalls == [2] }
+        XCTAssertEqual(engine.maximumConcurrentPrefetches, 1)
+
+        engine.completePrefetch(call: 2)
+        let secondDidPrefetch = await secondPrefetch!.value
+        XCTAssertTrue(secondDidPrefetch)
+        synthesizer.stop()
+    }
+
+    func testInitialIteratorPreparationDoesNotRetainReleasedSynthesizer() async throws {
+        let iterator = GatedArrayContentIterator(
+            elements: [textElement("first")],
+            startIndex: 0,
+            gatedNextCall: 1,
+            delaysCancellationExit: true
+        )
+        var synthesizer: PublicationSpeechSynthesizer? = try makeSynthesizer(
+            contentService: IteratorContentService(iteratorFactory: { iterator }),
+            engine: PrefetchingTTSEngine()
+        )
+        weak let weakSynthesizer = synthesizer
+        let prefetchTask = Task { @MainActor [weak synthesizer] in
+            await synthesizer?.prefetch() ?? false
+        }
+        defer {
+            iterator.openGate()
+            iterator.openCleanupGate()
+            prefetchTask.cancel()
+        }
+
+        try await waitUntil { iterator.hasSuspendedNext }
+        prefetchTask.cancel()
+        try await waitUntil { iterator.hasSuspendedCleanup }
+        synthesizer = nil
+
+        try await waitUntil { weakSynthesizer == nil }
+        XCTAssertEqual(iterator.activeCallCount, 1)
+
+        iterator.openCleanupGate()
+        let didPrefetch = await prefetchTask.value
+        XCTAssertFalse(didPrefetch)
+        try await waitUntil { iterator.activeCallCount == 0 }
+    }
+
+    func testInitialEnginePreparationDoesNotRetainReleasedSynthesizer() async throws {
+        let engine = PrefetchingTTSEngine(defersPrefetch: true)
+        var synthesizer: PublicationSpeechSynthesizer? = try makeSynthesizer(
+            elements: [textElement("first")],
+            engine: engine
+        )
+        weak let weakSynthesizer = synthesizer
+        let prefetchTask = Task { @MainActor [weak synthesizer] in
+            await synthesizer?.prefetch() ?? false
+        }
+        defer {
+            engine.completePrefetch(returning: nil)
+            prefetchTask.cancel()
+        }
+
+        try await waitUntil { engine.hasPendingPrefetch }
+        prefetchTask.cancel()
+        try await waitUntil { engine.cancelPrefetchCount == 1 }
+        synthesizer = nil
+
+        try await waitUntil { weakSynthesizer == nil }
+        XCTAssertTrue(engine.hasPendingPrefetch)
+
+        engine.completePrefetch(returning: nil)
+        let didPrefetch = await prefetchTask.value
+        XCTAssertFalse(didPrefetch)
+        XCTAssertFalse(engine.hasPendingPrefetch)
+    }
+
     func testLateCancellationDoesNotInvalidateNewStart() async throws {
         let engine = PrefetchingTTSEngine(
             defersPrefetch: true,

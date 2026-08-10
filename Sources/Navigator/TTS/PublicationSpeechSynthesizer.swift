@@ -238,8 +238,14 @@ public class PublicationSpeechSynthesizer: Loggable {
     private struct PlaybackOperation {
         let generation: UInt64
         let phase: PlaybackPhase
-        let task: Task<Void, Never>?
+        let task: Task<Void, Never>
+        let preparationResult: InitialPrefetchResult?
         let lifecycle: DetachedTaskLifecycleHandle
+    }
+
+    private struct InitialPrefetchRequest {
+        let engine: TTSPrefetchingEngine
+        let utterance: TTSUtterance
     }
 
     private struct ForwardPrefetchOperation {
@@ -681,7 +687,6 @@ public class PublicationSpeechSynthesizer: Loggable {
     private let forwardPrefetchLifecycle = DetachedTaskLifecycleHandle()
     private var operationGeneration: UInt64 = 0
     private var prefetchGeneration: UInt64 = 0
-    private var prefetchRequestGeneration: UInt64 = 0
     private struct ForwardPrefetch {
         let identifier: UUID
         let duration: TimeInterval
@@ -754,85 +759,78 @@ public class PublicationSpeechSynthesizer: Loggable {
         let oldPrefetchTask = invalidatePrefetch()
         operationGeneration &+= 1
         let generation = operationGeneration
+        let prefetchGeneration = self.prefetchGeneration
+        setStartText(from: startLocator)
+        resetIterator(nil)
+        let weakSynthesizer = WeakPublicationSpeechSynthesizer(self)
+        let result = InitialPrefetchResult()
+        let task = Task {
+            let didPrefetch = await Self.prefetchInitial(
+                weakSynthesizer: weakSynthesizer,
+                from: startLocator,
+                oldPlaybackTask: oldPlaybackTask,
+                oldPrefetchTask: oldPrefetchTask,
+                operationGeneration: generation,
+                prefetchGeneration: prefetchGeneration
+            )
+            result.finish(didPrefetch)
+        }
         setPlaybackOperation(
             generation: generation,
             phase: .preparing(startLocator: startLocator),
-            task: nil
+            task: task,
+            preparationResult: result
         )
-        let prefetchGeneration = self.prefetchGeneration
-        prefetchRequestGeneration &+= 1
-        let prefetchRequestGeneration = self.prefetchRequestGeneration
-        setStartText(from: startLocator)
-        resetIterator(nil)
         return await withTaskCancellationHandler(
             operation: {
-                await self.prefetchInitial(
-                    from: startLocator,
-                    oldPlaybackTask: oldPlaybackTask,
-                    oldPrefetchTask: oldPrefetchTask,
-                    operationGeneration: generation,
-                    prefetchGeneration: prefetchGeneration,
-                    prefetchRequestGeneration: prefetchRequestGeneration
-                )
+                await result.value()
             },
-            onCancel: { [weak self] in
+            onCancel: {
                 Task { @MainActor in
-                    self?.invalidatePrefetchIfCurrent(
+                    weakSynthesizer.value?.cancelInitialPrefetchIfCurrent(
                         operationGeneration: generation,
                         startLocator: startLocator,
-                        prefetchGeneration: prefetchGeneration,
-                        prefetchRequestGeneration: prefetchRequestGeneration
+                        prefetchGeneration: prefetchGeneration
                     )
                 }
             }
         )
     }
 
-    private func prefetchInitial(
+    private static func prefetchInitial(
+        weakSynthesizer: WeakPublicationSpeechSynthesizer,
         from startLocator: Locator?,
         oldPlaybackTask: Task<Void, Never>?,
         oldPrefetchTask: Task<Void, Never>?,
         operationGeneration generation: UInt64,
-        prefetchGeneration: UInt64,
-        prefetchRequestGeneration: UInt64
+        prefetchGeneration: UInt64
     ) async -> Bool {
-        defer {
-            if Task.isCancelled {
-                invalidatePrefetchIfCurrent(
-                    operationGeneration: generation,
-                    startLocator: startLocator,
-                    prefetchGeneration: prefetchGeneration,
-                    prefetchRequestGeneration: prefetchRequestGeneration
-                )
-            }
-        }
         await oldPlaybackTask?.value
         await oldPrefetchTask?.value
         guard !Task.isCancelled else { return false }
-        guard
-            isCurrentPreparation(generation: generation, startLocator: startLocator),
-            prefetchGeneration == self.prefetchGeneration
-        else {
+        guard weakSynthesizer.value?.beginInitialPrefetch(
+            from: startLocator,
+            operationGeneration: generation,
+            prefetchGeneration: prefetchGeneration
+        ) == true else {
             return false
         }
-        resetIterator(publication.content(from: startLocator)?.iterator())
         guard let utterance = await Self.nextUtterance(
-            weakSynthesizer: WeakPublicationSpeechSynthesizer(self),
+            weakSynthesizer: weakSynthesizer,
             direction: .forward,
             generation: generation
         ) else { return false }
         guard !Task.isCancelled else { return false }
-        guard
-            isCurrentPreparation(generation: generation, startLocator: startLocator),
-            prefetchGeneration == self.prefetchGeneration
-        else {
+        guard let request = weakSynthesizer.value?.initialPrefetchRequest(
+            for: utterance,
+            from: startLocator,
+            operationGeneration: generation,
+            prefetchGeneration: prefetchGeneration
+        ) else {
             return false
         }
-        guard let engine = engine as? TTSPrefetchingEngine else {
-            return false
-        }
-        guard let prefetchDuration = await engine.prefetch(
-            ttsUtterance(for: utterance),
+        guard let prefetchDuration = await request.engine.prefetch(
+            request.utterance,
             maximumDuration: Self.maximumSingleUtterancePrefetchDuration
         ),
         prefetchDuration.isFinite,
@@ -840,6 +838,54 @@ public class PublicationSpeechSynthesizer: Loggable {
         prefetchDuration <= Self.maximumSingleUtterancePrefetchDuration
         else { return false }
         guard !Task.isCancelled else { return false }
+        return weakSynthesizer.value?.commitInitialPrefetch(
+            utterance,
+            from: startLocator,
+            operationGeneration: generation,
+            prefetchGeneration: prefetchGeneration
+        ) == true
+    }
+
+    private func beginInitialPrefetch(
+        from startLocator: Locator?,
+        operationGeneration generation: UInt64,
+        prefetchGeneration: UInt64
+    ) -> Bool {
+        guard
+            isCurrentPreparation(generation: generation, startLocator: startLocator),
+            prefetchGeneration == self.prefetchGeneration
+        else {
+            return false
+        }
+        resetIterator(publication.content(from: startLocator)?.iterator())
+        return true
+    }
+
+    private func initialPrefetchRequest(
+        for utterance: Utterance,
+        from startLocator: Locator?,
+        operationGeneration generation: UInt64,
+        prefetchGeneration: UInt64
+    ) -> InitialPrefetchRequest? {
+        guard
+            isCurrentPreparation(generation: generation, startLocator: startLocator),
+            prefetchGeneration == self.prefetchGeneration,
+            let engine = engine as? TTSPrefetchingEngine
+        else {
+            return nil
+        }
+        return InitialPrefetchRequest(
+            engine: engine,
+            utterance: ttsUtterance(for: utterance)
+        )
+    }
+
+    private func commitInitialPrefetch(
+        _ utterance: Utterance,
+        from startLocator: Locator?,
+        operationGeneration generation: UInt64,
+        prefetchGeneration: UInt64
+    ) -> Bool {
         guard
             isCurrentPreparation(generation: generation, startLocator: startLocator),
             prefetchGeneration == self.prefetchGeneration
@@ -872,7 +918,6 @@ public class PublicationSpeechSynthesizer: Loggable {
         {
             preparedStartLocator = nil
             preparedUtterance = nil
-            prefetchRequestGeneration &+= 1
             let generation = operation.generation
             let task = Task { [weak self] in
                 await oldPlaybackTask?.value
@@ -922,24 +967,26 @@ public class PublicationSpeechSynthesizer: Loggable {
     private func setPlaybackOperation(
         generation: UInt64,
         phase: PlaybackPhase,
-        task: Task<Void, Never>?
+        task: Task<Void, Never>,
+        preparationResult: InitialPrefetchResult? = nil
     ) {
         let lifecycle = DetachedTaskLifecycleHandle()
-        if let task {
-            lifecycle.setTask(task)
-        }
+        lifecycle.setTask(task)
         playbackOperation = PlaybackOperation(
             generation: generation,
             phase: phase,
             task: task,
+            preparationResult: preparationResult,
             lifecycle: lifecycle
         )
     }
 
     @discardableResult
     private func cancelPlaybackTask() -> Task<Void, Never>? {
-        let task = playbackOperation?.task
+        let operation = playbackOperation
+        let task = operation?.task
         task?.cancel()
+        operation?.preparationResult?.finish(false)
         return task
     }
 
@@ -2362,22 +2409,21 @@ public class PublicationSpeechSynthesizer: Loggable {
         }
     }
 
-    private func invalidatePrefetchIfCurrent(
+    private func cancelInitialPrefetchIfCurrent(
         operationGeneration: UInt64,
         startLocator: Locator?,
-        prefetchGeneration: UInt64,
-        prefetchRequestGeneration: UInt64
+        prefetchGeneration: UInt64
     ) {
         guard
             isCurrentPreparation(
                 generation: operationGeneration,
                 startLocator: startLocator
             ),
-            prefetchGeneration == self.prefetchGeneration,
-            prefetchRequestGeneration == self.prefetchRequestGeneration
+            prefetchGeneration == self.prefetchGeneration
         else {
             return
         }
+        cancelPlaybackTask()
         invalidatePrefetch()
     }
 
@@ -2679,6 +2725,40 @@ public class PublicationSpeechSynthesizer: Loggable {
         }
 
         func play() {}
+    }
+}
+
+/// Bridges the operation-owned initial preparation task back to its caller
+/// without making the caller's task the owner of preparation work.
+private final class InitialPrefetchResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Bool?
+    private var continuation: CheckedContinuation<Bool, Never>?
+
+    func value() async -> Bool {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if let result {
+                lock.unlock()
+                continuation.resume(returning: result)
+            } else {
+                self.continuation = continuation
+                lock.unlock()
+            }
+        }
+    }
+
+    func finish(_ result: Bool) {
+        lock.lock()
+        guard self.result == nil else {
+            lock.unlock()
+            return
+        }
+        self.result = result
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: result)
     }
 }
 
