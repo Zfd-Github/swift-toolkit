@@ -4,9 +4,9 @@
 //  available in the top-level LICENSE file of the project.
 //
 
-@testable import ReadiumNavigator
 import CoreImage
 import CryptoKit
+@testable import ReadiumNavigator
 import ReadiumShared
 import SwiftUI
 import WebKit
@@ -1028,20 +1028,20 @@ enum ReaderTestAction: String {
 
         case .captureMetrics:
             let result = await navigator.evaluateJavaScript("""
-                (() => {
-                    const element = document.getElementById('reflow-marker')
-                        ?? document.getElementById('chapter-1-end');
-                    if (!element) return null;
-                    const rect = element.getBoundingClientRect();
-                    return {
-                        y: rect.top + window.scrollY,
-                        height: rect.height,
-                        bottom: rect.bottom + window.scrollY,
-                        documentHeight: readium.documentHeight(),
-                        bodyHeight: document.body.scrollHeight,
-                    };
-                })()
-                """)
+            (() => {
+                const element = document.getElementById('reflow-marker')
+                    ?? document.getElementById('chapter-1-end');
+                if (!element) return null;
+                const rect = element.getBoundingClientRect();
+                return {
+                    y: rect.top + window.scrollY,
+                    height: rect.height,
+                    bottom: rect.bottom + window.scrollY,
+                    documentHeight: readium.documentHeight(),
+                    bodyHeight: document.body.scrollHeight,
+                };
+            })()
+            """)
             guard
                 case let .success(value) = result,
                 let metrics = value as? [String: Any],
@@ -1142,8 +1142,8 @@ enum ReaderTestAction: String {
             let style: EPUBPageTurnStyle = action == .preparePushProbe
                 ? .push
                 : action == .prepareNoneProbe
-                    ? .none
-                    : action == .prepareCoverProbe ? .cover : .simulation
+                ? .none
+                : action == .prepareCoverProbe ? .cover : .simulation
             await preparePageTurnProbe(
                 in: navigator,
                 action: action,
@@ -1299,11 +1299,11 @@ enum ReaderTestAction: String {
         let deadline = ProcessInfo.processInfo.systemUptime + 5
         while
             isCurrentAction(generation),
-            (
-                !navigator.isPageTurnIdleForTesting
-                    || !pageTurnSurfaces(in: navigator).isEmpty
-                    || (didObservePageTurnTransaction && !didStopPageTurnSamplerAtTerminal)
-            ),
+
+            !navigator.isPageTurnIdleForTesting
+            || !pageTurnSurfaces(in: navigator).isEmpty
+            || (didObservePageTurnTransaction && !didStopPageTurnSamplerAtTerminal),
+
             ProcessInfo.processInfo.systemUptime < deadline
         {
             try? await Task.sleep(nanoseconds: 10_000_000)
@@ -1311,10 +1311,15 @@ enum ReaderTestAction: String {
         guard isCurrentAction(generation) else { return }
         guard
             navigator.isPageTurnIdleForTesting,
+            navigator.isNavigationQuiescentForTesting,
             pageTurnSurfaces(in: navigator).isEmpty,
             !didObservePageTurnTransaction || didStopPageTurnSamplerAtTerminal
         else {
-            fail(action, generation: generation, reason: "page-turn-not-settled")
+            fail(
+                action,
+                generation: generation,
+                reason: "page-turn-not-settled:\(navigator.navigationQuiescenceDiagnosticsForTesting)"
+            )
             return
         }
         let visibleMarker = await snapshotProbeState(in: navigator)?.visibleMarker
@@ -1554,12 +1559,12 @@ enum ReaderTestAction: String {
     ) {
         guard
             let pagination = navigator.view.subviews
-                .compactMap({ $0 as? PaginationView })
-                .last,
+            .compactMap({ $0 as? PaginationView })
+            .last,
             pagination.axis == .horizontalPaged,
             let paginationScrollView = pagination.subviews
-                .compactMap({ $0 as? UIScrollView })
-                .first
+            .compactMap({ $0 as? UIScrollView })
+            .first
         else {
             return
         }
@@ -1599,7 +1604,8 @@ enum ReaderTestAction: String {
     ) -> Bool {
         guard !surfaces.isEmpty else {
             if pageTurnEvidenceStyle == .none,
-               locationRevision > pageTurnEvidenceLocationRevision {
+               locationRevision > pageTurnEvidenceLocationRevision
+            {
                 didObserveStyleGeometry = true
             }
             return false
@@ -1734,7 +1740,8 @@ enum ReaderTestAction: String {
             }
             if current.hasPresentationLayer,
                target.hasPresentationLayer,
-               let previous = lastPairedTranslations {
+               let previous = lastPairedTranslations
+            {
                 let currentDelta = currentX - previous.current
                 let targetDelta = targetX - previous.target
                 if abs(currentDelta) > 0.25 || abs(targetDelta) > 0.25 {
@@ -2394,8 +2401,8 @@ enum ReaderTestAction: String {
             !enablesContinuousScrollActions,
             pageTurnGestureObserver == nil,
             let gestureRecognizer = navigator.view.gestureRecognizers?
-                .compactMap({ $0 as? UIPanGestureRecognizer })
-                .first(where: { $0.delegate === navigator })
+            .compactMap({ $0 as? UIPanGestureRecognizer })
+            .first(where: { $0.delegate === navigator })
         else {
             return
         }
@@ -2406,7 +2413,8 @@ enum ReaderTestAction: String {
             guard let self else { return }
             if gestureRecognizer.state == .began {
                 if locationRevision > pageTurnEvidenceLocationRevision,
-                   navigator.isPageTurnIdleForTesting {
+                   navigator.isPageTurnIdleForTesting
+                {
                     resetPageTurnEvidence(style: pageTurnEvidenceStyle, in: navigator)
                 }
                 didObserveCustomPageTurnPanBegan = true
@@ -2668,7 +2676,7 @@ enum ReaderTestAction: String {
         while
             !Task.isCancelled,
             lifetime.pagination.value != nil
-                || lifetime.webViews.contains(where: { $0.value != nil })
+            || lifetime.webViews.contains(where: { $0.value != nil })
         {
             await Task.yield()
         }
@@ -2789,7 +2797,9 @@ private struct ReaderLiveSurfaceSnapshot: Equatable {
 private typealias SnapshotExpectation = (direction: EPUBSpreadView.Direction, color: String)
 
 private extension CGRect {
-    var area: CGFloat { width * height }
+    var area: CGFloat {
+        width * height
+    }
 
     func approximatelyEquals(_ other: CGRect, tolerance: CGFloat = 1) -> Bool {
         abs(minX - other.minX) <= tolerance
@@ -2905,37 +2915,37 @@ extension ReaderViewModel: EPUBNavigatorDelegate {
         guard enablesContinuousScrollActions else { return }
 
         let source = """
-            document.addEventListener('click', event => {
-                const target = event.target instanceof Element
-                    ? event.target.closest('#chapter-2-start')
-                    : null;
-                if (!target) return;
+        document.addEventListener('click', event => {
+            const target = event.target instanceof Element
+                ? event.target.closest('#chapter-2-start')
+                : null;
+            if (!target) return;
 
-                const range = document.createRange();
-                range.selectNodeContents(target);
-                const selection = window.getSelection();
-                selection.removeAllRanges();
-                selection.addRange(range);
+            const range = document.createRange();
+            range.selectNodeContents(target);
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
 
-                const rect = target.getBoundingClientRect();
-                window.webkit.messageHandlers.decorationActivated.postMessage({
-                    id: '\(Self.interactionDecorationID)',
-                    group: '\(Self.interactionDecorationGroup)',
-                    rect: {
-                        left: rect.left,
-                        top: rect.top,
-                        width: rect.width,
-                        height: rect.height
-                    },
-                    click: {
-                        x: event.clientX,
-                        y: event.clientY,
-                        targetElement: target.outerHTML,
-                        defaultPrevented: event.defaultPrevented
-                    }
-                });
+            const rect = target.getBoundingClientRect();
+            window.webkit.messageHandlers.decorationActivated.postMessage({
+                id: '\(Self.interactionDecorationID)',
+                group: '\(Self.interactionDecorationGroup)',
+                rect: {
+                    left: rect.left,
+                    top: rect.top,
+                    width: rect.width,
+                    height: rect.height
+                },
+                click: {
+                    x: event.clientX,
+                    y: event.clientY,
+                    targetElement: target.outerHTML,
+                    defaultPrevented: event.defaultPrevented
+                }
             });
-            """
+        });
+        """
         userContentController.addUserScript(WKUserScript(
             source: source,
             injectionTime: .atDocumentEnd,
@@ -2952,4 +2962,5 @@ extension ReaderViewModel: EPUBNavigatorDelegate {
         return !enablesContinuousScrollActions
     }
 }
+
 extension ReaderViewModel: PDFNavigatorDelegate {}

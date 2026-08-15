@@ -95,5 +95,4 @@ struct PublicationFixture: Equatable {
         description: "Cover probe with VoiceOver enabled.",
         accessibilityOverride: .voiceOver
     )
-
 }

@@ -106,7 +106,7 @@ final class PageTurnTests: XCTestCase {
         continuousReader.close(assertMemoryDeallocated: true)
     }
 
-    func testSnapshotProbe() throws {
+    func testSnapshotProbe() {
         for fixture in [PublicationFixture.pageTurnProbeLTR, .pageTurnProbeRTL] {
             let normalReader = app.open(fixture, waitUntilReady: true)
             normalReader.runAction(

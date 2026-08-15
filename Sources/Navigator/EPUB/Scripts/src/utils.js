@@ -198,7 +198,11 @@ export function getColumnCountPerScreen() {
 }
 
 export function isScrollModeEnabled() {
-  const style = document.documentElement.style;
+  const root = document.documentElement;
+  if (!root) {
+    return false;
+  }
+  const style = window.getComputedStyle(root);
   return style.getPropertyValue("--USER__view").trim() == "readium-scroll-on";
 }
 
@@ -265,6 +269,74 @@ export function scrollToLocator(locator, animated) {
   return scrollToRange(range, animated);
 }
 
+// Returns whether the current scroll is at the same document offset
+// `scrollToRect` would use for this locator. Intersection is not enough:
+// a multi-column fragment can be visible on a later page while the start
+// page is the real target.
+export function locatorIsVisible(locator) {
+  const target = locatorScrollTarget(locator);
+  if (!target) {
+    return false;
+  }
+  return (
+    Math.abs(window.scrollX - target.x) < 1 &&
+    Math.abs(window.scrollY - target.y) < 1
+  );
+}
+
+export function locatorScrollTarget(locator) {
+  const range = rangeFromLocator(locator);
+  if (!range) {
+    return null;
+  }
+  const rect = range.getBoundingClientRect();
+  if (!rect || !Number.isFinite(rect.left) || !Number.isFinite(rect.top)) {
+    return null;
+  }
+  return documentScrollTargetForRect(rect);
+}
+
+function maxScrollX() {
+  const root = document.scrollingElement;
+  return Math.max((root?.scrollWidth || 0) - window.innerWidth, 0);
+}
+
+function maxScrollY() {
+  const root = document.scrollingElement;
+  return Math.max((root?.scrollHeight || 0) - window.innerHeight, 0);
+}
+
+function clampScrollX(offset) {
+  const maxAbs = maxScrollX();
+  if (isRTL()) {
+    return Math.min(Math.max(offset, -maxAbs), 0);
+  }
+  return Math.min(Math.max(offset, 0), maxAbs);
+}
+
+function clampScrollY(offset) {
+  return Math.min(Math.max(offset, 0), maxScrollY());
+}
+
+// Shared by mutation (`scrollToRect`) and verification (`locatorScrollTarget`):
+// horizontal scroll → Y; vertical-writing scroll → unsnapped X; paginated → snapped X.
+function documentScrollTargetForRect(rect) {
+  if (isScrollModeEnabled() && !isVerticalWritingMode()) {
+    return {
+      x: window.scrollX,
+      y: clampScrollY(rect.top + window.scrollY),
+    };
+  }
+  let left = rect.left + window.scrollX;
+  if (!isScrollModeEnabled()) {
+    left = snapOffset(left);
+  }
+  return {
+    x: clampScrollX(left),
+    y: window.scrollY,
+  };
+}
+
 /// Resolves a Locator to a finite, non-negative resource-local document Y.
 export function resolveVerticalOffset(locator) {
   const locations = locator.locations || {};
@@ -302,12 +374,12 @@ function scrollToRange(range, animated) {
 }
 
 function scrollToRect(rect, animated) {
-  if (isScrollModeEnabled()) {
-    scrollTo({ top: rect.top + window.scrollY, animated });
+  const target = documentScrollTargetForRect(rect);
+  if (isScrollModeEnabled() && !isVerticalWritingMode()) {
+    scrollTo({ top: target.y, animated });
   } else {
-    scrollTo({ left: snapOffset(rect.left + window.scrollX), animated });
+    scrollTo({ left: target.x, animated });
   }
-
   return true;
 }
 

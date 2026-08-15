@@ -8,6 +8,11 @@ import Foundation
 import QuartzCore
 import UIKit
 
+@MainActor
+protocol EPUBPageTurnSurfaceSnapshotProviding: AnyObject {
+    func pageTurnSurfaceSnapshot(afterScreenUpdates: Bool) -> UIView?
+}
+
 public enum EPUBPageTurnStyle: Sendable, Equatable {
     case simulation
     case cover
@@ -182,6 +187,26 @@ final class EPUBPageTurnSurfaceAnimator {
     /// sensitive because the user is already mid-gesture.
     private var prepareShield: UIView?
 
+    private static func snapshotView(of view: UIView) -> UIView? {
+        // UIKit can wait indefinitely for a RenderServer commit when asked to
+        // update an off-window hierarchy. There is no committed screen content
+        // to refresh in that state, so capture the hierarchy as-is instead.
+        let afterScreenUpdates = view.window != nil
+        if let provider = view as? EPUBPageTurnSurfaceSnapshotProviding {
+            return provider.pageTurnSurfaceSnapshot(
+                afterScreenUpdates: afterScreenUpdates
+            )
+        }
+        if afterScreenUpdates {
+            return view.snapshotView(afterScreenUpdates: true)
+        }
+        if let snapshot = view.snapshotView(afterScreenUpdates: false) {
+            return snapshot
+        }
+        guard let image = EPUBPageCurlController.rasterize(view) else { return nil }
+        return UIImageView(image: image)
+    }
+
     convenience init?(
         rootView: UIView,
         documentView: UIView? = nil,
@@ -208,7 +233,7 @@ final class EPUBPageTurnSurfaceAnimator {
         guard
             let rootView = rootViewProvider(),
             let parentView = rootView.superview,
-            let currentView = rootView.snapshotView(afterScreenUpdates: true)
+            let currentView = Self.snapshotView(of: rootView)
         else {
             return nil
         }
@@ -247,6 +272,11 @@ final class EPUBPageTurnSurfaceAnimator {
         self.pageCurlController = pageCurlController
         configure(currentView, role: "current", frame: rootView.frame)
         parentView.insertSubview(currentView, aboveSubview: rootView)
+        if let pageCurlController {
+            let renderView = pageCurlController.view
+            configureCurlView(renderView, frame: rootView.frame)
+            parentView.insertSubview(renderView, aboveSubview: currentView)
+        }
         // Install before any prepare navigation / afterScreenUpdates capture.
         installPrepareShield(over: rootView, in: parentView)
     }
@@ -296,7 +326,7 @@ final class EPUBPageTurnSurfaceAnimator {
             targetView == nil,
             let parentView = rootView.superview,
             currentView.superview === parentView,
-            let targetView = rootView.snapshotView(afterScreenUpdates: true),
+            let targetView = Self.snapshotView(of: rootView),
             style != .simulation || curlImage != nil
         else {
             return false
@@ -318,13 +348,10 @@ final class EPUBPageTurnSurfaceAnimator {
         {
             pageCurlController.setTargetImage(image)
             let renderView = pageCurlController.view
-            renderView.frame = rootView.frame
-            renderView.autoresizingMask = []
-            renderView.isAccessibilityElement = false
-            renderView.accessibilityElementsHidden = true
-            renderView.accessibilityIdentifier = "readium.page-turn.curl"
-            renderView.isUserInteractionEnabled = false
-            parentView.insertSubview(renderView, aboveSubview: currentView)
+            configureCurlView(renderView, frame: rootView.frame)
+            if renderView.superview !== parentView {
+                parentView.insertSubview(renderView, aboveSubview: currentView)
+            }
         }
         // Position first so cover-backward target is off-screen before it rises.
         syncPrepareShieldFrame(to: rootView)
@@ -350,7 +377,7 @@ final class EPUBPageTurnSurfaceAnimator {
             let rootView = rootViewProvider(),
             let documentView,
             let parentView = rootView.superview,
-            let replacement = rootView.snapshotView(afterScreenUpdates: true)
+            let replacement = Self.snapshotView(of: rootView)
         else {
             return false
         }
@@ -384,7 +411,7 @@ final class EPUBPageTurnSurfaceAnimator {
             let rootView = rootViewProvider(),
             let documentView,
             let parentView = rootView.superview,
-            let replacement = rootView.snapshotView(afterScreenUpdates: true)
+            let replacement = Self.snapshotView(of: rootView)
         else {
             return false
         }
@@ -415,7 +442,17 @@ final class EPUBPageTurnSurfaceAnimator {
     func render(progress: CGFloat) {
         let progress = min(max(progress, 0), 1)
         self.progress = progress
-        guard let rootView = rootViewProvider(), let targetView else { return }
+        guard let rootView = rootViewProvider() else { return }
+        if style == .simulation {
+            // The current-page curl is mounted as soon as prepare starts, so a
+            // cold target can track the gesture while WebKit loads. Capturing
+            // the target later replaces only the texture, not the live surface.
+            pageCurlController?.render(progress: progress)
+            currentView.transform = .identity
+            targetView?.transform = .identity
+            return
+        }
+        guard let targetView else { return }
         let width = rootView.bounds.width
         let sign: CGFloat = physicalCompletionDirection == .left ? -1 : 1
         switch style {
@@ -445,9 +482,7 @@ final class EPUBPageTurnSurfaceAnimator {
                 )
             }
         case .simulation:
-            pageCurlController?.render(progress: progress)
-            currentView.transform = .identity
-            targetView.transform = .identity
+            assertionFailure("simulation rendering returns before this switch")
         case .none:
             currentView.transform = .identity
             targetView.transform = .identity
@@ -619,6 +654,15 @@ final class EPUBPageTurnSurfaceAnimator {
         view.isAccessibilityElement = false
         view.accessibilityElementsHidden = true
         view.accessibilityIdentifier = "readium.page-turn.surface.\(role)"
+        view.isUserInteractionEnabled = false
+    }
+
+    private func configureCurlView(_ view: UIView, frame: CGRect) {
+        view.frame = frame
+        view.autoresizingMask = []
+        view.isAccessibilityElement = false
+        view.accessibilityElementsHidden = true
+        view.accessibilityIdentifier = "readium.page-turn.curl"
         view.isUserInteractionEnabled = false
     }
 
@@ -797,13 +841,11 @@ final class EPUBPageTurnController {
             return false
         }
 
-        let task = Task { @MainActor in
-            await operation()
-        }
         state = .committing(session)
-        let result = await task.value
+        let result = await operation()
         if case let .committing(activeSession) = state,
-           activeSession.id == session.id {
+           activeSession.id == session.id
+        {
             _ = finish(session)
         }
         return result
@@ -839,13 +881,28 @@ final class EPUBPageTurnController {
         }
         state = .restoring(session)
         for _ in 0 ..< 2 {
-            if await rebound(session) {
+            let restored = await rebound(session)
+            guard
+                !Task.isCancelled,
+                case let .restoring(activeSession) = state,
+                activeSession.id == session.id
+            else {
+                return false
+            }
+            if restored {
                 cleanup()
                 finish(session)
                 return true
             }
         }
         // The caller owns the terminal recovery while the surface stays visible.
+        guard
+            !Task.isCancelled,
+            case let .restoring(activeSession) = state,
+            activeSession.id == session.id
+        else {
+            return false
+        }
         state = .tracking(session, progress: 0)
         return false
     }
@@ -890,6 +947,7 @@ final class EPUBPageTurnController {
     }
 
     func settleRecovering(
+        refreshCurrentLocation shouldRefreshCurrentLocation: Bool = true,
         _ recovering: @escaping @MainActor (PageTurnSession) async -> Bool
     ) async {
         switch state {
@@ -905,7 +963,7 @@ final class EPUBPageTurnController {
             await waitUntilIdle()
         }
 
-        if isIdle {
+        if isIdle, shouldRefreshCurrentLocation {
             await refreshCurrentLocation()
         }
     }

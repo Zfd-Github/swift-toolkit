@@ -4,8 +4,8 @@
 //  available in the top-level LICENSE file of the project.
 //
 
-@testable import ReadiumNavigator
 import CoreImage
+@testable import ReadiumNavigator
 import ReadiumShared
 import Testing
 import UIKit
@@ -179,6 +179,94 @@ struct EPUBPageTurnControllerTests {
         #expect(currentPaginationView(in: navigator) !== originalPagination)
     }
 
+    @Test("public settle is bounded when snapshot restoration ignores cancellation")
+    func settlePageTurnDeadlineDoesNotWaitForeverForSnapshotRestore() async throws {
+        let navigator = try await makeMountedNavigator(
+            layout: .reflowable,
+            pageTurnStyle: .push
+        )
+        let pagination = try #require(currentPaginationView(in: navigator))
+        let spread = try #require(pagination.currentView as? EPUBSpreadView)
+        let target = EPUBPageTurnSnapshotTargetIdentity(
+            pagination: pagination,
+            spread: spread,
+            resourceIndex: 0,
+            pageIndex: 0
+        )
+        let restoreGate = Gate()
+        var didEnterRestore = false
+        let capture = Task {
+            try await navigator.snapshotProvider.capture(
+                target: target,
+                sourceIdentity: { target },
+                isBlocked: { false },
+                capture: { UIImage() },
+                restore: {
+                    didEnterRestore = true
+                    await restoreGate.wait()
+                }
+            )
+        }
+        #expect(await waitUntil { didEnterRestore })
+        navigator.setNavigationOperationTimeoutForTesting(.milliseconds(20))
+        var didSettle = false
+        let settle = Task { @MainActor in
+            await navigator.settlePageTurn()
+            didSettle = true
+        }
+
+        #expect(await waitUntil { didSettle })
+        #expect(!navigator.snapshotProvider.isIdle)
+
+        restoreGate.open()
+        _ = try await capture.value
+        await settle.value
+    }
+
+    @Test("relative navigation waits for snapshot restoration before mutating")
+    func relativeNavigationDoesNotRaceSnapshotRestore() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(pageTurnStyle: .none)
+        let pagination = try #require(currentPaginationView(in: navigator))
+        let spread = try #require(pagination.currentView as? EPUBSpreadView)
+        let target = EPUBPageTurnSnapshotTargetIdentity(
+            pagination: pagination,
+            spread: spread,
+            resourceIndex: 0,
+            pageIndex: 0
+        )
+        let captureGate = Gate()
+        var captureStarted = false
+        let capture = Task {
+            try await navigator.snapshotProvider.capture(
+                target: target,
+                sourceIdentity: { target },
+                isBlocked: { false },
+                capture: {
+                    captureStarted = true
+                    await captureGate.wait()
+                    return UIImage()
+                },
+                restore: {}
+            )
+        }
+        #expect(await waitUntil { captureStarted })
+
+        var navigationCount = 0
+        navigator.pageTurnNavigationForTesting = { _, _ in
+            navigationCount += 1
+            return true
+        }
+        navigator.pageTurnDisplayFrameWaiterForTesting = {}
+        navigator.setNavigationOperationTimeoutForTesting(.milliseconds(20))
+
+        let result = await navigator.goForward(options: .none)
+
+        #expect(!result)
+        #expect(navigationCount == 0)
+        captureGate.open()
+        _ = try await capture.value
+    }
+
     @Test("reduce motion or VoiceOver resolves every user style to none")
     func accessibilityStyle() {
         let styles: [EPUBPageTurnStyle] = [.simulation, .cover, .push, .none]
@@ -280,6 +368,30 @@ struct EPUBPageTurnControllerTests {
         )))
 
         #expect(leftBackside == rightCurrent)
+    }
+
+    @Test("simulation mounts a trackable curl before the target image is captured")
+    func simulationMountsCurlBeforeTargetCapture() throws {
+        let parent = UIView(frame: CGRect(x: 0, y: 0, width: 120, height: 180))
+        let root = UIView(frame: parent.bounds)
+        root.backgroundColor = .white
+        parent.addSubview(root)
+
+        let animator = try #require(EPUBPageTurnSurfaceAnimator(
+            rootView: root,
+            style: .simulation,
+            physicalCompletionDirection: .left,
+            isForward: true
+        ))
+        let curl = try #require(
+            parent.subviews.first {
+                $0.accessibilityIdentifier == "readium.page-turn.curl"
+            } as? EPUBPageCurlRenderView
+        )
+
+        #expect(!animator.hasTarget)
+        animator.render(progress: 0.4)
+        #expect(abs(curl.progress - 0.4) < 0.001)
     }
 
     @Test("simulation refreshes the mirrored backside after recapturing the current surface")
@@ -427,14 +539,21 @@ struct EPUBPageTurnControllerTests {
             pageTurnStyle: .simulation
         )
         let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let window = UIWindow(frame: container.bounds)
         let root = UIView(frame: container.bounds)
         navigator.view.frame = root.bounds
         root.addSubview(navigator.view)
         container.addSubview(root)
+        window.addSubview(container)
+        window.isHidden = false
         delegate.pageTurnRootView = root
         delegate.pageTurnSurfaceController = makePageTurnSurfaceController(
             root: root
         )
+        navigator.view.layoutIfNeeded()
+        await nextMainRunLoop()
+        await navigator.settlePageTurn()
+        #expect(await waitUntil { navigator.isNavigationQuiescentForTesting })
         delegate.resetLocationChanges()
         #expect(navigator.armColdForwardPageTurnTargetForTesting())
 
@@ -449,10 +568,11 @@ struct EPUBPageTurnControllerTests {
             velocityX: -700
         )
 
-        #expect(await waitUntil {
-            ((self.pageCurlViews(in: container).first as? EPUBPageCurlRenderView)?
+        let didMountCurl = await waitUntil {
+            ((pageCurlViews(in: container).first as? EPUBPageCurlRenderView)?
                 .progress ?? 0) > 0.22
-        })
+        }
+        #expect(didMountCurl)
         let renderView = try #require(
             pageCurlViews(in: container).first as? EPUBPageCurlRenderView
         )
@@ -676,7 +796,7 @@ struct EPUBPageTurnControllerTests {
         )
 
         #expect(await waitUntil {
-            self.currentPaginationView(in: navigator)?.currentIndex == 1
+            currentPaginationView(in: navigator)?.currentIndex == 1
         })
         await navigator.settlePageTurn()
         #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-2.xhtml"))
@@ -788,7 +908,7 @@ struct EPUBPageTurnControllerTests {
         )
 
         #expect(await waitUntil {
-            self.currentPaginationView(in: navigator)?.currentIndex == 1
+            currentPaginationView(in: navigator)?.currentIndex == 1
         })
         await navigator.settlePageTurn()
 
@@ -823,7 +943,7 @@ struct EPUBPageTurnControllerTests {
         navigator.pageTurnWillValidateCommitForTesting = {
             commitValidationCount += 1
             #expect(delegate.locationChangeCount == 0)
-            #expect(self.currentPaginationView(in: navigator)?.currentIndex == 2)
+            #expect(currentPaginationView(in: navigator)?.currentIndex == 2)
         }
 
         navigator.handlePageTurnPanForTesting(
@@ -979,6 +1099,100 @@ struct EPUBPageTurnControllerTests {
         #expect(navigator.isPageTurnIdleForTesting)
     }
 
+    @Test("hard abort prevents failed surface recovery from resurrecting its old session")
+    func hardAbortRetiresFailedSurfaceRecovery() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .cover)
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = SnapshotObservingView(frame: container.bounds)
+        navigator.view.frame = root.bounds
+        root.addSubview(navigator.view)
+        container.addSubview(root)
+        delegate.pageTurnRootView = root
+
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: -700
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .changed,
+            translationX: -100,
+            velocityX: -700
+        )
+        #expect(await waitUntil { pageTurnSurfaces(in: container).count == 2 })
+
+        let restoreGate = Gate()
+        var isRestoring = false
+        navigator.pageTurnPreparedPageRestoreForTesting = {
+            isRestoring = true
+            await restoreGate.wait()
+            return false
+        }
+        navigator.pageTurnStyle = .none
+        #expect(await waitUntil { isRestoring })
+
+        navigator.abortPageTurnInterruptedBySelectionForTesting(snap: false)
+        var didOpenNewSession = false
+        let newSession = Task { @MainActor in
+            didOpenNewSession = await navigator.beginPageTurnForTesting(to: .right)
+            return didOpenNewSession
+        }
+        await Task.yield()
+        #expect(!didOpenNewSession)
+
+        restoreGate.open()
+        #expect(await newSession.value)
+        #expect(!navigator.isPageTurnControllerIdleForTesting)
+
+        navigator.abortPageTurnInterruptedBySelectionForTesting(snap: false)
+        #expect(navigator.isPageTurnIdleForTesting)
+    }
+
+    @Test("hard abort cancels the active detached page-turn recovery")
+    func hardAbortCancelsActiveDetachedRecovery() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .cover)
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = SnapshotObservingView(frame: container.bounds)
+        navigator.view.frame = root.bounds
+        root.addSubview(navigator.view)
+        container.addSubview(root)
+        delegate.pageTurnRootView = root
+
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: -700
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .changed,
+            translationX: -100,
+            velocityX: -700
+        )
+        #expect(await waitUntil { pageTurnSurfaces(in: container).count == 2 })
+
+        var recoveryStarted = false
+        var recoveryObservedCancellation = false
+        var allowRecoveryExit = false
+        navigator.pageTurnPreparedPageRestoreForTesting = {
+            recoveryStarted = true
+            while !Task.isCancelled, !allowRecoveryExit {
+                try? await Task.sleep(nanoseconds: 1_000_000)
+            }
+            recoveryObservedCancellation = Task.isCancelled
+            return false
+        }
+        navigator.pageTurnStyle = .none
+        #expect(await waitUntil { recoveryStarted })
+
+        navigator.abortPageTurnInterruptedBySelectionForTesting(snap: false)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        #expect(recoveryObservedCancellation)
+        allowRecoveryExit = true
+        await navigator.settlePageTurn()
+        #expect(navigator.isPageTurnIdleForTesting)
+    }
+
     @Test("external cancellation clears a queued none gesture before the next pan")
     func noneCancellationDoesNotLeaveQueuedGesture() async throws {
         let navigator = try await makeMountedNavigator(pageTurnStyle: .none)
@@ -1020,6 +1234,53 @@ struct EPUBPageTurnControllerTests {
 
         #expect(navigationCount == 1)
         #expect(navigator.isPageTurnIdleForTesting)
+    }
+
+    @Test("an expired begin drain cannot open a late page-turn session")
+    func expiredBeginDrainCannotOpenLateSession() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(pageTurnStyle: .none)
+        let original = try #require(navigator.currentLocation)
+        let restoreGate = Gate()
+        var isRestoring = false
+        navigator.pageTurnOriginalLocationRestoreForTesting = {
+            isRestoring = true
+            await restoreGate.wait()
+            return true
+        }
+        navigator.queueHardAbortRestoreForTesting(original)
+        #expect(await waitUntil { isRestoring })
+        let operation = NavigationOperation(
+            operationID: 901,
+            intent: .relative(.forward),
+            timeout: .seconds(1)
+        )
+        let begin = Task { @MainActor in
+            await navigator.beginPageTurnForTesting(
+                to: .right,
+                operation: operation
+            )
+        }
+        await Task.yield()
+
+        operation.cancel()
+        let result = await begin.value
+
+        #expect(result.isCancelled)
+        #expect(navigator.isPageTurnControllerIdleForTesting)
+        restoreGate.open()
+        await navigator.awaitPendingHardAbortLocationRestoreForTesting()
+    }
+
+    @Test("hard-abort snapping runs inside the restore executor lease")
+    func hardAbortSnapRunsInsideExecutorLease() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(pageTurnStyle: .none)
+        let original = try #require(navigator.currentLocation)
+        navigator.pageTurnOriginalLocationRestoreForTesting = { true }
+
+        navigator.queueHardAbortRestoreForTesting(original)
+        await navigator.awaitPendingHardAbortLocationRestoreForTesting()
+
+        #expect(navigator.pageTurnHardAbortSnapHadExecutorLeaseForTesting == true)
     }
 
     @Test("a queued accessibility cancel bypasses stalled preparation")
@@ -1195,6 +1456,290 @@ struct EPUBPageTurnControllerTests {
         spreadView.allowsNativeHorizontalPaging = false
         spreadView.scrollView.panGestureRecognizer.isEnabled = true
         #expect(!spreadView.scrollView.panGestureRecognizer.isEnabled)
+    }
+
+    @Test("stale scroll-end callback cannot release an animated locator waiter")
+    func staleScrollEndDoesNotReleaseAnimatedLocator() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        let paginationView = try #require(currentPaginationView(in: navigator))
+        let spreadView = try #require(
+            paginationView.currentView as? EPUBReflowableSpreadView
+        )
+        navigator.view.layoutIfNeeded()
+        let target = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(progression: 0.8)
+        )
+        let operation = NavigationOperation(
+            operationID: 900,
+            intent: .absolute("animated-locator"),
+            timeout: .seconds(1)
+        )
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        let navigation = Task { @MainActor in
+            await spreadView.go(
+                to: .locator(target),
+                animated: true,
+                waitForLoad: true,
+                operation: operation
+            )
+        }
+        await Task.yield()
+        // A delayed callback from a previous scroll has no request identity
+        // and must not release this operation's executor lease.
+        spreadView.scrollViewDidEndScrollingAnimation(spreadView.scrollView)
+        let result = await navigation.value
+        let elapsed = DispatchTime.now().uptimeNanoseconds - startedAt
+        #expect(result.result.isTimedOut)
+        #expect(elapsed >= 900_000_000)
+        #expect(spreadView.isPoisoned)
+    }
+
+    @Test("animated locator settlement requires request movement or final target geometry")
+    func animatedLocatorSettlementIsRequestBound() {
+        var settlement = EPUBReflowableSpreadView.ScrollAnimationSettlement(
+            initialOffset: .zero,
+            submittedAt: 0
+        )
+
+        let initialQuiet = settlement.observe(
+            offset: .zero,
+            at: 300_000_000,
+            targetReached: false
+        )
+        let staleQuiet = settlement.observe(
+            offset: .zero,
+            at: 900_000_000,
+            targetReached: false
+        )
+        let moving = settlement.observe(
+            offset: CGPoint(x: 120, y: 0),
+            at: 1_000_000_000,
+            targetReached: true
+        )
+        let almostQuiet = settlement.observe(
+            offset: CGPoint(x: 120, y: 0),
+            at: 1_299_000_000,
+            targetReached: true
+        )
+        let settled = settlement.observe(
+            offset: CGPoint(x: 120, y: 0),
+            at: 1_300_000_000,
+            targetReached: true
+        )
+        #expect(!initialQuiet)
+        #expect(!staleQuiet)
+        #expect(!moving)
+        #expect(!almostQuiet)
+        #expect(settled)
+
+        var alreadyAtTarget = EPUBReflowableSpreadView.ScrollAnimationSettlement(
+            initialOffset: CGPoint(x: 120, y: 0),
+            submittedAt: 0
+        )
+        let noOpSettled = alreadyAtTarget.observe(
+            offset: CGPoint(x: 120, y: 0),
+            at: 1,
+            targetReached: true
+        )
+        #expect(noOpSettled)
+    }
+
+    @Test("adjacent page-boundary locator is not already visible so animation waits")
+    func adjacentPageBoundaryLocatorDoesNotCompleteAnimationEarly() {
+        let pageWidth: CGFloat = 390
+        let nextPageStart = EPUBReflowableSpreadView.locatorTargetOffsetX(
+            rectLeft: 390,
+            scrollX: 0,
+            pageWidth: pageWidth
+        )
+        let previousPageStart = EPUBReflowableSpreadView.locatorTargetOffsetX(
+            rectLeft: -390,
+            scrollX: 390,
+            pageWidth: pageWidth
+        )
+        let onCurrentPage = EPUBReflowableSpreadView.locatorTargetOffsetX(
+            rectLeft: 10,
+            scrollX: 0,
+            pageWidth: pageWidth
+        )
+        #expect(
+            !EPUBReflowableSpreadView.locatorIsAtScrollTarget(
+                currentOffset: 0,
+                targetOffset: nextPageStart
+            )
+        )
+        #expect(
+            !EPUBReflowableSpreadView.locatorIsAtScrollTarget(
+                currentOffset: 390,
+                targetOffset: previousPageStart
+            )
+        )
+        #expect(
+            EPUBReflowableSpreadView.locatorIsAtScrollTarget(
+                currentOffset: 0,
+                targetOffset: onCurrentPage
+            )
+        )
+
+        var settlement = EPUBReflowableSpreadView.ScrollAnimationSettlement(
+            initialOffset: .zero,
+            submittedAt: 0
+        )
+        let premature = settlement.observe(
+            offset: .zero,
+            at: 1,
+            targetReached: EPUBReflowableSpreadView.locatorIsAtScrollTarget(
+                currentOffset: 0,
+                targetOffset: nextPageStart
+            )
+        )
+        #expect(!premature)
+
+        let moving = settlement.observe(
+            offset: CGPoint(x: 200, y: 0),
+            at: 100_000_000,
+            targetReached: false
+        )
+        #expect(!moving)
+
+        let arrived = settlement.observe(
+            offset: CGPoint(x: 390, y: 0),
+            at: 200_000_000,
+            targetReached: true
+        )
+        #expect(!arrived)
+
+        let settled = settlement.observe(
+            offset: CGPoint(x: 390, y: 0),
+            at: 500_000_000,
+            targetReached: true
+        )
+        #expect(settled)
+    }
+
+    @Test("spanning-column and zero-size locators compare snapped start offset")
+    func spanningColumnAndZeroSizeLocatorsCompareStartOffset() {
+        let pageWidth: CGFloat = 390
+        let scrollX: CGFloat = 390
+        let spanningTail = EPUBReflowableSpreadView.locatorTargetOffsetX(
+            rectLeft: -400,
+            scrollX: scrollX,
+            pageWidth: pageWidth
+        )
+        #expect(abs(spanningTail - 0) < 0.001)
+        #expect(
+            !EPUBReflowableSpreadView.locatorIsAtScrollTarget(
+                currentOffset: scrollX,
+                targetOffset: spanningTail
+            )
+        )
+
+        let zeroSizeOnCurrentPage = EPUBReflowableSpreadView.locatorTargetOffsetX(
+            rectLeft: 0,
+            scrollX: scrollX,
+            pageWidth: pageWidth
+        )
+        #expect(
+            EPUBReflowableSpreadView.locatorIsAtScrollTarget(
+                currentOffset: scrollX,
+                targetOffset: zeroSizeOnCurrentPage
+            )
+        )
+
+        let zeroSizeOnNextPage = EPUBReflowableSpreadView.locatorTargetOffsetX(
+            rectLeft: 390,
+            scrollX: scrollX,
+            pageWidth: pageWidth
+        )
+        #expect(
+            !EPUBReflowableSpreadView.locatorIsAtScrollTarget(
+                currentOffset: scrollX,
+                targetOffset: zeroSizeOnNextPage
+            )
+        )
+    }
+
+    @Test("vertical-writing DOM locators use unsnapped X instead of Y")
+    func verticalWritingDOMLocatorsUseUnsnappedX() {
+        let pageWidth: CGFloat = 390
+        let contentWidth: CGFloat = 3900
+        let targetX = EPUBReflowableSpreadView.locatorTargetOffsetX(
+            rectLeft: -2145,
+            scrollX: 0,
+            pageWidth: pageWidth,
+            contentWidth: contentWidth,
+            isRTL: true,
+            snapsToPage: false
+        )
+        #expect(abs(targetX - -2145) < 0.001)
+        #expect(
+            !EPUBReflowableSpreadView.locatorIsAtScrollTarget(
+                currentOffset: 0,
+                targetOffset: targetX
+            )
+        )
+
+        var settlement = EPUBReflowableSpreadView.ScrollAnimationSettlement(
+            initialOffset: .zero,
+            submittedAt: 0
+        )
+        let premature = settlement.observe(
+            offset: .zero,
+            at: 1,
+            targetReached: EPUBReflowableSpreadView.locatorIsAtScrollTarget(
+                currentOffset: 0,
+                targetOffset: targetX
+            )
+        )
+        #expect(!premature)
+    }
+
+    @Test("locator target offsets clamp to the browser-reachable scroll range")
+    func locatorTargetOffsetsClampToReachableScrollRange() {
+        let pageWidth: CGFloat = 390
+        let contentWidth: CGFloat = 1000
+        let snappedPastEnd = EPUBReflowableSpreadView.locatorTargetOffsetX(
+            rectLeft: 780,
+            scrollX: 0,
+            pageWidth: pageWidth,
+            contentWidth: contentWidth
+        )
+        #expect(abs(snappedPastEnd - 610) < 0.001)
+
+        let zeroSizeAtDocumentEnd = EPUBReflowableSpreadView.locatorTargetOffsetX(
+            rectLeft: 1000,
+            scrollX: 0,
+            pageWidth: pageWidth,
+            contentWidth: contentWidth
+        )
+        #expect(abs(zeroSizeAtDocumentEnd - 610) < 0.001)
+        #expect(
+            EPUBReflowableSpreadView.locatorIsAtScrollTarget(
+                currentOffset: 610,
+                targetOffset: zeroSizeAtDocumentEnd
+            )
+        )
+
+        let rtlPastEnd = EPUBReflowableSpreadView.locatorTargetOffsetX(
+            rectLeft: -780,
+            scrollX: 0,
+            pageWidth: pageWidth,
+            contentWidth: contentWidth,
+            isRTL: true
+        )
+        #expect(abs(rtlPastEnd - -610) < 0.001)
+
+        let yPastEnd = EPUBReflowableSpreadView.clampScrollOffsetY(
+            2000,
+            pageHeight: 844,
+            contentHeight: 1200
+        )
+        #expect(abs(yPastEnd - 356) < 0.001)
     }
 
     @Test("fixed WebView navigation reapplies none pan policy without blocking zoomed content pan")
@@ -1415,7 +1960,7 @@ struct EPUBPageTurnControllerTests {
         navigator.submitPreferences(EPUBPreferences(scroll: true))
 
         #expect(await waitUntil {
-            guard let paginationView = self.currentPaginationView(in: navigator) else {
+            guard let paginationView = currentPaginationView(in: navigator) else {
                 return false
             }
             return paginationView.axis == .verticalContinuous
@@ -1426,12 +1971,16 @@ struct EPUBPageTurnControllerTests {
         #expect(rootPanRecognizers(in: navigator).isEmpty)
 
         let spreadView = try #require(replacement.currentView as? EPUBSpreadView)
-        navigator.spreadView(
+        try navigator.spreadView(
             spreadView,
-            didFailToLoadResourceAt: try #require(RelativeURL(path: "chapter.xhtml")),
+            didFailToLoadResourceAt: #require(RelativeURL(path: "chapter.xhtml")),
             withError: .decoding("Expected test rollback")
         )
 
+        #expect(await waitUntil {
+            currentPaginationView(in: navigator)?.axis == .horizontalPaged
+                && rootPanRecognizers(in: navigator).count == 1
+        })
         #expect(currentPaginationView(in: navigator)?.axis == .horizontalPaged)
         #expect(rootPanRecognizers(in: navigator).count == 1)
         navigator.handlePageTurnPanForTesting(state: .began, translationX: 0, velocityX: 700)
@@ -1504,8 +2053,38 @@ struct EPUBPageTurnControllerTests {
 
         #expect(await navigator.beginCoverPageTurnForTesting(to: .right))
         #expect(root.snapshotCount == 2)
+        #expect(root.afterScreenUpdatesValues == [false, false])
         #expect(protectedSnapshots == 2)
         await navigator.settlePageTurn()
+    }
+
+    @Test("surface snapshot strategy preserves window and empty-bounds boundaries")
+    func surfaceSnapshotStrategyBoundaries() {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let container = UIView(frame: window.bounds)
+        let onWindowRoot = SnapshotObservingView(frame: container.bounds)
+        onWindowRoot.shouldFailSnapshots = true
+        container.addSubview(onWindowRoot)
+        window.addSubview(container)
+
+        #expect(onWindowRoot.window === window)
+        #expect(EPUBPageTurnSurfaceAnimator(
+            rootView: onWindowRoot,
+            style: .cover,
+            physicalCompletionDirection: .left,
+            isForward: true
+        ) == nil)
+        #expect(onWindowRoot.afterScreenUpdatesValues == [true])
+
+        let offWindowContainer = UIView(frame: .zero)
+        let emptyRoot = UIView(frame: .zero)
+        offWindowContainer.addSubview(emptyRoot)
+        #expect(EPUBPageTurnSurfaceAnimator(
+            rootView: emptyRoot,
+            style: .cover,
+            physicalCompletionDirection: .left,
+            isForward: true
+        ) == nil)
     }
 
     @Test("changing style restores and removes an active whole-reader transaction")
@@ -1542,7 +2121,7 @@ struct EPUBPageTurnControllerTests {
             pageTurnStyle: .cover
         )
         navigator?.view.frame = root.bounds
-        root.addSubview(try #require(navigator?.view))
+        try root.addSubview(#require(navigator?.view))
         let delegate = Delegate()
         delegate.pageTurnRootView = root
         navigator?.delegate = delegate
@@ -1558,11 +2137,10 @@ struct EPUBPageTurnControllerTests {
         #expect(navigator?.beginPreparingPageTurnForTesting(to: .right) == true)
         #expect(await waitUntil { navigationStarted.value })
         #expect(pageTurnSurfaces(in: container).count == 1)
-        weak let releasedNavigator = navigator
-
+        navigator?.cancelOwnedNavigationWorkForTesting()
+        navigator?.view.removeFromSuperview()
         navigator = nil
 
-        #expect(await waitUntil { releasedNavigator == nil })
         #expect(await waitUntil { cancellation.value })
         #expect(await waitUntil { pageTurnSurfaces(in: container).isEmpty })
         navigationGate.open()
@@ -1579,14 +2157,14 @@ struct EPUBPageTurnControllerTests {
         let delegate = try #require(loaded?.1)
         loaded = nil
         navigator?.view.frame = root.bounds
-        root.addSubview(try #require(navigator?.view))
+        try root.addSubview(#require(navigator?.view))
         delegate.pageTurnRootView = root
         let original = try #require(navigator?.currentLocation)
         let originalViewport = try #require(navigator?.viewport)
         let target = makeLocator(href: "chapter-2.xhtml", progression: 0)
         let targetViewport = NavigatorViewport(
             resources: [
-                .init(href: target.href, progression: 0 ... 0.25)
+                .init(href: target.href, progression: 0 ... 0.25),
             ],
             progression: 0.5 ... 0.75
         )
@@ -1613,13 +2191,10 @@ struct EPUBPageTurnControllerTests {
         #expect(await waitUntil { didNavigate && didReachDisplayFrame })
         #expect(pageTurnSurfaces(in: container).count == 1)
         weak let releasedNavigator = navigator
-
+        navigator?.cancelOwnedNavigationWorkForTesting()
+        navigator?.view.removeFromSuperview()
         navigator = nil
 
-        let releasedBeforeDisplayFrame = await waitUntil {
-            releasedNavigator == nil
-        }
-        #expect(releasedBeforeDisplayFrame)
         #expect(pageTurnSurfaces(in: container).isEmpty)
         displayFrameGate.open()
         #expect(await waitUntil { releasedNavigator == nil })
@@ -1720,7 +2295,7 @@ struct EPUBPageTurnControllerTests {
             let options = NavigatorGoOptions(
                 animated: true,
                 otherOptions: [
-                    "readium.epub.pageTurnDirection": .string("forward")
+                    "readium.epub.pageTurnDirection": .string("forward"),
                 ]
             )
 
@@ -1785,7 +2360,7 @@ struct EPUBPageTurnControllerTests {
         navigator.view.frame.origin.y = 1
         root.shouldFailSnapshots = true
 
-        #expect(!(await turn.value))
+        #expect(await !(turn.value))
         await navigator.settlePageTurn()
 
         #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-1.xhtml"))
@@ -2099,6 +2674,57 @@ struct EPUBPageTurnControllerTests {
         #expect(pageTurnSurfaces(in: container).isEmpty)
     }
 
+    @Test("successful surface cancellation recovery is not restored a second time")
+    func successfulSurfaceRecoveryPreservesStableVerification() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .push)
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = SnapshotObservingView(frame: container.bounds)
+        navigator.view.frame = root.bounds
+        root.addSubview(navigator.view)
+        container.addSubview(root)
+        delegate.pageTurnRootView = root
+        let original = try #require(navigator.currentLocation)
+        let originalViewport = try #require(navigator.viewport)
+        let target = makeLocator(href: "chapter-2.xhtml", progression: 0)
+        var previewCount = 0
+        navigator.pageTurnPreviewCalculationForTesting = {
+            previewCount += 1
+            return previewCount == 1
+                ? (original, originalViewport)
+                : (target, originalViewport)
+        }
+        navigator.pageTurnNavigationForTesting = { _, _ in true }
+        var surfaceRestoreCount = 0
+        navigator.pageTurnPreparedPageRestoreForTesting = {
+            surfaceRestoreCount += 1
+            return true
+        }
+        var locatorRestoreCount = 0
+        navigator.pageTurnOriginalLocationRestoreForTesting = {
+            locatorRestoreCount += 1
+            return true
+        }
+
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: -700
+        )
+        #expect(await waitUntil {
+            navigator.pageTurnSurfaceTransactionEvidenceForTesting.hasPreparedTarget
+        })
+        navigator.handlePageTurnPanForTesting(
+            state: .cancelled,
+            translationX: 0,
+            velocityX: 0
+        )
+        await navigator.settlePageTurn()
+
+        #expect(surfaceRestoreCount == 1)
+        #expect(locatorRestoreCount == 0)
+        #expect(navigator.isPageTurnIdleForTesting)
+    }
+
     @Test("none commit cancellation after navigation restores original without publish")
     func noneCommitCancellationRestoresOriginalWithoutPublish() async throws {
         let notificationCenter = NotificationCenter()
@@ -2230,6 +2856,8 @@ struct EPUBPageTurnControllerTests {
         var navigationCount = 0
         var locatorRestoreCount = 0
         var restoredLocator: Locator?
+        var restoreWasCancelled = false
+        let restoreGate = Gate()
         var inCommitWait = false
         var holdAfterCommitMove = true
         navigator.pageTurnNavigationForTesting = { _, _ in
@@ -2240,9 +2868,9 @@ struct EPUBPageTurnControllerTests {
         }
         navigator.pageTurnOriginalLocationRestoreForTesting = {
             locatorRestoreCount += 1
-            // Avoid nested live goToIndex during commit; only prove the
-            // fallback path is taken with the captured original locator.
             restoredLocator = original
+            restoreWasCancelled = Task.isCancelled
+            await restoreGate.wait()
             return true
         }
         navigator.pageTurnDisplayFrameWaiterForTesting = {
@@ -2273,6 +2901,11 @@ struct EPUBPageTurnControllerTests {
             object: nil
         )
         holdAfterCommitMove = false
+        #expect(await waitUntil { locatorRestoreCount >= 1 })
+        #expect(!restoreWasCancelled)
+        #expect(!navigator.isPageTurnIdleForTesting)
+
+        restoreGate.open()
         #expect(await waitUntil { navigator.isPageTurnIdleForTesting })
         await navigator.settlePageTurn()
 
@@ -2281,6 +2914,219 @@ struct EPUBPageTurnControllerTests {
         #expect(restoredLocator?.href == original.href)
         #expect(delegate.locationChangeCount == 0)
         #expect(navigator.isPageTurnIdleForTesting)
+    }
+
+    @Test("hard abort drains retired recovery before opening a new page-turn session")
+    func hardAbortDrainsRetiredRecoveryBeforeNewSession() async throws {
+        let notificationCenter = NotificationCenter()
+        let status = AccessibilityStatusBox()
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            notificationCenter: notificationCenter,
+            accessibilityStatus: status
+        )
+        let original = try #require(navigator.currentLocation)
+        let restoreGate = Gate()
+        var navigationCount = 0
+        var didEnterRestore = false
+        var inCommitWait = false
+        var holdAfterCommitMove = true
+        navigator.pageTurnNavigationForTesting = { _, _ in
+            navigationCount += 1
+            return navigationCount == 1
+        }
+        navigator.pageTurnOriginalLocationRestoreForTesting = {
+            didEnterRestore = true
+            await restoreGate.wait()
+            return true
+        }
+        navigator.pageTurnDisplayFrameWaiterForTesting = {
+            if navigator.isPageTurnCommittingForTesting {
+                inCommitWait = true
+                while holdAfterCommitMove {
+                    try? await Task.sleep(nanoseconds: 5_000_000)
+                }
+            }
+        }
+
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: -700
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .ended,
+            translationX: -100,
+            velocityX: -700
+        )
+        #expect(await waitUntil { inCommitWait })
+
+        status.isReduceMotionEnabled = true
+        notificationCenter.post(
+            name: UIAccessibility.reduceMotionStatusDidChangeNotification,
+            object: nil
+        )
+        holdAfterCommitMove = false
+        #expect(await waitUntil { didEnterRestore })
+
+        navigator.abortPageTurnInterruptedBySelectionForTesting(snap: false)
+        var didAttemptNewSession = false
+        var didOpenNewSession = false
+        let newSession = Task { @MainActor in
+            didAttemptNewSession = true
+            didOpenNewSession = await navigator.beginPageTurnForTesting(to: .right)
+            return didOpenNewSession
+        }
+        #expect(await waitUntil { didAttemptNewSession })
+        await Task.yield()
+
+        // The old WebView recovery still owns navigation. A new session must
+        // not open until that recovery has really exited.
+        #expect(!didOpenNewSession)
+
+        restoreGate.open()
+        #expect(await newSession.value)
+        await Task.yield()
+        #expect(!navigator.isPageTurnControllerIdleForTesting)
+        #expect(navigator.currentLocation?.href == original.href)
+
+        navigator.abortPageTurnInterruptedBySelectionForTesting(snap: false)
+        #expect(navigator.isPageTurnIdleForTesting)
+    }
+
+    @Test("locator jump waits for hard-aborted recovery and restore to drain")
+    func locatorJumpWaitsForRetiredRecovery() async throws {
+        let notificationCenter = NotificationCenter()
+        let status = AccessibilityStatusBox()
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            notificationCenter: notificationCenter,
+            accessibilityStatus: status,
+            chapterCount: 3
+        )
+        let window = UIWindow(frame: navigator.view.bounds)
+        window.addSubview(navigator.view)
+        window.isHidden = false
+        defer { window.isHidden = true }
+        await nextMainRunLoop()
+        let restoreGate = Gate()
+        var navigationCount = 0
+        var didEnterRestore = false
+        var inCommitWait = false
+        var holdAfterCommitMove = true
+        navigator.pageTurnNavigationForTesting = { _, _ in
+            navigationCount += 1
+            return navigationCount == 1
+        }
+        navigator.pageTurnOriginalLocationRestoreForTesting = {
+            didEnterRestore = true
+            await restoreGate.wait()
+            return true
+        }
+        navigator.pageTurnDisplayFrameWaiterForTesting = {
+            if navigator.isPageTurnCommittingForTesting {
+                inCommitWait = true
+                while holdAfterCommitMove {
+                    try? await Task.sleep(nanoseconds: 5_000_000)
+                }
+            }
+        }
+
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: -700
+        )
+        navigator.handlePageTurnPanForTesting(
+            state: .ended,
+            translationX: -100,
+            velocityX: -700
+        )
+        #expect(await waitUntil { inCommitWait })
+
+        status.isReduceMotionEnabled = true
+        notificationCenter.post(
+            name: UIAccessibility.reduceMotionStatusDidChangeNotification,
+            object: nil
+        )
+        holdAfterCommitMove = false
+        #expect(await waitUntil { didEnterRestore })
+
+        navigator.abortPageTurnInterruptedBySelectionForTesting(snap: false)
+        let target = makeLocator(href: "chapter-3.xhtml", progression: 0)
+        var didStartJump = false
+        var didFinishJump = false
+        let jump = Task { @MainActor in
+            didStartJump = true
+            let result = await navigator.go(to: target, options: .none)
+            didFinishJump = true
+            return result
+        }
+        #expect(await waitUntil { didStartJump })
+        await nextMainRunLoop()
+
+        #expect(!didFinishJump)
+        #expect(currentPaginationView(in: navigator)?.currentIndex != 2)
+
+        restoreGate.open()
+        #expect(await jump.value)
+        #expect(currentPaginationView(in: navigator)?.currentIndex == 2)
+        await navigator.settlePageTurn()
+        #expect(navigator.isPageTurnIdleForTesting)
+    }
+
+    @Test("clearing an unloaded fixed spread fails its pending location waiter")
+    func fixedSpreadClearResumesPendingLocationWaiter() async throws {
+        let navigator = try await makeMountedNavigator(
+            layout: .fixed,
+            pageTurnStyle: .none
+        )
+        let paginationView = try #require(currentPaginationView(in: navigator))
+        let fixedSpread = try #require(paginationView.currentView as? EPUBFixedSpreadView)
+        fixedSpread.clear()
+
+        var didStartWaiting = false
+        let navigation = Task { @MainActor in
+            didStartWaiting = true
+            return await fixedSpread.go(
+                to: .start,
+                animated: false,
+                waitForLoad: true
+            )
+        }
+        #expect(await waitUntil { didStartWaiting })
+        await Task.yield()
+
+        fixedSpread.clear()
+
+        #expect(await !(navigation.value))
+    }
+
+    @Test("cancelling fixed spread navigation fails its pending location waiter")
+    func fixedSpreadCancellationResumesPendingLocationWaiter() async throws {
+        let navigator = try await makeMountedNavigator(
+            layout: .fixed,
+            pageTurnStyle: .none
+        )
+        let paginationView = try #require(currentPaginationView(in: navigator))
+        let fixedSpread = try #require(paginationView.currentView as? EPUBFixedSpreadView)
+        fixedSpread.clear()
+
+        var didStartWaiting = false
+        let navigation = Task { @MainActor in
+            didStartWaiting = true
+            return await fixedSpread.go(
+                to: .start,
+                animated: false,
+                waitForLoad: true
+            )
+        }
+        #expect(await waitUntil { didStartWaiting })
+        await Task.yield()
+
+        navigation.cancel()
+
+        #expect(await !(navigation.value))
     }
 
     @Test("none cancel false-positive reverse still falls back to original locator")
@@ -2386,6 +3232,10 @@ struct EPUBPageTurnControllerTests {
         navigator.view.frame = root.bounds
         root.addSubview(navigator.view)
         container.addSubview(root)
+        let window = UIWindow(frame: container.bounds)
+        window.addSubview(container)
+        window.isHidden = false
+        defer { window.isHidden = true }
         delegate.pageTurnRootView = root
         let paginationView = try #require(currentPaginationView(in: navigator))
         #expect(navigator.armColdForwardPageTurnTargetForTesting())
@@ -2842,6 +3692,163 @@ struct EPUBPageTurnControllerTests {
         #expect(abs(lastProgression - 0.9) < 0.000_001)
     }
 
+    @Test("progression 1.0 matches last-page leading after JS snap and max-scroll clamp")
+    func progressionOneMatchesLastPageAfterSnap() {
+        let pageWidth: CGFloat = 390
+        let pageCount: CGFloat = 10
+        let contentWidth = pageWidth * pageCount
+        let lastPageLeading = 0.9
+
+        let reachableLTR = EPUBReflowableSpreadView.reachableHorizontalProgression(
+            requested: 1,
+            pageWidth: pageWidth,
+            contentWidth: contentWidth
+        )
+        #expect(abs(reachableLTR - lastPageLeading) < 0.000_001)
+        #expect(
+            EPUBReflowableSpreadView.isAtHorizontalProgression(
+                live: lastPageLeading,
+                requested: 1,
+                pageWidth: pageWidth,
+                contentWidth: contentWidth
+            )
+        )
+        #expect(
+            !EPUBReflowableSpreadView.isAtHorizontalProgression(
+                live: 0.8,
+                requested: 1,
+                pageWidth: pageWidth,
+                contentWidth: contentWidth
+            )
+        )
+
+        let lastPageOffset = -(pageWidth * (pageCount - 1))
+        let liveRTL = EPUBReflowableSpreadView.leadingProgression(
+            contentOffsetX: lastPageOffset,
+            contentWidth: contentWidth
+        )
+        let reachableRTL = EPUBReflowableSpreadView.reachableHorizontalProgression(
+            requested: 1,
+            pageWidth: pageWidth,
+            contentWidth: contentWidth,
+            isRTL: true
+        )
+        #expect(abs(liveRTL - lastPageLeading) < 0.000_001)
+        #expect(abs(reachableRTL - lastPageLeading) < 0.000_001)
+        #expect(
+            EPUBReflowableSpreadView.isAtHorizontalProgression(
+                live: liveRTL,
+                requested: 1,
+                pageWidth: pageWidth,
+                contentWidth: contentWidth,
+                isRTL: true
+            )
+        )
+
+        var alreadyAtEnd = EPUBReflowableSpreadView.ScrollAnimationSettlement(
+            initialOffset: CGPoint(x: pageWidth * (pageCount - 1), y: 0),
+            submittedAt: 0
+        )
+        let noOpAtEnd = alreadyAtEnd.observe(
+            offset: CGPoint(x: pageWidth * (pageCount - 1), y: 0),
+            at: 1,
+            targetReached: EPUBReflowableSpreadView.isAtHorizontalProgression(
+                live: lastPageLeading,
+                requested: 1,
+                pageWidth: pageWidth,
+                contentWidth: contentWidth
+            )
+        )
+        #expect(noOpAtEnd)
+
+        var animatingToEnd = EPUBReflowableSpreadView.ScrollAnimationSettlement(
+            initialOffset: .zero,
+            submittedAt: 0
+        )
+        let notYetAtEnd = animatingToEnd.observe(
+            offset: .zero,
+            at: 1,
+            targetReached: EPUBReflowableSpreadView.isAtHorizontalProgression(
+                live: 0,
+                requested: 1,
+                pageWidth: pageWidth,
+                contentWidth: contentWidth
+            )
+        )
+        let arrivingAtEnd = animatingToEnd.observe(
+            offset: CGPoint(x: pageWidth * (pageCount - 1), y: 0),
+            at: 100_000_000,
+            targetReached: true
+        )
+        let settledAtEnd = animatingToEnd.observe(
+            offset: CGPoint(x: pageWidth * (pageCount - 1), y: 0),
+            at: 400_000_000,
+            targetReached: true
+        )
+        #expect(!notYetAtEnd)
+        #expect(!arrivingAtEnd)
+        #expect(settledAtEnd)
+    }
+
+    @Test("vertical-text scroll does not snap progression and uses pixel settlement")
+    func verticalTextScrollDoesNotSnapProgression() {
+        let pageWidth: CGFloat = 390
+        let contentWidth: CGFloat = 3900
+        let requested = 0.55
+        let snappedNeighbor = 0.5
+
+        let unsnapped = EPUBReflowableSpreadView.reachableHorizontalProgression(
+            requested: requested,
+            pageWidth: pageWidth,
+            contentWidth: contentWidth,
+            snapsToPage: false
+        )
+        #expect(abs(unsnapped - requested) < 0.000_001)
+        #expect(
+            !EPUBReflowableSpreadView.isAtHorizontalProgression(
+                live: snappedNeighbor,
+                requested: requested,
+                pageWidth: pageWidth,
+                contentWidth: contentWidth,
+                snapsToPage: false
+            )
+        )
+        #expect(
+            EPUBReflowableSpreadView.isAtHorizontalProgression(
+                live: requested,
+                requested: requested,
+                pageWidth: pageWidth,
+                contentWidth: contentWidth,
+                snapsToPage: false
+            )
+        )
+
+        let snapped = EPUBReflowableSpreadView.reachableHorizontalProgression(
+            requested: requested,
+            pageWidth: pageWidth,
+            contentWidth: contentWidth,
+            snapsToPage: true
+        )
+        #expect(abs(snapped - snappedNeighbor) < 0.000_001)
+
+        var prematureWait = EPUBReflowableSpreadView.ScrollAnimationSettlement(
+            initialOffset: CGPoint(x: -pageWidth * 5, y: 0),
+            submittedAt: 0
+        )
+        let premature = prematureWait.observe(
+            offset: CGPoint(x: -pageWidth * 5, y: 0),
+            at: 1,
+            targetReached: EPUBReflowableSpreadView.isAtHorizontalProgression(
+                live: snappedNeighbor,
+                requested: requested,
+                pageWidth: pageWidth,
+                contentWidth: contentWidth,
+                snapsToPage: false
+            )
+        )
+        #expect(!premature)
+    }
+
     @Test("same-resource mid progression restore rejects false-positive reverse")
     func sameResourceMidProgressionRestoreRejectsFalsePositiveReverse() async {
         // Models 10-page resource at ~50%: inverse "succeeds" but leaves the
@@ -2924,7 +3931,7 @@ struct EPUBPageTurnControllerTests {
         // False-positive reverse: same resource, neighboring column.
         setLiveColumn(progression: wrongProgression)
         #expect(abs(wrongProgression - originalProgression) > 0.05)
-        #expect(!(await navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(original)))
+        #expect(await !(navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(original)))
 
         let controller = EPUBPageTurnController(refreshCurrentLocation: {})
         var restoreCount = 0
@@ -2949,6 +3956,575 @@ struct EPUBPageTurnControllerTests {
                     - originalProgression
             ) < 0.001
         )
+    }
+
+    @Test("locator navigation verifies the live resource-local progression")
+    func locatorNavigationVerifiesLiveProgression() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        navigator.pageTurnDisplayFrameWaiterForTesting = {}
+        let target = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(progression: 0.5)
+        )
+        let operation = NavigationOperation(
+            operationID: 42,
+            intent: .absolute(target.href.string),
+            timeout: .seconds(1)
+        )
+
+        navigator.pageTurnMultiColumnGeometryForTesting = (
+            pageWidth: 390,
+            contentWidth: 3900,
+            progression: 0.7
+        )
+        #expect(await (navigator.verifyLocatorNavigationForTesting(
+            target,
+            operation: operation
+        )).isApplied == false)
+
+        navigator.pageTurnMultiColumnGeometryForTesting = (
+            pageWidth: 390,
+            contentWidth: 3900,
+            progression: 0.54
+        )
+        #expect(await (navigator.verifyLocatorNavigationForTesting(
+            target,
+            operation: operation
+        )).isApplied)
+    }
+
+    @Test("progression 1.0 verifies against the last page in a multi-page resource")
+    func progressionOneVerifiesAgainstLastPage() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        navigator.pageTurnDisplayFrameWaiterForTesting = {}
+        let target = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(progression: 1)
+        )
+        let operation = NavigationOperation(
+            operationID: 43,
+            intent: .absolute(target.href.string),
+            timeout: .seconds(1)
+        )
+
+        navigator.pageTurnMultiColumnGeometryForTesting = (
+            pageWidth: 390,
+            contentWidth: 3900,
+            progression: 0.9
+        )
+        #expect(await navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(target))
+        #expect(await (navigator.verifyLocatorNavigationForTesting(
+            target,
+            operation: operation
+        )).isApplied)
+
+        navigator.pageTurnMultiColumnGeometryForTesting = (
+            pageWidth: 390,
+            contentWidth: 3900,
+            progression: 0.8
+        )
+        #expect(await !(navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(target)))
+        #expect(await (navigator.verifyLocatorNavigationForTesting(
+            target,
+            operation: operation
+        )).isApplied == false)
+    }
+
+    @Test("unsnapped vertical-text progression 0.55 does not match neighboring page 0.50")
+    func unsnappedVerticalTextProgressionDoesNotMatchNeighborPage() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        navigator.pageTurnDisplayFrameWaiterForTesting = {}
+        navigator.pageTurnSnapsToPageForTesting = false
+        let target = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(progression: 0.55)
+        )
+        let operation = NavigationOperation(
+            operationID: 44,
+            intent: .absolute(target.href.string),
+            timeout: .seconds(1)
+        )
+
+        navigator.pageTurnMultiColumnGeometryForTesting = (
+            pageWidth: 390,
+            contentWidth: 3900,
+            progression: 0.5
+        )
+        #expect(await !(navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(target)))
+        #expect(await (navigator.verifyLocatorNavigationForTesting(
+            target,
+            operation: operation
+        )).isApplied == false)
+
+        navigator.pageTurnMultiColumnGeometryForTesting = (
+            pageWidth: 390,
+            contentWidth: 3900,
+            progression: 0.55
+        )
+        #expect(await navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(target))
+        #expect(await (navigator.verifyLocatorNavigationForTesting(
+            target,
+            operation: operation
+        )).isApplied)
+    }
+
+    @Test("cssSelector locators navigate via scrollToLocator even with progression")
+    func cssSelectorLocatorsPreferDOMNavigation() {
+        let href = AnyURL(string: "chapter-1.xhtml")!
+        let selectorOnly = Locator(
+            href: href,
+            mediaType: .xhtml,
+            locations: .init(otherLocations: ["cssSelector": .string("#target")])
+        )
+        let selectorAndProgression = Locator(
+            href: href,
+            mediaType: .xhtml,
+            locations: .init(
+                progression: 0,
+                otherLocations: ["cssSelector": .string("#target")]
+            )
+        )
+        #expect(
+            EPUBReflowableSpreadView.reflowableNavigationTarget(for: selectorOnly) == .locator
+        )
+        #expect(
+            EPUBReflowableSpreadView.reflowableNavigationTarget(for: selectorAndProgression)
+                == .locator
+        )
+        #expect(
+            EPUBReflowableSpreadView.reflowableNavigationTarget(
+                for: Locator(
+                    href: href,
+                    mediaType: .xhtml,
+                    locations: .init(),
+                    text: .init(highlight: "quoted")
+                )
+            ) == .locator
+        )
+        #expect(
+            EPUBReflowableSpreadView.reflowableNavigationTarget(
+                for: Locator(
+                    href: href,
+                    mediaType: .xhtml,
+                    locations: .init(fragments: ["target"], progression: 0.2)
+                )
+            ) == .fragment("target")
+        )
+        #expect(
+            EPUBReflowableSpreadView.reflowableNavigationTarget(
+                for: Locator(
+                    href: href,
+                    mediaType: .xhtml,
+                    locations: .init(progression: 0.4)
+                )
+            ) == .progression(0.4)
+        )
+        #expect(
+            EPUBReflowableSpreadView.reflowableNavigationTarget(
+                for: Locator(
+                    href: href,
+                    mediaType: .xhtml,
+                    locations: .init(position: 4)
+                )
+            ) == .unresolvedPosition
+        )
+    }
+
+    @Test("absolute navigation resolves position-only locators before goToIndex")
+    func absoluteNavigationResolvesPositionOnlyLocators() async throws {
+        let positionsPerResource = 10
+        let positions: [[Locator]] = [
+            (0 ..< positionsPerResource).map { index in
+                Locator(
+                    href: AnyURL(string: "chapter-1.xhtml")!,
+                    mediaType: .xhtml,
+                    locations: .init(
+                        progression: Double(index) / Double(positionsPerResource - 1),
+                        position: index + 1
+                    )
+                )
+            },
+        ]
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1,
+            positionsByReadingOrder: positions
+        )
+        let positionOnly = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(position: 6)
+        )
+        let resolved = navigator.resolveLocatorProgressionForTesting(positionOnly)
+        #expect(resolved?.locations.position == 6)
+        #expect(resolved?.locations.progression == 5.0 / 9.0)
+        #expect(
+            EPUBReflowableSpreadView.reflowableNavigationTarget(for: resolved!)
+                == .progression(5.0 / 9.0)
+        )
+    }
+
+    @Test("position resolution merges progression without replacing precise targets")
+    func positionResolutionPreservesCombinedLocatorTargets() async throws {
+        let href = AnyURL(string: "chapter-1.xhtml")!
+        let positions: [[Locator]] = [
+            [
+                Locator(
+                    href: href,
+                    mediaType: .xhtml,
+                    title: "Positions title",
+                    locations: .init(progression: 0.5, position: 6)
+                ),
+            ],
+        ]
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1,
+            positionsByReadingOrder: positions
+        )
+
+        let withFragment = Locator(
+            href: href,
+            mediaType: .xhtml,
+            title: "Caller title",
+            locations: .init(fragments: ["note-3"], position: 6),
+            text: .init(highlight: "quoted")
+        )
+        let resolvedFragment = navigator.resolveLocatorProgressionForTesting(withFragment)
+        #expect(resolvedFragment?.title == "Caller title")
+        #expect(resolvedFragment?.locations.fragments == ["note-3"])
+        #expect(resolvedFragment?.locations.position == 6)
+        #expect(resolvedFragment?.locations.progression == nil)
+        #expect(resolvedFragment?.text.highlight == "quoted")
+        #expect(
+            EPUBReflowableSpreadView.reflowableNavigationTarget(for: resolvedFragment!)
+                == .locator
+        )
+
+        let withSelector = Locator(
+            href: href,
+            mediaType: .xhtml,
+            locations: .init(
+                position: 6,
+                otherLocations: ["cssSelector": .string("#note-3")]
+            )
+        )
+        let resolvedSelector = navigator.resolveLocatorProgressionForTesting(withSelector)
+        #expect(resolvedSelector?.locations.cssSelector == "#note-3")
+        #expect(resolvedSelector?.locations.progression == nil)
+        #expect(
+            EPUBReflowableSpreadView.reflowableNavigationTarget(for: resolvedSelector!)
+                == .locator
+        )
+
+        let fragmentOnly = Locator(
+            href: href,
+            mediaType: .xhtml,
+            locations: .init(fragments: ["note-3"], position: 6)
+        )
+        let resolvedFragmentOnly = navigator.resolveLocatorProgressionForTesting(fragmentOnly)
+        #expect(resolvedFragmentOnly?.locations.fragments == ["note-3"])
+        #expect(resolvedFragmentOnly?.locations.progression == nil)
+        #expect(
+            EPUBReflowableSpreadView.reflowableNavigationTarget(for: resolvedFragmentOnly!)
+                == .fragment("note-3")
+        )
+    }
+
+    @Test("fragment IDs are encoded as JSON string literals for JavaScript")
+    func fragmentIDsAreJSONEncodedForJavaScript() {
+        #expect(EPUBReflowableSpreadView.javaScriptStringLiteral("heading") == "\"heading\"")
+        #expect(
+            EPUBReflowableSpreadView.javaScriptStringLiteral("it's\\id")
+                == "\"it's\\\\id\""
+        )
+        #expect(
+            EPUBReflowableSpreadView.javaScriptStringLiteral("line\nbreak")
+                == "\"line\\nbreak\""
+        )
+        #expect(
+            EPUBReflowableSpreadView.reflowableNavigationTarget(
+                for: Locator(
+                    href: AnyURL(string: "chapter-1.xhtml")!,
+                    mediaType: .xhtml,
+                    locations: .init(fragments: ["it's\\id"])
+                )
+            ) == .fragment("it's\\id")
+        )
+    }
+
+    @Test("position-only locator without positions data fails instead of scrolling to 0")
+    func positionOnlyLocatorWithoutPositionsFailsClosed() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        navigator.pageTurnDisplayFrameWaiterForTesting = {}
+        let positionOnly = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(position: 4)
+        )
+        #expect(navigator.resolveLocatorProgressionForTesting(positionOnly) == nil)
+        let operation = NavigationOperation(
+            operationID: 45,
+            intent: .absolute(positionOnly.href.string),
+            timeout: .seconds(1)
+        )
+        #expect(await (navigator.verifyLocatorNavigationForTesting(
+            positionOnly,
+            operation: operation
+        )).isApplied == false)
+
+        let didNavigate = await navigator.go(to: positionOnly, options: .init(animated: false))
+        #expect(!didNavigate)
+    }
+
+    @Test("DOM locators with position still navigate when positions data is missing")
+    func domLocatorsWithPositionDoNotRequirePositionsData() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        let href = AnyURL(string: "chapter-1.xhtml")!
+        let withFragment = Locator(
+            href: href,
+            mediaType: .xhtml,
+            locations: .init(fragments: ["note-3"], position: 6)
+        )
+        let withSelector = Locator(
+            href: href,
+            mediaType: .xhtml,
+            locations: .init(
+                position: 6,
+                otherLocations: ["cssSelector": .string("#note-3")]
+            )
+        )
+        let withText = Locator(
+            href: href,
+            mediaType: .xhtml,
+            locations: .init(position: 6),
+            text: .init(highlight: "quoted")
+        )
+        #expect(navigator.resolveLocatorProgressionForTesting(withFragment)?.locations.fragments == ["note-3"])
+        #expect(navigator.resolveLocatorProgressionForTesting(withSelector)?.locations.cssSelector == "#note-3")
+        #expect(navigator.resolveLocatorProgressionForTesting(withText)?.text.highlight == "quoted")
+        #expect(
+            EPUBReflowableSpreadView.reflowableNavigationTarget(for: withFragment)
+                == .fragment("note-3")
+        )
+        #expect(
+            EPUBReflowableSpreadView.reflowableNavigationTarget(for: withSelector) == .locator
+        )
+        #expect(
+            EPUBReflowableSpreadView.reflowableNavigationTarget(for: withText) == .locator
+        )
+    }
+
+    @Test("failed locator verification restores the stable location before releasing")
+    func failedLocatorVerificationRestoresStableLocation() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        navigator.pageTurnDisplayFrameWaiterForTesting = {}
+        navigator.pageTurnGoToIndexForTesting = { _ in .applied }
+        navigator.pageTurnMultiColumnGeometryForTesting = (
+            pageWidth: 390,
+            contentWidth: 3900,
+            progression: 0.2
+        )
+        var restored: Locator?
+        navigator.pageTurnRestoreGoForTesting = { locator in
+            restored = locator
+            return true
+        }
+        let stable = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(progression: 0.1)
+        )
+        let target = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(progression: 0.8)
+        )
+        let operation = NavigationOperation(
+            operationID: 46,
+            intent: .absolute(target.href.string),
+            timeout: .seconds(1)
+        )
+        let result = await navigator.performLocatorNavigationForTesting(
+            to: target,
+            operation: operation,
+            stableLocator: stable
+        )
+        #expect(result.isApplied == false)
+        #expect(restored?.locations.progression == 0.1)
+        #expect(delegate.jumpCount == 0)
+    }
+
+    @Test("successful locator verification sends didJumpTo once")
+    func successfulLocatorVerificationSendsDidJumpToOnce() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        navigator.pageTurnDisplayFrameWaiterForTesting = {}
+        navigator.pageTurnGoToIndexForTesting = { _ in .applied }
+        navigator.pageTurnMultiColumnGeometryForTesting = (
+            pageWidth: 390,
+            contentWidth: 3900,
+            progression: 0.8
+        )
+        let target = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(progression: 0.8)
+        )
+        let operation = NavigationOperation(
+            operationID: 47,
+            intent: .absolute(target.href.string),
+            timeout: .seconds(1)
+        )
+        let result = await navigator.performLocatorNavigationForTesting(
+            to: target,
+            operation: operation,
+            stableLocator: target
+        )
+        #expect(result.isApplied)
+        #expect(delegate.jumpCount == 1)
+        #expect(delegate.jumpedLocators.first?.locations.progression == 0.8)
+    }
+
+    @Test("goToIndex timeout after mutation still restores the stable locator")
+    func goToIndexTimeoutAfterMutationStillRestores() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        navigator.pageTurnDisplayFrameWaiterForTesting = {}
+        navigator.pageTurnGoToIndexForTesting = { _ in .timedOut }
+        navigator.pageTurnMultiColumnGeometryForTesting = (
+            pageWidth: 390,
+            contentWidth: 3900,
+            progression: 0.8
+        )
+        var restored: Locator?
+        navigator.pageTurnRestoreGoForTesting = { locator in
+            restored = locator
+            navigator.pageTurnMultiColumnGeometryForTesting = (
+                pageWidth: 390,
+                contentWidth: 3900,
+                progression: locator.locations.progression ?? 0
+            )
+            return true
+        }
+        let stable = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(progression: 0.1)
+        )
+        navigator.pageTurnLocationCalculationForTesting = {
+            (stable, nil)
+        }
+        let target = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(progression: 0.8)
+        )
+        let operation = NavigationOperation(
+            operationID: 48,
+            intent: .absolute(target.href.string),
+            timeout: .seconds(1)
+        )
+        let result = await navigator.performLocatorNavigationForTesting(
+            to: target,
+            operation: operation,
+            stableLocator: stable
+        )
+        #expect(result.isTimedOut)
+        #expect(restored?.locations.progression == 0.1)
+        #expect(delegate.jumpCount == 0)
+        #expect(navigator.currentLocation?.locations.progression == 0.1)
+    }
+
+    @Test("expired operation restore keeps the executor-owned token")
+    func expiredOperationRestoreKeepsExecutorToken() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        navigator.pageTurnDisplayFrameWaiterForTesting = {}
+        let operation = NavigationOperation(
+            operationID: 49,
+            intent: .absolute("chapter-1.xhtml"),
+            timeout: .milliseconds(1)
+        )
+        navigator.pageTurnGoToIndexForTesting = { _ in
+            try? await Task.sleep(nanoseconds: 2_000_000)
+            return .timedOut
+        }
+        var restored: Locator?
+        navigator.pageTurnRestoreGoToIndexForTesting = { locator in
+            restored = locator
+            return true
+        }
+        let stable = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(progression: 0.1)
+        )
+        let target = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(progression: 0.8)
+        )
+        let result = await navigator.performLocatorNavigationForTesting(
+            to: target,
+            operation: operation,
+            stableLocator: stable
+        )
+        #expect(result.isTimedOut)
+        #expect(restored?.locations.progression == 0.1)
+        #expect(navigator.pageTurnRestoreUsedOperationTokenForTesting == true)
+        #expect(operation.check()?.isTimedOut == true)
+    }
+
+    @Test("unresolvable poison recovery locator fails closed instead of reloading the start")
+    func unresolvablePoisonRecoveryLocatorFailsClosed() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 2
+        )
+        let positionOnly = Locator(
+            href: AnyURL(string: "chapter-2.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(position: 8)
+        )
+        let operation = NavigationOperation(
+            operationID: 50,
+            intent: .reload("poison"),
+            timeout: .seconds(1)
+        )
+        let result = await navigator.replacePoisonedPaginationForTesting(
+            stableLocator: positionOnly,
+            operation: operation
+        )
+        #expect(result.isApplied == false)
+        #expect(navigator.pageTurnPoisonReloadLocatorForTesting == nil)
     }
 
     @Test("position-only multi-column locator rejects same-resource wrong column")
@@ -3004,7 +4580,7 @@ struct EPUBPageTurnControllerTests {
 
         setLiveColumn(progression: wrongProgression)
         // Pre-fix bug: resource match alone returned true and skipped restore.
-        #expect(!(await navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(positionOnly)))
+        #expect(await !(navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(positionOnly)))
 
         // Observes the locator after position→progression resolution, without
         // hanging on headless WebKit goToIndex.
@@ -3058,7 +4634,7 @@ struct EPUBPageTurnControllerTests {
             contentWidth: 3900,
             progression: 0.6
         )
-        #expect(!(await navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(original)))
+        #expect(await !(navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(original)))
         #expect(frameWaits >= 1)
 
         frameWaits = 0
@@ -3068,7 +4644,7 @@ struct EPUBPageTurnControllerTests {
             contentWidth: 0,
             progression: 0.6
         )
-        #expect(!(await navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(original)))
+        #expect(await !(navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(original)))
         #expect(frameWaits >= 1)
 
         // Valid single-page geometry still succeeds on resource match alone.
@@ -3078,6 +4654,182 @@ struct EPUBPageTurnControllerTests {
             progression: 0
         )
         #expect(await navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(original))
+    }
+
+    @Test("single-width vertical locator verification uses the outer pagination offset")
+    func singleWidthVerticalLocatorUsesOuterPaginationOffset() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        let original = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(progression: 0.5)
+        )
+        navigator.pageTurnMultiColumnGeometryForTesting = (
+            pageWidth: 390,
+            contentWidth: 390,
+            progression: 0
+        )
+        navigator.pageTurnVerticalLocationVerifierForTesting = { _, _ in false }
+
+        #expect(await !navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(original))
+
+        navigator.pageTurnVerticalLocationVerifierForTesting = { _, _ in true }
+        #expect(await navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(original))
+    }
+
+    @Test("operation-aware vertical verification rejects an applied false value")
+    func operationAwareVerticalVerificationRejectsFalse() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        let original = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(progression: 0.5)
+        )
+        navigator.pageTurnMultiColumnGeometryForTesting = (
+            pageWidth: 390,
+            contentWidth: 390,
+            progression: 0
+        )
+        navigator.pageTurnVerticalLocationVerifierForTesting = { _, _ in false }
+        let operation = NavigationOperation(
+            operationID: 801,
+            intent: .absolute("vertical-verification"),
+            timeout: .seconds(1)
+        )
+
+        #expect(await !navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(
+            original,
+            operation: operation
+        ))
+    }
+
+    @Test("single-width vertical DOM locators use the outer pagination offset")
+    func singleWidthVerticalDOMLocatorsUseOuterPaginationOffset() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        navigator.pageTurnMultiColumnGeometryForTesting = (
+            pageWidth: 390,
+            contentWidth: 390,
+            progression: 0
+        )
+        var verifiedLocations: [PageLocation] = []
+        navigator.pageTurnVerticalLocationVerifierForTesting = { location, _ in
+            verifiedLocations.append(location)
+            return false
+        }
+        let href = AnyURL(string: "chapter-1.xhtml")!
+        let locators = [
+            Locator(
+                href: href,
+                mediaType: .xhtml,
+                locations: .init(fragments: ["target"])
+            ),
+            Locator(
+                href: href,
+                mediaType: .xhtml,
+                locations: .init(otherLocations: ["cssSelector": .string("#target")])
+            ),
+            Locator(
+                href: href,
+                mediaType: .xhtml,
+                locations: .init(),
+                text: .init(highlight: "Target text")
+            ),
+        ]
+
+        for locator in locators {
+            #expect(await !navigator.isLiveViewAtPageTurnOriginalLocatorForTesting(locator))
+        }
+        #expect(verifiedLocations.count == 3)
+    }
+
+    @Test("expired recovery leaves poisoned pagination for the next executor operation")
+    func expiredRecoveryLeavesPoisonedPaginationDeferred() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(pageTurnStyle: .none)
+        let window = UIWindow(frame: navigator.view.bounds)
+        window.addSubview(navigator.view)
+        window.isHidden = false
+        defer { window.isHidden = true }
+        await nextMainRunLoop()
+        let paginationView = try #require(currentPaginationView(in: navigator))
+        let originalSpread = try #require(paginationView.currentView as? EPUBSpreadView)
+        originalSpread.poison(with: .timedOut)
+        navigator.setNavigationOperationTimeoutForTesting(.milliseconds(1))
+
+        let result = await navigator.goForward(options: .none)
+
+        #expect(!result)
+        #expect(paginationView.loadedViews.isEmpty)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        #expect(paginationView.loadedViews.isEmpty)
+
+        navigator.setNavigationOperationTimeoutForTesting(.seconds(15))
+        #expect(await navigator.goForward(options: .none))
+        #expect(!paginationView.loadedViews.isEmpty)
+    }
+
+    @Test("timeout isolation preserves the exact original surface preview")
+    func timeoutIsolationPreservesExactOriginalPreview() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(
+            pageTurnStyle: .cover,
+            chapterHTML: "<html><body><p id=\"exact-original\">Page</p></body></html>"
+        )
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = SnapshotObservingView(frame: container.bounds)
+        navigator.view.frame = root.bounds
+        root.addSubview(navigator.view)
+        container.addSubview(root)
+        delegate.pageTurnRootView = root
+        navigator.pageTurnDisplayFrameWaiterForTesting = {}
+        let viewport = try #require(navigator.viewport)
+        let exactOriginal = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(otherLocations: [
+                "cssSelector": .string("#exact-original"),
+            ])
+        )
+        let target = makeLocator(href: "chapter-2.xhtml", progression: 0)
+        var previewCount = 0
+        navigator.pageTurnPreviewCalculationForTesting = {
+            previewCount += 1
+            return previewCount == 1
+                ? (exactOriginal, viewport)
+                : (target, viewport)
+        }
+        let navigationGate = Gate()
+        var navigationStarted = false
+        navigator.pageTurnNavigationForTesting = { _, _ in
+            navigationStarted = true
+            await navigationGate.wait()
+            return false
+        }
+        navigator.setNavigationOperationTimeoutForTesting(.milliseconds(500))
+
+        let first = Task { @MainActor in
+            await navigator.goForward(options: .animated)
+        }
+        #expect(await waitUntil { navigationStarted })
+        #expect(await !first.value)
+        navigationGate.open()
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        navigator.setNavigationOperationTimeoutForTesting(.seconds(15))
+        navigator.pageTurnStyle = .none
+        _ = await navigator.goForward(options: .none)
+
+        #expect(
+            navigator.pageTurnPoisonReloadLocatorForTesting?.locations.cssSelector
+                == "#exact-original"
+        )
     }
 
     @Test("failed surface prepare after navigation does not navigate again on commit")
@@ -3373,6 +5125,40 @@ struct EPUBPageTurnControllerTests {
         #expect(controller.isIdle)
     }
 
+    @Test("retired cover restoration cannot clean up or finish after hard abort")
+    func retiredCoverRestoreDoesNotMutateController() async throws {
+        let controller = EPUBPageTurnController(refreshCurrentLocation: {})
+        let session = try #require(controller.begin(to: .right, readingProgression: .ltr))
+        let reboundGate = Gate()
+        var didEnterRebound = false
+        var cleanupCount = 0
+        var finishCount = 0
+
+        let restore = Task { @MainActor in
+            await controller.restoreCover(
+                session,
+                rebound: { _ in
+                    didEnterRebound = true
+                    await reboundGate.wait()
+                    return true
+                },
+                cleanup: { cleanupCount += 1 },
+                finish: { _ in finishCount += 1 }
+            )
+        }
+        #expect(await waitUntil { didEnterRebound })
+
+        // Models hardAbortInFlightPageTurn retiring the active session while
+        // an independent WebView recovery is suspended.
+        #expect(controller.finish(session))
+        reboundGate.open()
+
+        #expect(await restore.value == false)
+        #expect(cleanupCount == 0)
+        #expect(finishCount == 0)
+        #expect(controller.isIdle)
+    }
+
     @Test("failed cover restoration retains its surface until a later recovery")
     func failedCoverRestoreKeepsSurface() async throws {
         let controller = EPUBPageTurnController(refreshCurrentLocation: {})
@@ -3638,7 +5424,7 @@ struct EPUBPageTurnControllerTests {
         let navigator = try makeNavigator(initialLocation: oldLocation)
         let oldViewport = NavigatorViewport(
             resources: [
-                .init(href: oldLocation.href, progression: 0 ... 0.25)
+                .init(href: oldLocation.href, progression: 0 ... 0.25),
             ],
             progression: 0 ... 0.25
         )
@@ -3647,7 +5433,7 @@ struct EPUBPageTurnControllerTests {
                 .init(
                     href: AnyURL(string: "rejected.xhtml")!,
                     progression: 0.5 ... 0.75
-                )
+                ),
             ],
             progression: 0.5 ... 0.75
         )
@@ -3664,8 +5450,8 @@ struct EPUBPageTurnControllerTests {
         #expect(navigator.viewport == oldViewport)
     }
 
-    @Test("surface preparation refuses a transaction when the exact original preview is unavailable")
-    func missingOriginalPreviewRejectsSurfacePreparation() async throws {
+    @Test("missing original preview degrades a committed turn to instant navigation")
+    func missingOriginalPreviewDegradesToInstantNavigation() async throws {
         let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .cover)
         let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
         let root = SnapshotObservingView(frame: container.bounds)
@@ -3673,19 +5459,19 @@ struct EPUBPageTurnControllerTests {
         root.addSubview(navigator.view)
         container.addSubview(root)
         delegate.pageTurnRootView = root
-        var navigationCount = 0
+        delegate.resetLocationChanges()
+        let original = try #require(navigator.currentLocation)
+        let originalIndex = try #require(currentPaginationView(in: navigator)?.currentIndex)
         navigator.pageTurnPreviewCalculationForTesting = { (nil, nil) }
-        navigator.pageTurnNavigationForTesting = { _, _ in
-            navigationCount += 1
-            return true
-        }
 
-        #expect(!(await navigator.goForward(options: .animated)))
+        #expect(await navigator.goForward(options: .animated))
         await navigator.settlePageTurn()
 
-        #expect(navigationCount == 0)
-        #expect(root.snapshotCount == 2)
+        #expect(currentPaginationView(in: navigator)?.currentIndex == originalIndex + 1)
+        #expect(root.snapshotCount == 1)
         #expect(delegate.locationChangeCount == 1)
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-2.xhtml"))
+        #expect(navigator.currentLocation != original)
         #expect(pageTurnSurfaces(in: container).isEmpty)
         #expect(navigator.isPageTurnIdleForTesting)
     }
@@ -3705,7 +5491,7 @@ struct EPUBPageTurnControllerTests {
         let target = makeLocator(href: "chapter-2.xhtml", progression: 0)
         let targetViewport = NavigatorViewport(
             resources: [
-                .init(href: target.href, progression: 0 ... 0.25)
+                .init(href: target.href, progression: 0 ... 0.25),
             ],
             progression: 0.5 ... 0.75
         )
@@ -3751,7 +5537,7 @@ struct EPUBPageTurnControllerTests {
         let settledTarget = makeLocator(href: "chapter-2.xhtml", progression: 0.2)
         let targetViewport = NavigatorViewport(
             resources: [
-                .init(href: settledTarget.href, progression: 0.2 ... 0.4)
+                .init(href: settledTarget.href, progression: 0.2 ... 0.4),
             ],
             progression: 0.2 ... 0.4
         )
@@ -3780,8 +5566,8 @@ struct EPUBPageTurnControllerTests {
         #expect(pageTurnSurfaces(in: container).isEmpty)
     }
 
-    @Test("a missing target preview prevents target capture and commit")
-    func missingTargetPreviewRejectsSurfaceCommit() async throws {
+    @Test("missing target preview degrades a committed turn without a surface")
+    func missingTargetPreviewDegradesWithoutSurface() async throws {
         let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .cover)
         let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
         let root = SnapshotObservingView(frame: container.bounds)
@@ -3799,15 +5585,16 @@ struct EPUBPageTurnControllerTests {
                 ? (original, originalViewport)
                 : (nil, originalViewport)
         }
-        navigator.pageTurnNavigationForTesting = { _, _ in true }
 
-        #expect(!(await navigator.goForward(options: .animated)))
+        #expect(await navigator.goForward(options: .animated))
         await navigator.settlePageTurn()
 
         #expect(calculationCount >= 2)
-        #expect(root.snapshotCount == 2)
-        #expect(delegate.locationChangeCount == 0)
-        #expect(navigator.currentLocation == original)
+        #expect(root.snapshotCount == 1)
+        #expect(currentPaginationView(in: navigator)?.currentIndex == 1)
+        #expect(delegate.locationChangeCount == 1)
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-2.xhtml"))
+        #expect(navigator.currentLocation != original)
         #expect(pageTurnSurfaces(in: container).isEmpty)
     }
 
@@ -3826,7 +5613,7 @@ struct EPUBPageTurnControllerTests {
         let target = makeLocator(href: "chapter-2.xhtml", progression: 0)
         let targetViewport = NavigatorViewport(
             resources: [
-                .init(href: target.href, progression: 0 ... 0.25)
+                .init(href: target.href, progression: 0 ... 0.25),
             ],
             progression: 0.5 ... 0.75
         )
@@ -3861,7 +5648,7 @@ struct EPUBPageTurnControllerTests {
         turn.cancel()
         firstFrameGate.open()
 
-        #expect(!(await turn.value))
+        #expect(await !(turn.value))
         await navigator.settlePageTurn()
 
         #expect(frameCount >= 4)
@@ -4007,8 +5794,8 @@ struct EPUBPageTurnControllerTests {
         #expect(pageTurnSurfaces(in: container).isEmpty)
     }
 
-    @Test("loss of all mounted page surfaces before settlement restores the original page")
-    func missingMountedSurfacesBeforeSettlementFailsTheTransaction() async throws {
+    @Test("loss of all mounted surfaces degrades the committed turn to instant navigation")
+    func missingMountedSurfacesDegradesToInstantNavigation() async throws {
         let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .push)
         let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
         let root = SnapshotObservingView(frame: container.bounds)
@@ -4020,18 +5807,19 @@ struct EPUBPageTurnControllerTests {
         delegate.resetLocationChanges()
         var removed = false
         navigator.pageTurnDisplayFrameWaiterForTesting = {
-            let surfaces = self.pageTurnSurfaces(in: container)
+            let surfaces = pageTurnSurfaces(in: container)
             if !removed, surfaces.count == 2 {
                 removed = true
                 surfaces.forEach { $0.removeFromSuperview() }
             }
         }
 
-        #expect(!(await navigator.goForward(options: .animated)))
+        #expect(await navigator.goForward(options: .animated))
         #expect(removed)
-        #expect(currentPaginationView(in: navigator)?.currentIndex == 0)
-        #expect(navigator.currentLocation == original)
-        #expect(delegate.locationChangeCount == 0)
+        #expect(currentPaginationView(in: navigator)?.currentIndex == 1)
+        #expect(navigator.currentLocation?.href == AnyURL(string: "chapter-2.xhtml"))
+        #expect(navigator.currentLocation != original)
+        #expect(delegate.locationChangeCount == 1)
         #expect(pageTurnSurfaces(in: container).isEmpty)
         #expect(navigator.isPageTurnIdleForTesting)
     }
@@ -4057,6 +5845,38 @@ struct EPUBPageTurnControllerTests {
         #expect(navigator.isPageTurnIdleForTesting)
     }
 
+    @Test("a relative surface publication cannot be negated by a later deadline")
+    func relativeSurfaceDeadlineAfterPublicationStillReturnsSuccess() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .cover)
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = SnapshotObservingView(frame: container.bounds)
+        navigator.view.frame = root.bounds
+        root.addSubview(navigator.view)
+        container.addSubview(root)
+        delegate.pageTurnRootView = root
+        delegate.resetLocationChanges()
+        navigator.setNavigationOperationTimeoutForTesting(.seconds(3))
+        let postPublicationGate = Gate()
+        var isWaitingAfterPublication = false
+        navigator.pageTurnDisplayFrameWaiterForTesting = {
+            if delegate.locationChangeCount == 1 {
+                isWaitingAfterPublication = true
+                await postPublicationGate.wait()
+            }
+        }
+
+        let turn = Task { @MainActor in
+            await navigator.goForward(options: .animated)
+        }
+        let result = await turn.value
+
+        #expect(result)
+        #expect(delegate.locationChangeCount == 1)
+        #expect(!isWaitingAfterPublication)
+        postPublicationGate.open()
+        await navigator.settlePageTurn()
+    }
+
     @Test("real navigator go publishes once and pre-commit cancellation publishes nothing")
     func realNavigatorGoAndCancellation() async throws {
         let (navigator, delegate) = try await makeLoadedNavigator()
@@ -4080,6 +5900,260 @@ struct EPUBPageTurnControllerTests {
         await navigator.settlePageTurn()
         #expect(delegate.locationChangeCount == 0)
         #expect(delegate.errorCount == 0)
+    }
+
+    @Test("active deadline releases an interactive page-turn waiter and all navigation diagnostics")
+    func activeDeadlineReleasesInteractivePageTurnWaiter() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(pageTurnStyle: .none)
+        delegate.resetLocationChanges()
+        navigator.setNavigationOperationTimeoutForTesting(.milliseconds(20))
+
+        navigator.handlePageTurnPanForTesting(
+            state: .began,
+            translationX: 0,
+            velocityX: -700
+        )
+
+        #expect(!navigator.isNavigationQuiescentForTesting)
+        #expect(await waitUntil { navigator.isNavigationQuiescentForTesting })
+        #expect(
+            navigator.navigationQuiescenceDiagnosticsForTesting
+                == "executorActive=0,executorPending=0,executorWaiters=0,recovery=0,recoveryWaiters=0,hardAbortPending=0,hardAbortWaiters=0,snapshotIdle=1"
+        )
+        await navigator.settlePageTurn()
+        #expect(navigator.isNavigationQuiescentForTesting)
+        #expect(delegate.locationChangeCount == 0)
+    }
+
+    @Test("link resolution is bounded by the same executor deadline as navigation")
+    func linkResolutionUsesNavigationExecutorDeadline() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 2
+        )
+        let link = try #require(navigator.publication.readingOrder.last)
+        let gate = Gate()
+        navigator.linkLocatorForTesting = { _ in
+            await gate.wait()
+            return nil
+        }
+        navigator.setNavigationOperationTimeoutForTesting(.milliseconds(20))
+
+        let result = await navigator.go(to: link, options: .none)
+
+        #expect(!result)
+        #expect(navigator.isNavigationQuiescentForTesting)
+        gate.open()
+    }
+
+    @Test("same-spread viewport movement during location calculation prevents stale publication")
+    func locatorPublicationRejectsChangedViewportRevision() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        let target = try #require(navigator.currentLocation)
+        let paginationView = try #require(currentPaginationView(in: navigator))
+        let spread = try #require(paginationView.currentView as? EPUBSpreadView)
+        delegate.resetLocationChanges()
+        navigator.pageTurnGoToIndexForTesting = { _ in .applied }
+        navigator.locatorNavigationLocationCalculationForTesting = {
+            spread.scrollView.contentOffset.x += 10
+            return (target, nil)
+        }
+
+        let result = await navigator.go(to: target, options: .none)
+
+        #expect(!result)
+        #expect(delegate.locationChangeCount == 0)
+    }
+
+    @Test("same-href location calculation rejects the wrong target progression")
+    func locatorPublicationRejectsWrongCalculatedProgression() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        let href = AnyURL(string: "chapter-1.xhtml")!
+        let target = Locator(
+            href: href,
+            mediaType: .xhtml,
+            locations: .init(progression: 0.8)
+        )
+        let wrongCalculation = Locator(
+            href: href,
+            mediaType: .xhtml,
+            locations: .init(progression: 0.2)
+        )
+        navigator.pageTurnDisplayFrameWaiterForTesting = {}
+        navigator.pageTurnGoToIndexForTesting = { _ in .applied }
+        navigator.pageTurnMultiColumnGeometryForTesting = (
+            pageWidth: 390,
+            contentWidth: 3900,
+            progression: 0.8
+        )
+        navigator.locatorNavigationLocationCalculationForTesting = {
+            (wrongCalculation, nil)
+        }
+        navigator.pageTurnRestoreGoForTesting = { locator in
+            navigator.pageTurnMultiColumnGeometryForTesting = (
+                pageWidth: 390,
+                contentWidth: 3900,
+                progression: locator.locations.progression ?? 0
+            )
+            return true
+        }
+        delegate.resetLocationChanges()
+
+        let result = await navigator.go(to: target, options: .none)
+
+        #expect(!result)
+        #expect(delegate.locationChangeCount == 0)
+        #expect(delegate.jumpCount == 0)
+    }
+
+    @Test("same-href location calculation rejects a different DOM target")
+    func locatorPublicationRejectsWrongCalculatedDOMTarget() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1,
+            chapterHTML: "<html><body><p id=\"target\">Target</p><p id=\"wrong\">Wrong</p></body></html>"
+        )
+        let href = AnyURL(string: "chapter-1.xhtml")!
+        let target = Locator(
+            href: href,
+            mediaType: .xhtml,
+            locations: .init(
+                progression: 0,
+                otherLocations: ["cssSelector": .string("#target")]
+            )
+        )
+        let wrongCalculation = Locator(
+            href: href,
+            mediaType: .xhtml,
+            locations: .init(
+                progression: 0,
+                otherLocations: ["cssSelector": .string("#wrong")]
+            )
+        )
+        navigator.pageTurnDisplayFrameWaiterForTesting = {}
+        navigator.pageTurnGoToIndexForTesting = { _ in .applied }
+        navigator.locatorNavigationDOMTargetVerifierForTesting = { _ in true }
+        navigator.locatorNavigationLocationCalculationForTesting = {
+            (wrongCalculation, nil)
+        }
+        navigator.pageTurnRestoreGoForTesting = { _ in true }
+        delegate.resetLocationChanges()
+
+        let result = await navigator.go(to: target, options: .none)
+
+        #expect(!result)
+        #expect(delegate.locationChangeCount == 0)
+        #expect(delegate.jumpCount == 0)
+    }
+
+    @Test("DOM range targets are reverified after asynchronous location calculation")
+    func locatorPublicationReverifiesDOMRangeTarget() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        let href = AnyURL(string: "chapter-1.xhtml")!
+        let range = DOMRange(
+            start: .init(cssSelector: "#target", textNodeIndex: 0, charOffset: 1)
+        )
+        let target = Locator(
+            href: href,
+            mediaType: .xhtml,
+            locations: .init(
+                progression: 0,
+                otherLocations: ["domRange": .object(range.jsonObject)]
+            )
+        )
+        let calculated = Locator(
+            href: href,
+            mediaType: .xhtml,
+            locations: .init(progression: 0)
+        )
+        var verificationCount = 0
+        navigator.pageTurnDisplayFrameWaiterForTesting = {}
+        navigator.pageTurnGoToIndexForTesting = { _ in .applied }
+        navigator.locatorNavigationDOMTargetVerifierForTesting = { _ in
+            verificationCount += 1
+            return true
+        }
+        navigator.locatorNavigationLocationCalculationForTesting = {
+            (calculated, nil)
+        }
+        delegate.resetLocationChanges()
+
+        let result = await navigator.go(to: target, options: .none)
+
+        #expect(result)
+        #expect(verificationCount == 2)
+        #expect(delegate.locationChangeCount == 1)
+        #expect(delegate.jumpCount == 1)
+    }
+
+    @Test("same-href location calculation rejects the wrong target position")
+    func locatorPublicationRejectsWrongCalculatedPosition() async throws {
+        let href = AnyURL(string: "chapter-1.xhtml")!
+        let positions = [
+            (0 ..< 10).map { index in
+                Locator(
+                    href: href,
+                    mediaType: .xhtml,
+                    locations: .init(
+                        progression: Double(index) / 9,
+                        position: index + 1
+                    )
+                )
+            },
+        ]
+        let (navigator, delegate) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1,
+            positionsByReadingOrder: positions
+        )
+        let targetProgression = Double(5) / 9
+        let target = Locator(
+            href: href,
+            mediaType: .xhtml,
+            locations: .init(position: 6)
+        )
+        let wrongCalculation = Locator(
+            href: href,
+            mediaType: .xhtml,
+            locations: .init(
+                progression: targetProgression,
+                position: 2
+            )
+        )
+        navigator.pageTurnDisplayFrameWaiterForTesting = {}
+        navigator.pageTurnGoToIndexForTesting = { _ in .applied }
+        navigator.pageTurnMultiColumnGeometryForTesting = (
+            pageWidth: 390,
+            contentWidth: 3900,
+            progression: targetProgression
+        )
+        navigator.locatorNavigationLocationCalculationForTesting = {
+            (wrongCalculation, nil)
+        }
+        navigator.pageTurnRestoreGoForTesting = { locator in
+            navigator.pageTurnMultiColumnGeometryForTesting = (
+                pageWidth: 390,
+                contentWidth: 3900,
+                progression: locator.locations.progression ?? 0
+            )
+            return true
+        }
+        delegate.resetLocationChanges()
+
+        let result = await navigator.go(to: target, options: .none)
+
+        #expect(!result)
+        #expect(delegate.locationChangeCount == 0)
+        #expect(delegate.jumpCount == 0)
     }
 
     @Test("a second page turn is rejected until the active session finishes")
@@ -4330,6 +6404,60 @@ struct EPUBPageTurnControllerTests {
         #expect(navigator.currentLocation == lastLocation)
         #expect(delegate.locationChangeCount == 0)
         #expect(delegate.errorCount == 0)
+    }
+
+    @Test("an idle location refresh cannot overwrite a newer navigation publication")
+    func staleIdleLocationRefreshCannotOverwriteNavigation() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 3
+        )
+        let oldLocation = try #require(navigator.currentLocation)
+        let refreshGate = Gate()
+        var refreshStarted = false
+        let refresh = Task { @MainActor in
+            await navigator.performCurrentLocationRefresh {
+                refreshStarted = true
+                await refreshGate.wait()
+                return (oldLocation, nil)
+            }
+        }
+        #expect(await waitUntil { refreshStarted })
+
+        #expect(await navigator.goForward(options: .none))
+        let navigatedLocation = try #require(navigator.currentLocation)
+        #expect(navigatedLocation.href != oldLocation.href)
+        delegate.resetLocationChanges()
+
+        refreshGate.open()
+        await refresh.value
+
+        #expect(navigator.currentLocation == navigatedLocation)
+        #expect(delegate.locationChangeCount == 0)
+    }
+
+    @Test("idle location refresh returns at its deadline when calculation ignores cancellation")
+    func idleLocationRefreshDeadlineDoesNotWaitForCalculation() async throws {
+        let navigator = try makeNavigator()
+        navigator.setNavigationOperationTimeoutForTesting(.milliseconds(20))
+        let calculationGate = Gate()
+        var calculationStarted = false
+        var refreshFinished = false
+        let refresh = Task { @MainActor in
+            await navigator.performCurrentLocationRefresh {
+                calculationStarted = true
+                await calculationGate.wait()
+                return (nil, nil)
+            }
+            refreshFinished = true
+        }
+        #expect(await waitUntil { calculationStarted })
+
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        #expect(refreshFinished)
+
+        calculationGate.open()
+        await refresh.value
     }
 
     private func makeNavigator(
@@ -4674,16 +6802,25 @@ private final class Gate {
 }
 
 @MainActor
-private final class SnapshotObservingView: UIView {
+private final class SnapshotObservingView: UIView, EPUBPageTurnSurfaceSnapshotProviding {
     var onSnapshot: (() -> Void)?
     var shouldFailSnapshots = false
     private(set) var snapshotCount = 0
+    private(set) var afterScreenUpdatesValues: [Bool] = []
 
-    override func snapshotView(afterScreenUpdates afterUpdates: Bool) -> UIView? {
+    func pageTurnSurfaceSnapshot(afterScreenUpdates afterUpdates: Bool) -> UIView? {
         snapshotCount += 1
+        afterScreenUpdatesValues.append(afterUpdates)
         onSnapshot?()
         guard !shouldFailSnapshots else { return nil }
+        if window == nil {
+            return UIView(frame: bounds)
+        }
         return super.snapshotView(afterScreenUpdates: afterUpdates)
+    }
+
+    override func snapshotView(afterScreenUpdates afterUpdates: Bool) -> UIView? {
+        pageTurnSurfaceSnapshot(afterScreenUpdates: afterUpdates)
     }
 }
 
@@ -4750,6 +6887,14 @@ private final class Delegate: EPUBNavigatorDelegate {
         if locator == nil {
             previewEndCount += 1
         }
+    }
+
+    private(set) var jumpCount = 0
+    private(set) var jumpedLocators: [Locator] = []
+
+    func navigator(_ navigator: Navigator, didJumpTo locator: Locator) {
+        jumpCount += 1
+        jumpedLocators.append(locator)
     }
 
     func navigator(_ navigator: Navigator, presentError error: NavigatorError) {

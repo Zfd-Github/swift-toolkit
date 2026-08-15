@@ -29,20 +29,85 @@ enum PageLocation: Equatable {
     }
 }
 
+@MainActor
 protocol PageView {
+    /// Binds the generation which will own the next mutation. Most page views
+    /// don't have a generation; WebKit-backed spreads override this.
+    func bindNavigationOperation(_ operation: NavigationOperationToken)
+
+    /// Makes every callback from an abandoned page generation untrustworthy.
+    /// WebKit-backed pages stop loading and resolve their pending waiters.
+    func isolateNavigationGeneration(with result: NavigationResult)
+
     /// Moves the page to the given internal location.
-    func go(to location: PageLocation, animated: Bool) async
+    ///
+    /// - Parameter waitForLoad: When false, returns immediately if the page is
+    ///   not ready instead of installing a pending location waiter.
+    /// - Returns: Whether the location was applied.
+    func go(
+        to location: PageLocation,
+        animated: Bool,
+        waitForLoad: Bool
+    ) async -> Bool
+
+    /// Moves the page while preserving the owning operation's deadline and
+    /// precise terminal result.
+    func go(
+        to location: PageLocation,
+        animated: Bool,
+        waitForLoad: Bool,
+        operation: NavigationOperationToken
+    ) async -> NavigationMutationResult
+}
+
+extension PageView {
+    func bindNavigationOperation(_ operation: NavigationOperationToken) {}
+    func isolateNavigationGeneration(with result: NavigationResult) {}
+
+    func go(
+        to location: PageLocation,
+        animated: Bool,
+        waitForLoad: Bool,
+        operation: NavigationOperationToken
+    ) async -> NavigationMutationResult {
+        if let result = operation.check() {
+            return .init(
+                result: result,
+                mayHaveMutated: false,
+                failureStage: .preflight
+            )
+        }
+        let applied = await go(
+            to: location,
+            animated: animated,
+            waitForLoad: waitForLoad
+        )
+        if let result = operation.check() {
+            return .init(
+                result: result,
+                mayHaveMutated: true,
+                failureStage: .pageViewMutation
+            )
+        }
+        return .init(
+            result: applied ? .applied : .spreadNotLoaded,
+            mayHaveMutated: true,
+            failureStage: applied ? nil : .pageViewMutation
+        )
+    }
 }
 
 @MainActor
 final class PaginationPageTurnSnapshotExposureContext {
     fileprivate let originalOffset: CGPoint
     fileprivate let cover: UIView
+    fileprivate let generation: UInt64
     fileprivate var isRestored = false
 
-    fileprivate init(originalOffset: CGPoint, cover: UIView) {
+    fileprivate init(originalOffset: CGPoint, cover: UIView, generation: UInt64) {
         self.originalOffset = originalOffset
         self.cover = cover
+        self.generation = generation
     }
 }
 
@@ -137,6 +202,10 @@ final class PaginationView: UIView, Loggable {
     private var unavailableVerticalPageIndices: Set<Int> = []
     private var initialVerticalNavigationTask: Task<Void, Never>?
     private var loadGeneration = 0
+    /// Invalidates tokens whenever the set of page views is rebuilt.
+    private(set) var generation: UInt64 = 0
+    private var activeSnapshotExposure: PaginationPageTurnSnapshotExposureContext?
+    private(set) var viewportRevision: UInt64 = 0
     private var isUpdatingVerticalLayout = false
     private var isViewportUpdateScheduled = false
 
@@ -184,6 +253,50 @@ final class PaginationView: UIView, Loggable {
             && loadedViews[index] === view
     }
 
+    /// Removes an untrusted page generation from the navigation tree before
+    /// any subsequent mutation can start using the pagination view.
+    @discardableResult
+    func detachPoisonedView(
+        _ view: UIView & PageView,
+        at index: Int
+    ) -> Bool {
+        guard loadedViews[index] === view else { return false }
+        generation &+= 1
+        cancelPageLoading(clearQueue: false)
+        loadingIndexQueue.removeAll { $0.index == index }
+        loadedViews.removeValue(forKey: index)?.removeFromSuperview()
+        verticalPageStates.removeValue(forKey: index)
+        unavailableVerticalPageIndices.remove(index)
+        completeVerticalReadyWaiters(at: index, with: .unavailable)
+        return true
+    }
+
+    /// Synchronously removes every page generation and cancels pagination-owned
+    /// loading work without starting a replacement. A later executor lease can
+    /// safely call `reloadAtIndex` to rebuild the pagination.
+    func isolateForDeferredReload(with result: NavigationResult = .cancelled) {
+        invalidateSnapshotExposure()
+        generation &+= 1
+        layer.removeAllAnimations()
+        scrollView.layer.removeAllAnimations()
+        alpha = 1
+        isAnimatingContentOffset = false
+        restoreScrollInteraction()
+        initialVerticalNavigationTask?.cancel()
+        initialVerticalNavigationTask = nil
+        cancelPageLoading(clearQueue: true)
+        completeAllVerticalReadyWaiters(with: .unavailable)
+        provisionalVerticalNavigations.removeAll()
+        provisionalOnlyPageIndices.removeAll()
+        for view in loadedViews.values {
+            view.isolateNavigationGeneration(with: result)
+            view.removeFromSuperview()
+        }
+        loadedViews.removeAll()
+        verticalPageStates.removeAll()
+        unavailableVerticalPageIndices.removeAll()
+    }
+
     func exposeReadyViewForPageTurnSnapshot(
         at index: Int
     ) async -> PaginationPageTurnSnapshotExposureContext? {
@@ -209,8 +322,10 @@ final class PaginationView: UIView, Loggable {
         addSubview(cover)
         let context = PaginationPageTurnSnapshotExposureContext(
             originalOffset: scrollView.contentOffset,
-            cover: cover
+            cover: cover,
+            generation: generation
         )
+        activeSnapshotExposure = context
 
         isAnimatingContentOffset = true
         scrollView.isScrollEnabled = false
@@ -222,6 +337,8 @@ final class PaginationView: UIView, Loggable {
         await PageTurnAnimationFrameWaiter.wait()
 
         guard
+            activeSnapshotExposure === context,
+            context.generation == generation,
             currentIndex == sourceIndex,
             loadedViews[index] === targetView,
             visibleFrame(at: index) != nil
@@ -238,9 +355,34 @@ final class PaginationView: UIView, Loggable {
         guard !context.isRestored else { return }
         context.isRestored = true
 
+        guard
+            activeSnapshotExposure === context,
+            context.generation == generation
+        else {
+            context.cover.removeFromSuperview()
+            return
+        }
+
         scrollView.contentOffset = context.originalOffset
         await PageTurnAnimationFrameWaiter.wait()
         await PageTurnAnimationFrameWaiter.wait()
+        guard
+            activeSnapshotExposure === context,
+            context.generation == generation
+        else {
+            context.cover.removeFromSuperview()
+            return
+        }
+        context.cover.removeFromSuperview()
+        activeSnapshotExposure = nil
+        isAnimatingContentOffset = false
+        restoreScrollInteraction()
+    }
+
+    private func invalidateSnapshotExposure() {
+        guard let context = activeSnapshotExposure else { return }
+        activeSnapshotExposure = nil
+        context.isRestored = true
         context.cover.removeFromSuperview()
         isAnimatingContentOffset = false
         restoreScrollInteraction()
@@ -303,6 +445,46 @@ final class PaginationView: UIView, Loggable {
 
     var visibleIndices: [Int] {
         loadedViews.keys.sorted().filter { visibleFrame(at: $0) != nil }
+    }
+
+    /// Verifies that a continuous-scroll navigation landed at the requested
+    /// resource-local offset by comparing it with the outer viewport's live Y.
+    func isAtVerticalLocation(
+        _ location: PageLocation,
+        at index: Int,
+        tolerance: CGFloat = 1
+    ) async -> Bool {
+        guard
+            axis == .verticalContinuous,
+            verticalPageStates[index]?.isReady == true,
+            let view = loadedViews[index],
+            let frame = frameForView(at: index)
+        else {
+            return false
+        }
+        let localY: CGFloat?
+        do {
+            localY = try await delegate?.paginationView(
+                self,
+                verticalOffsetFor: location,
+                at: index
+            )
+        } catch {
+            return false
+        }
+        guard
+            loadedViews[index] === view,
+            let currentFrame = frameForView(at: index),
+            currentFrame == frame,
+            let localY,
+            localY.isFinite,
+            localY >= 0
+        else {
+            return false
+        }
+        let maximumLocalY = max(0, frame.height - effectiveViewport.height)
+        let expectedViewportY = frame.minY + min(localY, maximumLocalY)
+        return abs(effectiveViewport.minY - expectedViewportY) <= max(0, tolerance)
     }
 
     /// Set while a transition animation is in progress to prevent
@@ -662,6 +844,8 @@ final class PaginationView: UIView, Loggable {
         precondition(pageCount >= 1)
         precondition(0 ..< pageCount ~= index)
 
+        invalidateSnapshotExposure()
+        generation &+= 1
         cancelPageLoading(clearQueue: true)
         initialVerticalNavigationTask?.cancel()
         initialVerticalNavigationTask = nil
@@ -687,12 +871,14 @@ final class PaginationView: UIView, Loggable {
 
         if axis == .verticalContinuous {
             setCurrentIndex(index)
+            let reloadGeneration = generation
             initialVerticalNavigationTask = Task { @MainActor [weak self] in
                 guard let self else { return }
                 _ = await navigateVertically(
                     at: index,
                     location: location,
-                    animated: false
+                    animated: false,
+                    reloadGeneration: reloadGeneration
                 )
             }
         } else {
@@ -705,6 +891,7 @@ final class PaginationView: UIView, Loggable {
         guard isEmpty || index != currentIndex else {
             return
         }
+        viewportRevision &+= 1
 
         // If no explicit location is given, we'll load either the beginning or the end of the
         // resource depending on the last index. This allows to navigate backward across resources,
@@ -800,7 +987,11 @@ final class PaginationView: UIView, Loggable {
         }
 
         if axis == .horizontalPaged {
-            await view.go(to: location, animated: false)
+            _ = await view.go(
+                to: location,
+                animated: false,
+                waitForLoad: true
+            )
         }
         guard !Task.isCancelled, generation == loadGeneration else {
             return
@@ -864,10 +1055,54 @@ final class PaginationView: UIView, Loggable {
     /// - Parameters:
     ///   - index: The index to move to.
     ///   - location: The location to move the future current page view to.
-    /// - Returns: Whether the move is possible.
-    func goToIndex(_ index: Int, location: PageLocation, options: NavigatorGoOptions) async -> Bool {
+    /// - Returns: The complete mutation outcome, including partial-mutation evidence.
+    func goToIndex(
+        _ index: Int,
+        location: PageLocation,
+        options: NavigatorGoOptions,
+        waitForLoad: Bool = true
+    ) async -> NavigationMutationResult {
+        let operation = NavigationOperation(
+            operationID: 0,
+            intent: .absolute("legacy-go-to-index"),
+            timeout: .seconds(30)
+        )
+        return await goToIndexWithMutation(
+            index,
+            location: location,
+            options: options,
+            waitForLoad: waitForLoad,
+            operation: operation
+        )
+    }
+
+    /// Token-aware navigation which reports whether a failure can have changed
+    /// the visible page or its in-resource position. Callers must restore a
+    /// stable locator before releasing their executor lease when
+    /// `mayHaveMutated`.
+    func goToIndexWithMutation(
+        _ index: Int,
+        location: PageLocation,
+        options: NavigatorGoOptions,
+        waitForLoad: Bool = true,
+        operation: NavigationOperationToken
+    ) async -> NavigationMutationResult {
         guard 0 ..< pageCount ~= index else {
-            return false
+            return .init(
+                result: .spreadNotLoaded,
+                mayHaveMutated: false,
+                failureStage: .preflight
+            )
+        }
+
+        let expectedGeneration = generation
+        operation.bindPaginationGeneration(expectedGeneration)
+        if let result = operation.check(paginationGeneration: expectedGeneration) {
+            return .init(
+                result: result,
+                mayHaveMutated: false,
+                failureStage: .preflight
+            )
         }
 
         let shouldAnimate = options.animated && !UIAccessibility.isReduceMotionEnabled
@@ -878,44 +1113,284 @@ final class PaginationView: UIView, Loggable {
             return await navigateVertically(
                 at: index,
                 location: location,
-                animated: shouldAnimate
+                animated: shouldAnimate,
+                operation: operation
+            )
+        }
+
+        let sourceIndex = currentIndex
+        let targetView: UIView & PageView
+        var provisionallySelectedColdTarget = false
+        if let loaded = loadedViews[index] {
+            targetView = loaded
+        } else {
+            guard waitForLoad else {
+                return .init(
+                    result: .spreadNotLoaded,
+                    mayHaveMutated: false,
+                    failureStage: .targetLoad
+                )
+            }
+            let prepared = await prepareHorizontalPage(
+                at: index,
+                location: location,
+                operation: operation
+            )
+            switch prepared {
+            case let .applied(view):
+                targetView = view
+                if currentIndex != index {
+                    // The Readium load signal is posted from requestAnimationFrame;
+                    // WebKit may throttle it while the cold page is offscreen.
+                    // Select provisionally inside the executor lease, without
+                    // publishing a location. Failure rolls back below.
+                    restoreScrollInteraction()
+                    setCurrentIndex(index, location: location)
+                    setNeedsLayout()
+                    layoutIfNeeded()
+                    scrollView.contentOffset = CGPoint(
+                        x: xOffsetForIndex(index),
+                        y: scrollView.contentOffset.y
+                    )
+                    provisionallySelectedColdTarget = true
+                    await Task.yield()
+                    if let result = operation.check(
+                        paginationGeneration: expectedGeneration
+                    ) {
+                        rollbackProvisionalColdTargetIfOwned(
+                            sourceIndex: sourceIndex,
+                            targetIndex: index,
+                            targetView: targetView,
+                            expectedGeneration: expectedGeneration
+                        )
+                        return .init(
+                            result: result,
+                            mayHaveMutated: true,
+                            failureStage: .targetLoad
+                        )
+                    }
+                    guard
+                        generation == expectedGeneration,
+                        loadedViews[index] === targetView,
+                        currentIndex == index
+                    else {
+                        return .init(
+                            result: .superseded,
+                            mayHaveMutated: true,
+                            failureStage: .targetLoad
+                        )
+                    }
+                }
+            case let .rejected(result):
+                return .init(
+                    result: result,
+                    mayHaveMutated: false,
+                    failureStage: .targetLoad
+                )
+            }
+        }
+
+        // Recovery may have bound the operation to a stable page while
+        // replacing poisoned pagination. The requested mutation owns the
+        // selected target generation from this point onward.
+        targetView.bindNavigationOperation(operation)
+        let pageMutation = await targetView.go(
+            to: location,
+            animated: currentIndex == index ? shouldAnimate : false,
+            waitForLoad: waitForLoad,
+            operation: operation
+        )
+        guard pageMutation.result.isApplied else {
+            if provisionallySelectedColdTarget, sourceIndex != index {
+                rollbackProvisionalColdTargetIfOwned(
+                    sourceIndex: sourceIndex,
+                    targetIndex: index,
+                    targetView: targetView,
+                    expectedGeneration: expectedGeneration
+                )
+            }
+            return .init(
+                result: pageMutation.result,
+                mayHaveMutated: provisionallySelectedColdTarget
+                    || pageMutation.mayHaveMutated,
+                stableLocator: pageMutation.stableLocator,
+                stableVerified: pageMutation.stableVerified,
+                failureStage: pageMutation.failureStage ?? .pageViewMutation
+            )
+        }
+        if let result = operation.check(paginationGeneration: expectedGeneration) {
+            return .init(
+                result: result,
+                mayHaveMutated: true,
+                failureStage: .pageViewMutation
+            )
+        }
+        guard loadedViews[index] === targetView else {
+            return .init(
+                result: .superseded,
+                mayHaveMutated: true,
+                failureStage: .verification
             )
         }
 
         if currentIndex == index {
-            await scrollToView(at: index, location: location, animated: shouldAnimate)
-        } else if abs(currentIndex - index) == 1 {
-            await slideToView(at: index, location: location, animated: shouldAnimate)
-        } else {
-            await fadeToView(at: index, location: location, animated: shouldAnimate)
+            return .init(result: .applied, mayHaveMutated: true)
         }
-        return true
+
+        let transition: NavigationResult
+        if abs(currentIndex - index) == 1 {
+            transition = await slideToView(
+                at: index,
+                location: location,
+                animated: shouldAnimate,
+                operation: operation,
+                generation: expectedGeneration
+            )
+        } else {
+            transition = await fadeToView(
+                at: index,
+                location: location,
+                animated: shouldAnimate,
+                operation: operation,
+                generation: expectedGeneration
+            )
+        }
+        guard transition.isApplied else {
+            return .init(
+                result: transition,
+                mayHaveMutated: true,
+                failureStage: .paginationTransition
+            )
+        }
+        if let result = operation.check(paginationGeneration: expectedGeneration) {
+            return .init(
+                result: result,
+                mayHaveMutated: true,
+                failureStage: .paginationTransition
+            )
+        }
+        return .init(
+            result: currentIndex == index ? .applied : .superseded,
+            mayHaveMutated: true,
+            failureStage: currentIndex == index ? nil : .paginationTransition
+        )
+    }
+
+    private func rollbackProvisionalColdTargetIfOwned(
+        sourceIndex: Int,
+        targetIndex: Int,
+        targetView: UIView & PageView,
+        expectedGeneration: UInt64
+    ) {
+        guard
+            generation == expectedGeneration,
+            loadedViews[targetIndex] === targetView,
+            currentIndex == targetIndex
+        else {
+            return
+        }
+        setCurrentIndex(sourceIndex)
+        scrollView.contentOffset = CGPoint(
+            x: xOffsetForIndex(sourceIndex),
+            y: scrollView.contentOffset.y
+        )
+    }
+
+    private func prepareHorizontalPage(
+        at index: Int,
+        location: PageLocation,
+        operation: NavigationOperationToken
+    ) async -> NavigationValueResult<UIView & PageView> {
+        if let view = loadedViews[index] {
+            return .applied(view)
+        }
+        guard
+            0 ..< pageCount ~= index,
+            let view = delegate?.paginationView(self, pageViewAtIndex: index)
+        else {
+            return .rejected(.spreadNotLoaded)
+        }
+        loadingIndexQueue.removeAll { $0.index == index }
+        unavailableVerticalPageIndices.remove(index)
+        loadedViews[index] = view
+        scrollView.addSubview(view)
+        setNeedsLayout()
+        layoutIfNeeded()
+        if let result = operation.check(paginationGeneration: generation) {
+            view.isolateNavigationGeneration(with: result)
+            loadedViews.removeValue(forKey: index)?.removeFromSuperview()
+            return .rejected(result)
+        }
+        return .applied(view)
     }
 
     /// Loads a vertical navigation target without changing the visible
     /// resource. The target becomes current only after it is ready.
     private func prepareVerticalPage(
         at index: Int,
-        location: PageLocation
-    ) async -> Bool {
+        location: PageLocation,
+        validate: @escaping @MainActor () -> NavigationResult?
+    ) async -> NavigationResult {
+        if let result = validate() { return result }
         if verticalPageStates[index]?.isReady == true, loadedViews[index] != nil {
-            return true
+            return .applied
         }
 
         guard scheduleLoadPage(at: index, location: location) else {
-            return false
+            return .spreadNotLoaded
         }
         loadPages()
 
-        return await waitUntilVerticalPageIsReady(at: index) == .ready
-            && !Task.isCancelled
+        let readiness = await waitUntilVerticalPageIsReady(at: index)
+        if let result = validate() { return result }
+        return readiness == .ready ? .applied : .spreadNotLoaded
     }
 
     private func navigateVertically(
         at index: Int,
         location: PageLocation,
-        animated: Bool
-    ) async -> Bool {
+        animated: Bool,
+        operation: NavigationOperationToken
+    ) async -> NavigationMutationResult {
+        let expectedGeneration = generation
+        return await navigateVertically(
+            at: index,
+            location: location,
+            animated: animated,
+            validate: {
+                if Task.isCancelled { return .cancelled }
+                return operation.check(paginationGeneration: expectedGeneration)
+            }
+        )
+    }
+
+    private func navigateVertically(
+        at index: Int,
+        location: PageLocation,
+        animated: Bool,
+        reloadGeneration: UInt64
+    ) async -> NavigationMutationResult {
+        await navigateVertically(
+            at: index,
+            location: location,
+            animated: animated,
+            validate: { [weak self] in
+                guard !Task.isCancelled else { return .cancelled }
+                guard self?.generation == reloadGeneration else { return .superseded }
+                return nil
+            }
+        )
+    }
+
+    private func navigateVertically(
+        at index: Int,
+        location: PageLocation,
+        animated: Bool,
+        validate: @escaping @MainActor () -> NavigationResult?
+    ) async -> NavigationMutationResult {
+        if let result = validate() {
+            return .rejected(result, mayHaveMutated: false, stage: .preflight)
+        }
         let navigationID = UUID()
         let isProvisional = index != currentIndex
         if isProvisional, loadedViews[index] == nil {
@@ -939,13 +1414,28 @@ final class PaginationView: UIView, Loggable {
             }
         }
 
+        let preparation = await prepareVerticalPage(
+            at: index,
+            location: location,
+            validate: validate
+        )
+        guard preparation.isApplied else {
+            return .rejected(
+                preparation,
+                mayHaveMutated: false,
+                stage: .targetLoad
+            )
+        }
         guard
-            await prepareVerticalPage(at: index, location: location),
-            !Task.isCancelled,
+            validate() == nil,
             let targetView = loadedViews[index],
             verticalPageStates[index]?.isReady == true
         else {
-            return false
+            return .rejected(
+                validate() ?? .spreadNotLoaded,
+                mayHaveMutated: false,
+                stage: .targetLoad
+            )
         }
 
         let localY: CGFloat?
@@ -956,27 +1446,40 @@ final class PaginationView: UIView, Loggable {
                 at: index
             )
         } catch {
-            return false
+            return .rejected(
+                .failed(error),
+                mayHaveMutated: false,
+                stage: .verification
+            )
         }
         guard
-            !Task.isCancelled,
+            validate() == nil,
             let localY,
             localY.isFinite,
             localY >= 0,
             loadedViews[index] === targetView,
             verticalPageStates[index]?.isReady == true
         else {
-            return false
+            return .rejected(
+                validate() ?? .spreadNotLoaded,
+                mayHaveMutated: false,
+                stage: .verification
+            )
         }
 
         if currentIndex != index {
             setCurrentIndex(index)
         }
         guard
+            validate() == nil,
             loadedViews[index] === targetView,
             let frame = frameForView(at: index)
         else {
-            return false
+            return .rejected(
+                validate() ?? .spreadNotLoaded,
+                mayHaveMutated: true,
+                stage: .paginationTransition
+            )
         }
 
         let maximumLocalY = max(0, frame.height - effectiveViewport.height)
@@ -993,8 +1496,15 @@ final class PaginationView: UIView, Loggable {
         } else {
             updateOffset()
         }
+        if let result = validate() {
+            return .rejected(
+                result,
+                mayHaveMutated: true,
+                stage: .paginationTransition
+            )
+        }
         scheduleViewportUpdate()
-        return true
+        return .init(result: .applied, mayHaveMutated: true)
     }
 
     private func discardProvisionalVerticalPage(at index: Int) {
@@ -1074,7 +1584,16 @@ final class PaginationView: UIView, Loggable {
         waiters.forEach { $0.continuation.resume(returning: result) }
     }
 
-    private func slideToView(at index: Int, location: PageLocation, animated: Bool) async {
+    private func slideToView(
+        at index: Int,
+        location: PageLocation,
+        animated: Bool,
+        operation: NavigationOperationToken,
+        generation expectedGeneration: UInt64
+    ) async -> NavigationResult {
+        if let result = operation.check(paginationGeneration: expectedGeneration) {
+            return result
+        }
         let fromOffset = scrollView.contentOffset
         let targetOffset = CGPoint(x: xOffsetForIndex(index), y: fromOffset.y)
         let translationX = fromOffset.x - targetOffset.x
@@ -1098,10 +1617,15 @@ final class PaginationView: UIView, Loggable {
 
         defer {
             snapshot?.removeFromSuperview()
-            isAnimatingContentOffset = false
-            restoreScrollInteraction()
+            if generation == expectedGeneration {
+                isAnimatingContentOffset = false
+                restoreScrollInteraction()
+            }
         }
 
+        if let result = operation.check(paginationGeneration: expectedGeneration) {
+            return result
+        }
         setCurrentIndex(index, location: location)
 
         scrollView.contentOffset = fromOffset
@@ -1114,45 +1638,54 @@ final class PaginationView: UIView, Loggable {
         } else {
             scrollView.contentOffset = targetOffset
         }
+        if let result = operation.check(paginationGeneration: expectedGeneration) {
+            return result
+        }
 
         // There are visual glitches when scrolling web views into view.
         // To prevent these, we wait a few ms before removing the snapshot.
         // See https://github.com/readium/swift-toolkit/issues/737#issuecomment-4090386881
         if !animated {
             try? await Task.sleep(seconds: 0.1)
+            if let result = operation.check(paginationGeneration: expectedGeneration) {
+                return result
+            }
         }
+        return .applied
     }
 
-    private func fadeToView(at index: Int, location: PageLocation, animated: Bool) async {
-        func fade(to alpha: CGFloat) async {
+    private func fadeToView(
+        at index: Int,
+        location: PageLocation,
+        animated: Bool,
+        operation: NavigationOperationToken,
+        generation expectedGeneration: UInt64
+    ) async -> NavigationResult {
+        func fade(to alpha: CGFloat) async -> NavigationResult {
+            if let result = operation.check(paginationGeneration: expectedGeneration) {
+                return result
+            }
             await animate(duration: animated ? 0.15 : 0) {
                 self.alpha = alpha
             }
+            return operation.check(paginationGeneration: expectedGeneration) ?? .applied
         }
 
-        await fade(to: 0)
-        await scrollToView(at: index, location: location, animated: false)
-        await fade(to: 1)
-    }
-
-    private func scrollToView(at index: Int, location: PageLocation, animated: Bool) async {
-        guard currentIndex != index else {
-            if let view = currentView {
-                await view.go(to: location, animated: animated)
-            }
-            return
+        let fadedOut = await fade(to: 0)
+        guard fadedOut.isApplied else { return fadedOut }
+        if let result = operation.check(paginationGeneration: expectedGeneration) {
+            return result
         }
-
         restoreScrollInteraction()
         setCurrentIndex(index, location: location)
-
         scrollView.scrollRectToVisible(CGRect(
             origin: CGPoint(
                 x: xOffsetForIndex(index),
                 y: scrollView.contentOffset.y
             ),
             size: scrollView.frame.size
-        ), animated: animated)
+        ), animated: false)
+        return await fade(to: 1)
     }
 
     private func animate(duration: TimeInterval, animations: @escaping () -> Void) async {
@@ -1219,6 +1752,7 @@ extension PaginationView: UIScrollViewDelegate {
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        viewportRevision &+= 1
         guard axis == .verticalContinuous, !isUpdatingVerticalLayout else {
             return
         }

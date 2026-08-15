@@ -276,6 +276,33 @@ struct EPUBPageTurnSnapshotTests {
         #expect(spread.progression == spread.originalProgression)
     }
 
+    @Test("operation deadline releases a settle waiter without releasing the capture lease")
+    func operationDeadlineReleasesSettleWaiter() async {
+        let provider = EPUBPageTurnSnapshotProvider()
+        let spread = FakeSnapshotSpread(pageIndex: 1)
+        spread.isCaptureBlocked = true
+        spread.requiredRestoreFrames = 1
+        let captureTask = Task { try? await capture(with: provider, spread: spread) }
+        #expect(await waitUntil { spread.captureCount == 1 })
+
+        let executor = NavigationOperationExecutor { _, _ in }
+        let result = await executor.submit(
+            intent: .absolute("snapshot-settle"),
+            timeout: .milliseconds(20)
+        ) { operation in
+            await provider.settle(operation: operation)
+        }
+
+        #expect(result.isTimedOut)
+        #expect(!provider.isIdle)
+        #expect(executor.activeOperationCountForTesting == 0)
+
+        spread.isCaptureBlocked = false
+        spread.allowedRestoreFrames = 1
+        _ = await captureTask.value
+        #expect(provider.isIdle)
+    }
+
     @Test("capture error is settled only after completed restore")
     func settleAfterCaptureError() async {
         let provider = EPUBPageTurnSnapshotProvider()
@@ -356,6 +383,32 @@ struct EPUBPageTurnSnapshotTests {
         #expect(provider.isIdle)
     }
 
+    @Test("executor-owned deferred mutations queue while an earlier mutation is active")
+    func overlappingDeferredMutationsRunSerially() async {
+        let provider = EPUBPageTurnSnapshotProvider()
+        var events: [String] = []
+        var releaseFirst = false
+
+        provider.performDeferredMutation {
+            events.append("first:start")
+            while !releaseFirst {
+                await Task.yield()
+            }
+            events.append("first:end")
+        }
+        #expect(await waitUntil { events == ["first:start"] })
+
+        provider.performDeferredMutation {
+            events.append("second")
+        }
+        #expect(!provider.isIdle)
+        releaseFirst = true
+        await provider.settle()
+
+        #expect(events == ["first:start", "first:end", "second"])
+        #expect(provider.isIdle)
+    }
+
     @Test("selection and active media independently suppress capture without mutations")
     func selectionAndMediaIndependentlySuppressCapture() async throws {
         let selected = FakeSnapshotSpread(pageIndex: 1, hasSelection: true)
@@ -420,7 +473,7 @@ struct EPUBPageTurnSnapshotTests {
     private func waitUntil(
         _ condition: @escaping @MainActor () -> Bool
     ) async -> Bool {
-        for _ in 0 ..< 5_000 {
+        for _ in 0 ..< 5000 {
             if condition() { return true }
             await Task.yield()
         }
@@ -512,7 +565,9 @@ private final class FakeSnapshotSpread {
         events.append("restore-offset")
         if requiredRestoreFrames > 0 {
             for frame in 1 ... requiredRestoreFrames {
-                while allowedRestoreFrames < frame { await Task.yield() }
+                while allowedRestoreFrames < frame {
+                    await Task.yield()
+                }
                 completedRestoreFrames = frame
                 events.append("frame-\(frame)")
             }

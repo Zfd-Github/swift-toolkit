@@ -5,12 +5,34 @@
 //
 
 @testable import ReadiumNavigator
+import ReadiumShared
 import Testing
 import UIKit
 
 @MainActor
 private final class StubPageView: UIView, PageView {
-    func go(to location: PageLocation, animated: Bool) async {}
+    var navigationResult: NavigationResult = .applied
+
+    func go(
+        to location: PageLocation,
+        animated: Bool,
+        waitForLoad: Bool
+    ) async -> Bool {
+        true
+    }
+
+    func go(
+        to location: PageLocation,
+        animated: Bool,
+        waitForLoad: Bool,
+        operation: NavigationOperation
+    ) async -> NavigationMutationResult {
+        .init(
+            result: navigationResult,
+            mayHaveMutated: true,
+            failureStage: navigationResult.isApplied ? nil : .pageViewMutation
+        )
+    }
 }
 
 @MainActor
@@ -87,11 +109,35 @@ private final class SuspendedPageView: UIView, PageView {
     private var continuation: CheckedContinuation<Void, Never>?
     private(set) var goCallCount = 0
 
-    func go(to location: PageLocation, animated: Bool) async {
+    func go(
+        to location: PageLocation,
+        animated: Bool,
+        waitForLoad: Bool
+    ) async -> Bool {
         goCallCount += 1
+        guard waitForLoad else { return false }
         await withCheckedContinuation { continuation in
             self.continuation = continuation
         }
+        return true
+    }
+
+    func go(
+        to location: PageLocation,
+        animated: Bool,
+        waitForLoad: Bool,
+        operation: NavigationOperation
+    ) async -> NavigationMutationResult {
+        let applied = await go(
+            to: location,
+            animated: animated,
+            waitForLoad: waitForLoad
+        )
+        return .init(
+            result: operation.check() ?? (applied ? .applied : .spreadNotLoaded),
+            mayHaveMutated: true,
+            failureStage: applied ? nil : .pageViewMutation
+        )
     }
 
     func resume() {
@@ -141,6 +187,246 @@ private final class NavigationResultRecorder {
 
 @MainActor
 struct PaginationViewTests {
+    @Test("an expired fade cannot select its target after the animation continuation resumes")
+    func expiredFadeDoesNotSelectTargetAfterContinuationResumes() async {
+        let pageCount = 4
+        let delegate = StubPaginationDelegate(pageCount: pageCount)
+        let paginationView = PaginationView(
+            frame: CGRect(x: 0, y: 0, width: 320, height: 500),
+            preloadPreviousPositionCount: pageCount,
+            preloadNextPositionCount: pageCount,
+            isScrollEnabled: true
+        )
+        paginationView.delegate = delegate
+        let window = UIWindow(frame: paginationView.bounds)
+        window.addSubview(paginationView)
+        window.isHidden = false
+        defer {
+            window.isHidden = true
+            withExtendedLifetime(delegate) {}
+        }
+        paginationView.reloadAtIndex(
+            0,
+            location: .start,
+            pageCount: pageCount,
+            readingProgression: .ltr
+        )
+        await waitUntil { paginationView.loadedViews.count == pageCount }
+        paginationView.layoutIfNeeded()
+        let operation = NavigationOperation(
+            operationID: 1,
+            intent: .absolute("fade-target"),
+            timeout: .milliseconds(20)
+        )
+
+        let outcome = await paginationView.goToIndexWithMutation(
+            3,
+            location: .start,
+            options: .init(animated: true),
+            operation: operation
+        )
+
+        #expect(outcome.result.isTimedOut)
+        #expect(paginationView.currentIndex == 0)
+    }
+
+    @Test("an isolated cold-target operation cannot roll back a replacement generation")
+    func isolatedColdTargetCannotRollBackReplacementGeneration() async {
+        let pageCount = 3
+        let delegate = LoadingPaginationDelegate(pageCount: pageCount, suspendedIndex: 1)
+        let paginationView = PaginationView(
+            frame: CGRect(x: 0, y: 0, width: 320, height: 500),
+            preloadPreviousPositionCount: 0,
+            preloadNextPositionCount: 0,
+            isScrollEnabled: true
+        )
+        paginationView.delegate = delegate
+        let window = UIWindow(frame: paginationView.bounds)
+        window.addSubview(paginationView)
+        window.isHidden = false
+        defer {
+            window.isHidden = true
+            withExtendedLifetime(delegate) {}
+        }
+        paginationView.reloadAtIndex(
+            0,
+            location: .start,
+            pageCount: pageCount,
+            readingProgression: .ltr
+        )
+        await nextMainRunLoop()
+        await nextMainRunLoop()
+        #expect(paginationView.loadedViews[0] != nil)
+        let operation = NavigationOperation(
+            operationID: 2,
+            intent: .absolute("cold-target"),
+            timeout: .seconds(1)
+        )
+        let staleNavigation = Task { @MainActor in
+            await paginationView.goToIndexWithMutation(
+                1,
+                location: .start,
+                options: .none,
+                operation: operation
+            )
+        }
+        for _ in 0 ..< 100 where delegate.suspendedView.goCallCount < 2 {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        #expect(delegate.suspendedView.goCallCount == 2)
+        #expect(paginationView.currentIndex == 1)
+
+        operation.cancel()
+        paginationView.isolateForDeferredReload(with: .timedOut)
+        paginationView.reloadAtIndex(
+            2,
+            location: .start,
+            pageCount: pageCount,
+            readingProgression: .ltr
+        )
+        await nextMainRunLoop()
+        await nextMainRunLoop()
+        #expect(paginationView.currentIndex == 2)
+
+        delegate.suspendedView.resume()
+        let outcome = await staleNavigation.value
+
+        #expect(outcome.result.isCancelled)
+        #expect(paginationView.currentIndex == 2)
+    }
+
+    @Test("an expired vertical offset resolution cannot commit its target")
+    func expiredVerticalOffsetResolutionDoesNotCommitTarget() async throws {
+        let (paginationView, delegate) = await makePagination(
+            pageCount: 5,
+            currentIndex: 1,
+            preloadPreviousPositionCount: 1,
+            preloadNextPositionCount: 1
+        )
+        defer { withExtendedLifetime(delegate) {} }
+        for index in 0 ... 2 {
+            paginationView.setVerticalPageHeight(600, isReady: true, at: index)
+        }
+        paginationView.layoutIfNeeded()
+        // Let reloadAtIndex's initialization task leave navigateVertically
+        // before installing the single-continuation resolver used below.
+        await nextMainRunLoop()
+        await nextMainRunLoop()
+        let originalOffset = try #require(outerScrollView(in: paginationView)).contentOffset
+        let resolver = SuspendedVerticalOffsetResolver()
+        delegate.verticalOffsetResolver = resolver.resolve
+        let operation = NavigationOperation(
+            operationID: 2,
+            intent: .absolute("vertical-target"),
+            timeout: .seconds(1)
+        )
+        let navigation = Task { @MainActor in
+            await paginationView.goToIndexWithMutation(
+                4,
+                location: .start,
+                options: .none,
+                operation: operation
+            )
+        }
+        await waitUntil { paginationView.loadedViews[4] != nil }
+        paginationView.setVerticalPageHeight(600, isReady: true, at: 4)
+        await waitUntil { resolver.isResolving }
+
+        operation.cancel()
+        resolver.resume(returning: 0)
+        let outcome = await navigation.value
+
+        #expect(outcome.result.isCancelled)
+        #expect(paginationView.currentIndex == 1)
+        #expect(try #require(outerScrollView(in: paginationView)).contentOffset == originalOffset)
+    }
+
+    @Test("explicit navigation propagates an adjacent page failure")
+    func explicitNavigationPropagatesAdjacentFailure() async {
+        let (paginationView, delegate, window) = await makeHorizontalPagination()
+        defer {
+            window.isHidden = true
+            withExtendedLifetime(delegate) {}
+        }
+        delegate.views[2]?.navigationResult = .spreadNotLoaded
+        let operation = NavigationOperation(
+            operationID: 1,
+            intent: .absolute("test"),
+            timeout: .seconds(1)
+        )
+
+        let outcome = await paginationView.goToIndexWithMutation(
+            2,
+            location: .start,
+            options: .none,
+            operation: operation
+        )
+
+        let result = outcome.result
+        #expect(!result.isApplied)
+        #expect(outcome.mayHaveMutated)
+        #expect(outcome.stableLocator == nil)
+        #expect(!outcome.stableVerified)
+        #expect(outcome.failureStage == .pageViewMutation)
+        if case .spreadNotLoaded = result {
+            // Expected.
+        } else {
+            Issue.record("Expected spreadNotLoaded, got \(result)")
+        }
+        #expect(paginationView.currentIndex == 1)
+    }
+
+    @Test("reload supersedes a token bound to an older pagination generation")
+    func reloadSupersedesStalePaginationToken() async {
+        let (paginationView, delegate, window) = await makeHorizontalPagination()
+        defer {
+            window.isHidden = true
+            withExtendedLifetime(delegate) {}
+        }
+        let operation = NavigationOperation(
+            operationID: 1,
+            intent: .absolute("test"),
+            timeout: .seconds(1)
+        )
+        operation.bindPaginationGeneration(paginationView.generation)
+        paginationView.reloadAtIndex(
+            0,
+            location: .start,
+            pageCount: 3,
+            readingProgression: .ltr
+        )
+
+        let outcome = await paginationView.goToIndexWithMutation(
+            2,
+            location: .start,
+            options: .none,
+            operation: operation
+        )
+
+        #expect(outcome.result.isSuperseded)
+        #expect(!outcome.mayHaveMutated)
+        #expect(outcome.failureStage == .preflight)
+        #expect(paginationView.currentIndex == 0)
+    }
+
+    @Test("detaching a poisoned page invalidates the pagination generation")
+    func detachingPoisonedPageInvalidatesGeneration() async throws {
+        let (paginationView, delegate, window) = await makeHorizontalPagination()
+        defer {
+            window.isHidden = true
+            withExtendedLifetime(delegate) {}
+        }
+        let view = try #require(paginationView.loadedViews[1])
+        let previousGeneration = paginationView.generation
+
+        #expect(paginationView.detachPoisonedView(view, at: 1))
+
+        #expect(paginationView.loadedViews[1] == nil)
+        #expect(paginationView.generation > previousGeneration)
+        #expect(view.superview == nil)
+        #expect(!paginationView.detachPoisonedView(view, at: 1))
+    }
+
     @Test("continuous resources use measured heights and can share the viewport")
     func continuousGeometry() async throws {
         let (paginationView, delegate) = await makePagination(pageCount: 3, currentIndex: 1)
@@ -368,6 +654,72 @@ struct PaginationViewTests {
         )
     }
 
+    @Test("non-waiting horizontal relocation reports an unready current page")
+    func nonWaitingHorizontalRelocationReportsNotReady() async {
+        let delegate = LoadingPaginationDelegate(pageCount: 1, suspendedIndex: 0)
+        let paginationView = PaginationView(
+            frame: CGRect(x: 0, y: 0, width: 320, height: 500),
+            preloadPreviousPositionCount: 0,
+            preloadNextPositionCount: 0,
+            isScrollEnabled: true
+        )
+        paginationView.delegate = delegate
+        paginationView.reloadAtIndex(
+            0,
+            location: .start,
+            pageCount: 1,
+            readingProgression: .ltr
+        )
+        await waitUntil { delegate.suspendedView.goCallCount == 1 }
+
+        let moved = await paginationView.goToIndex(
+            0,
+            location: .start,
+            options: .none,
+            waitForLoad: false
+        )
+
+        #expect(!moved.result.isApplied)
+        #expect(delegate.suspendedView.goCallCount == 2)
+        delegate.suspendedView.resume()
+        await waitUntil { delegate.viewsUpdateCount == 1 }
+    }
+
+    @Test("non-waiting horizontal relocation does not select an unready neighbor")
+    func nonWaitingHorizontalRelocationRejectsUnreadyNeighbor() async {
+        let delegate = LoadingPaginationDelegate(pageCount: 2, suspendedIndex: 1)
+        let paginationView = PaginationView(
+            frame: CGRect(x: 0, y: 0, width: 320, height: 500),
+            preloadPreviousPositionCount: 0,
+            preloadNextPositionCount: 1,
+            isScrollEnabled: true
+        )
+        paginationView.delegate = delegate
+        paginationView.reloadAtIndex(
+            0,
+            location: .start,
+            pageCount: 2,
+            readingProgression: .ltr
+        )
+        await waitUntil {
+            paginationView.loadedViews[1] === delegate.suspendedView
+                && delegate.suspendedView.goCallCount == 1
+        }
+
+        let moved = await paginationView.goToIndex(
+            1,
+            location: .start,
+            options: .none,
+            waitForLoad: false
+        )
+
+        #expect(!moved.result.isApplied)
+        #expect(paginationView.currentIndex == 0)
+        #expect(delegate.suspendedView.goCallCount == 2)
+        delegate.suspendedView.resume()
+        await waitUntil { delegate.viewsUpdateCount == 1 }
+    }
+
     @Test("snapshot exposure reveals and restores a ready neighbor without navigation")
     func snapshotExposureRestoresWithoutNavigation() async throws {
         let (paginationView, delegate, window) = await makeHorizontalPagination()
@@ -420,6 +772,38 @@ struct PaginationViewTests {
         #expect(scrollView.panGestureRecognizer.isEnabled)
         #expect(delegate.viewsUpdateCount == originalViewsUpdateCount)
         #expect(delegate.viewportUpdateCount == originalViewportUpdateCount)
+    }
+
+    @Test("stale snapshot restore cannot overwrite a replacement pagination generation")
+    func staleSnapshotExposureCannotRestoreAfterIsolation() async throws {
+        let (paginationView, delegate, window) = await makeHorizontalPagination()
+        defer {
+            window.isHidden = true
+            withExtendedLifetime(delegate) {}
+        }
+        let scrollView = try #require(outerScrollView(in: paginationView))
+        let exposure = try #require(
+            await paginationView.exposeReadyViewForPageTurnSnapshot(at: 0)
+        )
+
+        paginationView.isolateForDeferredReload(with: .timedOut)
+        paginationView.reloadAtIndex(
+            0,
+            location: .start,
+            pageCount: delegate.views.count,
+            readingProgression: .ltr
+        )
+        paginationView.layoutIfNeeded()
+        scrollView.setContentOffset(
+            CGPoint(x: scrollView.contentOffset.x + 17, y: scrollView.contentOffset.y),
+            animated: false
+        )
+        let replacementOffset = scrollView.contentOffset
+
+        await paginationView.restorePageTurnSnapshotExposure(exposure)
+
+        #expect(paginationView.currentIndex == 0)
+        #expect(scrollView.contentOffset == replacementOffset)
     }
 
     @Test("a thrown snapshot capture restores the exposed neighbor before lease release")
@@ -533,6 +917,32 @@ struct PaginationViewTests {
         #expect(delegate.viewportUpdateCount == 1)
     }
 
+    @Test("vertical locator verification compares the outer viewport offset")
+    func verticalLocatorVerificationUsesOuterViewportOffset() async throws {
+        let (paginationView, delegate) = await makePagination(pageCount: 1, currentIndex: 0)
+        delegate.verticalOffsetResolver = { _, _ in 1000 }
+        paginationView.setVerticalPageHeight(2000, isReady: true, at: 0)
+        paginationView.layoutIfNeeded()
+
+        let locator = Locator(
+            href: AnyURL(string: "chapter.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(progression: 0.5)
+        )
+        #expect(await !paginationView.isAtVerticalLocation(.locator(locator), at: 0))
+
+        #expect(await (paginationView.goToIndex(
+            0,
+            location: .locator(locator),
+            options: .init(animated: false)
+        )).result.isApplied)
+        #expect(await paginationView.isAtVerticalLocation(.locator(locator), at: 0))
+
+        let scrollView = try #require(outerScrollView(in: paginationView))
+        scrollView.contentOffset.y = 500
+        #expect(await !paginationView.isAtVerticalLocation(.locator(locator), at: 0))
+    }
+
     @Test("backward navigation aligns the previous resource end inside the effective viewport")
     func backwardNavigationKeepsPreviousResourceEndVisible() async throws {
         let (paginationView, delegate) = await makePagination(pageCount: 2, currentIndex: 1)
@@ -559,7 +969,7 @@ struct PaginationViewTests {
         )
 
         let scrollView = try #require(outerScrollView(in: paginationView))
-        #expect(moved)
+        #expect(moved.result.isApplied)
         #expect(scrollView.contentOffset.y == 530)
         #expect(paginationView.visibleIndices == [0])
         #expect(paginationView.visibleFrame(at: 0) == CGRect(x: 0, y: 550, width: 320, height: 450))
@@ -594,21 +1004,21 @@ struct PaginationViewTests {
 
         let cancelledRecorder = NavigationResultRecorder()
         let cancelledTask = Task { @MainActor in
-            cancelledRecorder.result = await paginationView.goToIndex(
+            cancelledRecorder.result = await (paginationView.goToIndex(
                 1,
                 location: .start,
                 options: .init(animated: false)
-            )
+            )).result.isApplied
         }
         await nextMainRunLoop()
 
         let readyRecorder = NavigationResultRecorder()
         let readyTask = Task { @MainActor in
-            readyRecorder.result = await paginationView.goToIndex(
+            readyRecorder.result = await (paginationView.goToIndex(
                 1,
                 location: .start,
                 options: .init(animated: false)
-            )
+            )).result.isApplied
         }
         await nextMainRunLoop()
 
@@ -645,7 +1055,7 @@ struct PaginationViewTests {
             options: .init(animated: false)
         )
 
-        #expect(firstResult == false)
+        #expect(!firstResult.result.isApplied)
         #expect(paginationView.currentIndex == 0)
         #expect(paginationView.currentView === delegate.views[0])
         #expect(paginationView.frameForView(at: 0) == originalFrame)
@@ -655,11 +1065,11 @@ struct PaginationViewTests {
 
         let recorder = NavigationResultRecorder()
         let navigationTask = Task { @MainActor in
-            recorder.result = await paginationView.goToIndex(
+            recorder.result = await (paginationView.goToIndex(
                 1,
                 location: .start,
                 options: .init(animated: false)
-            )
+            )).result.isApplied
         }
 
         await waitUntil { paginationView.loadedViews[1] != nil }
@@ -688,11 +1098,11 @@ struct PaginationViewTests {
 
         let recorder = NavigationResultRecorder()
         let navigationTask = Task { @MainActor in
-            recorder.result = await paginationView.goToIndex(
+            recorder.result = await (paginationView.goToIndex(
                 4,
                 location: .start,
                 options: .init(animated: false)
-            )
+            )).result.isApplied
         }
         await waitUntil { paginationView.loadedViews[4] != nil }
 
@@ -711,7 +1121,7 @@ struct PaginationViewTests {
     }
 
     @Test("a nil vertical offset preserves the current window and the target can be retried")
-    func nilVerticalOffsetDoesNotCommit() async throws {
+    func nilVerticalOffsetDoesNotCommit() async {
         let (paginationView, delegate) = await makePagination(
             pageCount: 5,
             currentIndex: 1,
@@ -741,7 +1151,7 @@ struct PaginationViewTests {
         await waitUntil { paginationView.loadedViews[4] != nil }
         paginationView.setVerticalPageHeight(600, isReady: true, at: 4)
 
-        #expect(await failedNavigation.value == false)
+        #expect(await !(failedNavigation.value).result.isApplied)
         #expect(paginationView.currentIndex == 1)
         #expect(paginationView.currentView === delegate.views[1])
         #expect(paginationView.loadedViews.keys.sorted() == originalLoadedIndices)
@@ -761,7 +1171,7 @@ struct PaginationViewTests {
         await waitUntil { paginationView.loadedViews[4] != nil }
         paginationView.setVerticalPageHeight(600, isReady: true, at: 4)
 
-        #expect(await retry.value == true)
+        #expect(await (retry.value).result.isApplied)
         #expect(paginationView.currentIndex == 4)
         #expect(paginationView.currentView === delegate.views[4])
     }
@@ -802,7 +1212,7 @@ struct PaginationViewTests {
         navigation.cancel()
         resolver.resume(returning: 0)
 
-        #expect(await navigation.value == false)
+        #expect(await !(navigation.value).result.isApplied)
         #expect(paginationView.currentIndex == 1)
         #expect(paginationView.currentView === delegate.views[1])
         #expect(paginationView.loadedViews.keys.sorted() == originalLoadedIndices)
@@ -822,12 +1232,12 @@ struct PaginationViewTests {
         await waitUntil { paginationView.loadedViews[4] != nil }
         paginationView.setVerticalPageHeight(600, isReady: true, at: 4)
 
-        #expect(await retry.value == true)
+        #expect(await (retry.value).result.isApplied)
         #expect(paginationView.currentIndex == 4)
     }
 
     @Test("a thrown vertical offset resolution preserves the current window and permits retry")
-    func thrownVerticalOffsetDoesNotCommit() async throws {
+    func thrownVerticalOffsetDoesNotCommit() async {
         let (paginationView, delegate) = await makePagination(
             pageCount: 5,
             currentIndex: 1,
@@ -859,7 +1269,7 @@ struct PaginationViewTests {
         await waitUntil { paginationView.loadedViews[4] != nil }
         paginationView.setVerticalPageHeight(600, isReady: true, at: 4)
 
-        #expect(await failedNavigation.value == false)
+        #expect(await !(failedNavigation.value).result.isApplied)
         #expect(paginationView.currentIndex == 1)
         #expect(paginationView.currentView === delegate.views[1])
         #expect(paginationView.loadedViews.keys.sorted() == originalLoadedIndices)
@@ -879,7 +1289,7 @@ struct PaginationViewTests {
         await waitUntil { paginationView.loadedViews[4] != nil }
         paginationView.setVerticalPageHeight(600, isReady: true, at: 4)
 
-        #expect(await retry.value == true)
+        #expect(await (retry.value).result.isApplied)
         #expect(paginationView.currentIndex == 4)
     }
 

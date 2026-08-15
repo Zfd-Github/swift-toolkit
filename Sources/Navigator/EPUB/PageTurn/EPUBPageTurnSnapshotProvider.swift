@@ -40,8 +40,12 @@ final class EPUBPageTurnSnapshotProvider {
     private var hasCaptureLease = false
     private var leaseWaiters: [CheckedContinuation<Void, Never>] = []
     private var settleWaiters: [CheckedContinuation<Void, Never>] = []
+    private var operationSettleWaiters: [UUID: CheckedContinuation<NavigationResult, Never>] = [:]
+    private var operationCaptureSettleWaiters: [UUID: CheckedContinuation<NavigationResult, Never>] = [:]
     private var idleWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var activeCaptureTask: Task<UIImage, Error>?
+    private var activeDeferredMutationTask: Task<Void, Never>?
+    private var pendingDeferredMutation: (@MainActor () async -> Void)?
     private var cancellationGeneration: UInt64 = 0
 
     private var deferredReload: (() -> Void)?
@@ -49,11 +53,21 @@ final class EPUBPageTurnSnapshotProvider {
     private var deferredPageTurnInteraction: (() -> Void)?
 
     var isIdle: Bool {
-        !hasCaptureLease && leaseWaiters.isEmpty && !hasDeferredMutations
+        !hasCaptureLease
+            && leaseWaiters.isEmpty
+            && !hasDeferredMutations
+            && activeDeferredMutationTask == nil
+            && pendingDeferredMutation == nil
     }
 
     var isInputEnabled: Bool {
         isIdle
+    }
+
+    private var isCaptureRestored: Bool {
+        !hasCaptureLease
+            && leaseWaiters.isEmpty
+            && !hasDeferredMutations
     }
 
     var cacheCount: Int {
@@ -112,11 +126,94 @@ final class EPUBPageTurnSnapshotProvider {
         drainDeferredMutationsIfPossible()
     }
 
+    /// Extends the snapshot barrier across an asynchronous mutation which was
+    /// released by one of the deferred callbacks above. `settle()` must not
+    /// report idle merely because an executor request was enqueued.
+    func performDeferredMutation(_ mutation: @escaping @MainActor () async -> Void) {
+        guard activeDeferredMutationTask == nil else {
+            pendingDeferredMutation = mutation
+            return
+        }
+        activeDeferredMutationTask = Task { @MainActor [weak self] in
+            await mutation()
+            guard let self else { return }
+            activeDeferredMutationTask = nil
+            if let pendingDeferredMutation {
+                self.pendingDeferredMutation = nil
+                performDeferredMutation(pendingDeferredMutation)
+                return
+            }
+            drainDeferredMutationsIfPossible()
+        }
+    }
+
     func settle() async {
         cancelActiveCapture()
         guard !isIdle else { return }
         await withCheckedContinuation { continuation in
             settleWaiters.append(continuation)
+        }
+    }
+
+    /// Waits for snapshot restoration without allowing a stuck capture to hold
+    /// a navigation operation beyond its absolute deadline.
+    func settle(operation: NavigationOperationToken) async -> NavigationResult {
+        if isIdle {
+            return operation.check() ?? .applied
+        }
+        if let result = operation.check() { return result }
+        cancelActiveCapture()
+        let id = UUID()
+        return await withTaskGroup(of: NavigationResult.self) { group in
+            group.addTask { @MainActor [weak self] in
+                guard let self else { return .cancelled }
+                return await withCheckedContinuation { continuation in
+                    if self.isIdle {
+                        continuation.resume(returning: operation.check() ?? .applied)
+                    } else {
+                        self.operationSettleWaiters[id] = continuation
+                    }
+                }
+            }
+            group.addTask { @MainActor in
+                await operation.waitForCancellation()
+            }
+            let result = await group.next() ?? .cancelled
+            cancelOperationSettleWaiter(id, with: result)
+            group.cancelAll()
+            return result
+        }
+    }
+
+    /// Waits only for the capture hierarchy to be restored. Deferred mutations
+    /// are submitted to the navigation executor and can safely remain queued
+    /// behind the operation which is calling this method. Waiting for their
+    /// tasks here would deadlock when they are queued on that same executor.
+    func settleCapture(operation: NavigationOperationToken) async -> NavigationResult {
+        if isCaptureRestored {
+            return operation.check() ?? .applied
+        }
+        if let result = operation.check() { return result }
+        cancelActiveCapture()
+        let id = UUID()
+        return await withTaskGroup(of: NavigationResult.self) { group in
+            group.addTask { @MainActor [weak self] in
+                guard let self else { return .cancelled }
+                return await withCheckedContinuation { continuation in
+                    if self.isCaptureRestored {
+                        continuation.resume(returning: operation.check() ?? .applied)
+                    } else {
+                        self.operationCaptureSettleWaiters[id] = continuation
+                    }
+                }
+            }
+            group.addTask { @MainActor in
+                await operation.waitForCancellation()
+            }
+            let result = await group.next() ?? .cancelled
+            cancelOperationCaptureSettleWaiter(id, with: result)
+            group.cancelAll()
+            return result
         }
     }
 
@@ -266,17 +363,42 @@ final class EPUBPageTurnSnapshotProvider {
     }
 
     private func resumeWaitersIfIdle() {
+        resumeCaptureWaitersIfIdle()
         guard isIdle else { return }
         let waiters = settleWaiters
         settleWaiters.removeAll()
         waiters.forEach { $0.resume() }
+        let operationWaiters = operationSettleWaiters.values
+        operationSettleWaiters.removeAll()
+        operationWaiters.forEach { $0.resume(returning: .applied) }
         let idleWaiters = Array(idleWaiters.values)
         self.idleWaiters.removeAll()
         idleWaiters.forEach { $0.resume() }
     }
 
+    private func resumeCaptureWaitersIfIdle() {
+        guard isCaptureRestored else { return }
+        let operationWaiters = operationCaptureSettleWaiters.values
+        operationCaptureSettleWaiters.removeAll()
+        operationWaiters.forEach { $0.resume(returning: .applied) }
+    }
+
     private func cancelIdleWaiter(_ id: UUID) {
         idleWaiters.removeValue(forKey: id)?.resume()
+    }
+
+    private func cancelOperationSettleWaiter(
+        _ id: UUID,
+        with result: NavigationResult
+    ) {
+        operationSettleWaiters.removeValue(forKey: id)?.resume(returning: result)
+    }
+
+    private func cancelOperationCaptureSettleWaiter(
+        _ id: UUID,
+        with result: NavigationResult
+    ) {
+        operationCaptureSettleWaiters.removeValue(forKey: id)?.resume(returning: result)
     }
 
     private func store(_ image: UIImage, for key: CacheKey) {

@@ -124,9 +124,9 @@ final class NavigationStressTests: XCTestCase {
             return (String(parts[0]), value)
         }
         let values = Dictionary(uniqueKeysWithValues: pairs)
-        return (
-            offsetY: try XCTUnwrap(values["offsetY"]),
-            viewportHeight: try XCTUnwrap(values["viewportHeight"])
+        return try (
+            offsetY: XCTUnwrap(values["offsetY"]),
+            viewportHeight: XCTUnwrap(values["viewportHeight"])
         )
     }
 }

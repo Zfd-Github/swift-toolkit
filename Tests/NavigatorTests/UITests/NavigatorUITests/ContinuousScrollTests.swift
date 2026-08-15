@@ -383,17 +383,17 @@ final class ContinuousScrollTests: XCTestCase {
     private func locationUpdate(from marker: String) throws -> (revision: Int, locator: String) {
         let separator = try XCTUnwrap(marker.firstIndex(of: "|"))
         let revision = marker[..<separator].dropFirst(2)
-        return (
-            revision: try XCTUnwrap(Int(revision)),
+        return try (
+            revision: XCTUnwrap(Int(revision)),
             locator: String(marker[marker.index(after: separator)...])
         )
     }
 
     private func metrics(from marker: String) throws -> (y: Double, height: Double) {
         let values = metricsValues(from: marker)
-        return (
-            y: try XCTUnwrap(values["y"]),
-            height: try XCTUnwrap(values["h"])
+        return try (
+            y: XCTUnwrap(values["y"]),
+            height: XCTUnwrap(values["h"])
         )
     }
 
@@ -417,11 +417,11 @@ final class ContinuousScrollTests: XCTestCase {
             return (String(parts[0]), value)
         }
         let values = Dictionary(uniqueKeysWithValues: pairs)
-        return (
-            offsetY: try XCTUnwrap(values["offsetY"]),
-            viewportHeight: try XCTUnwrap(values["viewportHeight"]),
-            documentHeight: try XCTUnwrap(values["documentHeight"]),
-            spreadHeight: try XCTUnwrap(values["spreadHeight"])
+        return try (
+            offsetY: XCTUnwrap(values["offsetY"]),
+            viewportHeight: XCTUnwrap(values["viewportHeight"]),
+            documentHeight: XCTUnwrap(values["documentHeight"]),
+            spreadHeight: XCTUnwrap(values["spreadHeight"])
         )
     }
 
@@ -432,11 +432,11 @@ final class ContinuousScrollTests: XCTestCase {
             return (String(parts[0]), value)
         }
         let values = Dictionary(uniqueKeysWithValues: pairs)
-        let rect = CGRect(
-            x: try XCTUnwrap(values["x"]),
-            y: try XCTUnwrap(values["y"]),
-            width: try XCTUnwrap(values["w"]),
-            height: try XCTUnwrap(values["h"])
+        let rect = try CGRect(
+            x: XCTUnwrap(values["x"]),
+            y: XCTUnwrap(values["y"]),
+            width: XCTUnwrap(values["w"]),
+            height: XCTUnwrap(values["h"])
         )
         let point = CGPoint(
             x: values["px"] ?? rect.midX,

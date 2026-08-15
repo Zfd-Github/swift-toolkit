@@ -13,6 +13,7 @@ import {
   documentHeight,
   removeProperty,
   resolveVerticalOffset,
+  locatorIsVisible,
   scrollLeft,
   scrollRight,
   scrollToId,
@@ -38,6 +39,7 @@ global.readium = {
   setViewportRect: setViewportRect,
   documentHeight: documentHeight,
   resolveVerticalOffset: resolveVerticalOffset,
+  locatorIsVisible: locatorIsVisible,
 
   // decoration
   registerDecorationTemplates: registerTemplates,

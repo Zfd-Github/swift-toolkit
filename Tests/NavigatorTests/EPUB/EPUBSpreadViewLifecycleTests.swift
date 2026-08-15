@@ -10,7 +10,7 @@ import Testing
 import UIKit
 
 @MainActor
-private final class LifecycleTestSpreadView: EPUBSpreadView {
+private class LifecycleTestSpreadView: EPUBSpreadView {
     override func loadSpread() {}
 
     func loadDocumentReportingSpreadLoaded() {
@@ -55,8 +55,132 @@ private final class LifecycleTestSpreadView: EPUBSpreadView {
 }
 
 @MainActor
+private final class SuspendingJavaScriptSpreadView: LifecycleTestSpreadView {
+    private var evaluationCompletions: [(Any?, Error?) -> Void] = []
+
+    var pendingEvaluationCount: Int {
+        evaluationCompletions.count
+    }
+
+    override var javaScriptEvaluationTimeout: TimeInterval {
+        0.05
+    }
+
+    override func beginJavaScriptEvaluation(
+        _ script: String,
+        completionHandler: @escaping (Any?, Error?) -> Void
+    ) {
+        evaluationCompletions.append(completionHandler)
+    }
+
+    func completeEvaluations(with error: Error = CancellationError()) {
+        let completions = evaluationCompletions
+        evaluationCompletions.removeAll()
+        completions.forEach { $0(nil, error) }
+    }
+}
+
+@MainActor
 @Suite(.serialized)
 struct EPUBSpreadViewLifecycleTests {
+    @Test("operation deadline bounds a JavaScript request and poisons its generation")
+    func operationDeadlinePoisonsJavaScriptGeneration() async {
+        let (spread, container) = await makeLoadedSuspendingSpreadView()
+        let originalGeneration = spread.webViewGeneration
+        let operation = NavigationOperation(
+            operationID: 7,
+            intent: .absolute("deadline"),
+            timeout: .milliseconds(20)
+        )
+
+        let result = await spread.evaluateScript(
+            "never-finishes",
+            operation: operation
+        )
+
+        #expect(result.result.isTimedOut)
+        #expect(spread.isPoisoned)
+        #expect(spread.webViewGeneration != originalGeneration)
+        #expect(spread.pendingEvaluationCount == 1)
+        spread.completeEvaluations()
+        await nextMainRunLoop()
+        #expect(spread.isPoisoned)
+        spread.clear()
+        withExtendedLifetime(container) {}
+    }
+
+    @Test("cancelling a submitted position mutation poisons its WebView generation")
+    func cancelledMutationPoisonsJavaScriptGeneration() async {
+        let (spread, container) = await makeLoadedSuspendingSpreadView()
+        let originalGeneration = spread.webViewGeneration
+        let operation = NavigationOperation(
+            operationID: 9,
+            intent: .absolute("cancelled-mutation"),
+            timeout: .seconds(1)
+        )
+
+        let evaluation = Task { @MainActor in
+            await spread.evaluateScript(
+                "window.scrollBy({ left: 320 });",
+                operation: operation,
+                effect: .positionMutation
+            )
+        }
+        #expect(await waitUntil { spread.pendingEvaluationCount == 1 })
+        evaluation.cancel()
+
+        #expect(await (evaluation.value).result.isCancelled)
+        #expect(spread.isPoisoned)
+        #expect(spread.webViewGeneration != originalGeneration)
+        spread.completeEvaluations()
+        spread.clear()
+        withExtendedLifetime(container) {}
+    }
+
+    @Test("cancelling a submitted read-only script keeps its WebView generation")
+    func cancelledReadOnlyScriptKeepsJavaScriptGeneration() async {
+        let (spread, container) = await makeLoadedSuspendingSpreadView()
+        let originalGeneration = spread.webViewGeneration
+        let operation = NavigationOperation(
+            operationID: 10,
+            intent: .absolute("cancelled-query"),
+            timeout: .seconds(1)
+        )
+
+        let evaluation = Task { @MainActor in
+            await spread.evaluateScript(
+                "readium.findFirstVisibleLocator()",
+                operation: operation,
+                effect: .readOnly
+            )
+        }
+        #expect(await waitUntil { spread.pendingEvaluationCount == 1 })
+        evaluation.cancel()
+
+        #expect(await (evaluation.value).result.isCancelled)
+        #expect(!spread.isPoisoned)
+        #expect(spread.webViewGeneration == originalGeneration)
+        spread.completeEvaluations()
+        spread.clear()
+        withExtendedLifetime(container) {}
+    }
+
+    @Test("operation deadline includes waiting for spread load")
+    func operationDeadlineIncludesSpreadLoad() async {
+        let spread = makeSpreadView()
+        let operation = NavigationOperation(
+            operationID: 8,
+            intent: .absolute("load-deadline"),
+            timeout: .milliseconds(20)
+        )
+
+        let result = await spread.evaluateScript("never-submitted", operation: operation)
+
+        #expect(result.result.isTimedOut)
+        #expect(spread.isPoisoned)
+        spread.clear()
+    }
+
     @Test("clear resumes existing and future callbacks exactly once")
     func clearResumesCallbacksExactlyOnce() async {
         let waitingSpread = makeSpreadView()
@@ -130,6 +254,122 @@ struct EPUBSpreadViewLifecycleTests {
         await evaluationTask.value
     }
 
+    @Test("task cancellation releases a pending JavaScript evaluation")
+    func cancellationReleasesPendingEvaluation() async {
+        let (spread, container) = await makeLoadedSuspendingSpreadView()
+        var result: Result<Any, Error>?
+        let evaluation = Task { @MainActor in
+            result = await spread.evaluateScript("never-calls-back")
+        }
+        #expect(await waitUntil { spread.pendingEvaluationCount == 1 })
+
+        evaluation.cancel()
+        let didFinish = await waitUntil(attempts: 50) { result != nil }
+        #expect(didFinish)
+        #expect(result?.isFailure == true)
+
+        if !didFinish {
+            spread.completeEvaluations()
+        }
+        await evaluation.value
+        spread.clear()
+        withExtendedLifetime(container) {}
+    }
+
+    @Test("clear releases every pending JavaScript evaluation")
+    func clearReleasesPendingEvaluations() async {
+        let (spread, container) = await makeLoadedSuspendingSpreadView()
+        var results: [Result<Any, Error>] = []
+        let first = Task { @MainActor in
+            await results.append(spread.evaluateScript("first"))
+        }
+        let second = Task { @MainActor in
+            await results.append(spread.evaluateScript("second"))
+        }
+        #expect(await waitUntil { spread.pendingEvaluationCount == 2 })
+
+        spread.clear()
+        let didFinish = await waitUntil(attempts: 50) { results.count == 2 }
+        #expect(didFinish)
+        let allFailed = results.allSatisfy(\.isFailure)
+        #expect(allFailed)
+
+        if !didFinish {
+            spread.completeEvaluations()
+        }
+        await first.value
+        await second.value
+        withExtendedLifetime(container) {}
+    }
+
+    @Test("WebContent termination releases pending JavaScript evaluation")
+    func webContentTerminationReleasesPendingEvaluation() async {
+        let (spread, container) = await makeLoadedSuspendingSpreadView()
+        var result: Result<Any, Error>?
+        let evaluation = Task { @MainActor in
+            result = await spread.evaluateScript("terminated")
+        }
+        #expect(await waitUntil { spread.pendingEvaluationCount == 1 })
+
+        spread.webViewWebContentProcessDidTerminate(spread.webView)
+        let didFinish = await waitUntil(attempts: 50) { result != nil }
+        #expect(didFinish)
+        #expect(result?.isFailure == true)
+
+        if !didFinish {
+            spread.completeEvaluations()
+        }
+        await evaluation.value
+        spread.clear()
+        withExtendedLifetime(container) {}
+    }
+
+    @Test("navigation failure releases pending JavaScript evaluation")
+    func navigationFailureReleasesPendingEvaluation() async {
+        let (spread, container) = await makeLoadedSuspendingSpreadView()
+        var result: Result<Any, Error>?
+        let evaluation = Task { @MainActor in
+            result = await spread.evaluateScript("failed-navigation")
+        }
+        #expect(await waitUntil { spread.pendingEvaluationCount == 1 })
+
+        spread.webView(
+            spread.webView,
+            didFail: nil,
+            withError: URLError(.cannotDecodeContentData)
+        )
+        let didFinish = await waitUntil(attempts: 50) { result != nil }
+        #expect(didFinish)
+        #expect(result?.isFailure == true)
+
+        if !didFinish {
+            spread.completeEvaluations()
+        }
+        await evaluation.value
+        withExtendedLifetime(container) {}
+    }
+
+    @Test("pending JavaScript evaluation has a bounded timeout")
+    func pendingEvaluationTimesOut() async {
+        let (spread, container) = await makeLoadedSuspendingSpreadView()
+        var result: Result<Any, Error>?
+        let evaluation = Task { @MainActor in
+            result = await spread.evaluateScript("never-finishes")
+        }
+        #expect(await waitUntil { spread.pendingEvaluationCount == 1 })
+
+        let didFinish = await waitUntil(attempts: 50) { result != nil }
+        #expect(didFinish)
+        #expect(result?.isFailure == true)
+
+        if !didFinish {
+            spread.completeEvaluations()
+        }
+        await evaluation.value
+        spread.clear()
+        withExtendedLifetime(container) {}
+    }
+
     @Test("normal loading waits for spreadLoaded before resuming")
     func normalLoadingWaitsThenResumes() async {
         let spread = makeSpreadView()
@@ -151,6 +391,27 @@ struct EPUBSpreadViewLifecycleTests {
         spread.clear()
         await waitingTask.value
         #expect(completionCount == 1)
+    }
+
+    @Test("task cancellation releases a pending spread load waiter")
+    func cancellationReleasesSpreadLoadWaiter() async {
+        let spread = makeSpreadView()
+        var didFinishWaiting = false
+        let waiting = Task { @MainActor in
+            await spread.spreadLoaded()
+            didFinishWaiting = true
+        }
+        await nextMainRunLoop()
+
+        waiting.cancel()
+        let didFinish = await waitUntil(attempts: 50) { didFinishWaiting }
+        #expect(didFinish)
+
+        if !didFinish {
+            spread.clear()
+        }
+        await waiting.value
+        spread.clear()
     }
 
     @Test("active media tracks same-URL frames independently")
@@ -179,6 +440,24 @@ struct EPUBSpreadViewLifecycleTests {
     }
 
     private func makeSpreadView() -> LifecycleTestSpreadView {
+        makeSpreadView(ofType: LifecycleTestSpreadView.self)
+    }
+
+    private func makeLoadedSuspendingSpreadView() async -> (
+        SuspendingJavaScriptSpreadView,
+        UIView
+    ) {
+        let spread = makeSpreadView(ofType: SuspendingJavaScriptSpreadView.self)
+        let container = UIView()
+        container.addSubview(spread)
+        spread.loadDocumentReportingSpreadLoaded()
+        await spread.spreadLoaded()
+        return (spread, container)
+    }
+
+    private func makeSpreadView<Spread: LifecycleTestSpreadView>(
+        ofType type: Spread.Type
+    ) -> Spread {
         let link = Link(href: "chapter.xhtml", mediaType: .xhtml)
         let readingOrder = [link]
         let publication = Publication(
@@ -196,7 +475,7 @@ struct EPUBSpreadViewLifecycleTests {
             resource: EPUBSpreadResource(index: 0, link: link)
         ))
 
-        return LifecycleTestSpreadView(
+        return type.init(
             viewModel: viewModel,
             spread: spread,
             scripts: [],
@@ -205,9 +484,10 @@ struct EPUBSpreadViewLifecycleTests {
     }
 
     private func waitUntil(
+        attempts: Int = 500,
         _ condition: @escaping @MainActor () -> Bool
     ) async -> Bool {
-        for _ in 0 ..< 500 {
+        for _ in 0 ..< attempts {
             if condition() {
                 return true
             }
@@ -234,6 +514,15 @@ struct EPUBSpreadViewLifecycleTests {
                 continuation.resume()
             }
         }
+    }
+}
+
+private extension Result {
+    var isFailure: Bool {
+        if case .failure = self {
+            return true
+        }
+        return false
     }
 }
 

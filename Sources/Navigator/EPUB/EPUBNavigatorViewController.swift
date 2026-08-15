@@ -20,6 +20,14 @@ func pageTurnSnapshotsRequireInvalidationForPagesDidChange(
         || paginationView.currentView === spreadView
 }
 
+private final class WeakNavigationOwner<Owner: AnyObject> {
+    weak var value: Owner?
+
+    init(_ value: Owner) {
+        self.value = value
+    }
+}
+
 @MainActor public protocol EPUBNavigatorDelegate: VisualNavigatorDelegate, SelectableNavigatorDelegate,
     ViewportObservingNavigatorDelegate
 {
@@ -49,15 +57,21 @@ func pageTurnSnapshotsRequireInvalidationForPagesDidChange(
 }
 
 public extension EPUBNavigatorDelegate {
-    func pageTurnRootView(for navigator: EPUBNavigatorViewController) -> UIView? { nil }
+    func pageTurnRootView(for navigator: EPUBNavigatorViewController) -> UIView? {
+        nil
+    }
 
     func pageTurnContainerViewController(
         for navigator: EPUBNavigatorViewController
-    ) -> UIViewController? { nil }
+    ) -> UIViewController? {
+        nil
+    }
 
     func pageTurnLiveSurfaceViewController(
         for navigator: EPUBNavigatorViewController
-    ) -> UIViewController? { nil }
+    ) -> UIViewController? {
+        nil
+    }
 
     func navigator(
         _ navigator: EPUBNavigatorViewController,
@@ -306,7 +320,123 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private let readingOrder: [Link]
     public private(set) var currentLocation: Locator?
+    /// Sole owner of reading-position mutations submitted by public
+    /// navigation entry points. Recovery remains inside the active body.
+    private var initializedNavigationExecutor: NavigationOperationExecutor?
+    private var navigationExecutor: NavigationOperationExecutor {
+        if let executor = initializedNavigationExecutor {
+            return executor
+        }
+        let executor = NavigationOperationExecutor { [weak self] _, result in
+            self?.isolateAbandonedNavigation(with: result)
+        }
+        initializedNavigationExecutor = executor
+        return executor
+    }
+
+    private var navigationOperationTimeout: NavigationOperationTimeout = .seconds(15)
+    private struct DeferredPoisonedPaginationReplacement {
+        let stableLocator: Locator?
+    }
+
+    private var deferredPoisonedPaginationReplacement: DeferredPoisonedPaginationReplacement?
     private var storedPageTurnStyle: EPUBPageTurnStyle
+
+    /// Retires every live generation synchronously before a timed-out executor
+    /// lease is released. A non-cooperative WebKit/UIKit continuation may still
+    /// resume later, but it no longer has a surface in the navigation tree.
+    private func isolateAbandonedNavigation(with result: NavigationResult) {
+        let stableLocator = pageTurnTransaction?.originalLocator
+            ?? pageTurnSurfaceOriginalPreview?.location
+            ?? currentLocation
+        retireAbandonedPageTurn(with: result)
+        poisonVisibleSpreads(with: result)
+        if deferredPoisonedPaginationReplacement == nil {
+            deferredPoisonedPaginationReplacement = .init(
+                stableLocator: stableLocator
+            )
+        }
+        paginationView?.isolateForDeferredReload(with: result)
+    }
+
+    /// Synchronously releases page-turn ownership before the executor starts a
+    /// replacement request. Suspended UIKit/WebKit continuations may resume, but
+    /// transaction identity and recovery generation checks reject every late
+    /// state write.
+    private func retireAbandonedPageTurn(with result: NavigationResult) {
+        pageTurnRecoveryGeneration &+= 1
+        pageTurnRecoveryTask?.cancel()
+        pageTurnRecoveryTask = nil
+        pageTurnRecoveryTaskGeneration = nil
+        pageTurnDisplayFrameWaiter?.cancel()
+        pageTurnDisplayFrameWaiter = nil
+
+        if let transaction = pageTurnTransaction {
+            transaction.invalidate()
+            transaction.complete(with: transaction.mutationResult.replacingResult(
+                result,
+                stableLocator: transaction.mutationResult.stableLocator
+                    ?? transaction.originalLocator,
+                failureStage: .stableLocationRestore
+            ))
+        }
+        pageTurnTransactionTask?.cancel()
+        pageTurnTransactionTask = nil
+        pageTurnTransaction = nil
+        pageTurnRecoverySessionID = nil
+        let drainWaiters = pageTurnRecoveryDrainWaiters
+        pageTurnRecoveryDrainWaiters.removeAll()
+        drainWaiters.forEach { $0.resume() }
+        finishPageTurnRecoveryOperationWaiters(with: result)
+
+        pageTurnSurfaceAnimator?.cancelAnimation()
+        forceReleaseOrphanPageTurnSurface()
+        if let session = pageTurnController.activeSession {
+            _ = pageTurnController.finish(session)
+        }
+        releasePageTurnNavigatorNavigationLock()
+        applyDeferredPageTurnInteractionMode()
+    }
+
+    private func cancelOwnedNavigationWork() {
+        // Do not initialize the executor while `self` is deinitializing. Its
+        // isolation callback captures the navigator weakly, and forming that
+        // weak reference after Objective-C deallocation has begun aborts the
+        // process. An executor which was never initialized owns no work.
+        initializedNavigationExecutor?.shutdown()
+        hardAbortPanResumeTask?.cancel()
+        hardAbortPanResumeTask = nil
+        pendingPageTurnGesture = nil
+        pageTurnRecoveryTask?.cancel()
+        pageTurnRecoveryTask = nil
+        pageTurnRecoveryTaskGeneration = nil
+        pageTurnRecoverySessionID = nil
+        let recoveryDrainWaiters = pageTurnRecoveryDrainWaiters
+        pageTurnRecoveryDrainWaiters.removeAll()
+        recoveryDrainWaiters.forEach { $0.resume() }
+        finishPageTurnRecoveryOperationWaiters(with: .cancelled)
+        pageTurnTransactionTask?.cancel()
+        pageTurnDisplayFrameWaiter?.cancel()
+        pageTurnDisplayFrameWaiter = nil
+        pageTurnTransaction?.invalidate()
+        if let transaction = pageTurnTransaction {
+            transaction.complete(with: transaction.mutationResult.replacingResult(
+                .cancelled,
+                stableLocator: transaction.mutationResult.stableLocator
+                    ?? transaction.originalLocator,
+                failureStage: .stableLocationRestore
+            ))
+        }
+        pageTurnSurfaceAnimator?.remove()
+        pageTurnSurfaceAnimator = nil
+    }
+
+    /// Reader containers should call the normal containment removal APIs;
+    /// tests which mount only the view use this hook to model that lifecycle.
+    func cancelOwnedNavigationWorkForTesting() {
+        cancelOwnedNavigationWork()
+    }
+
     public var pageTurnStyle: EPUBPageTurnStyle {
         get { storedPageTurnStyle }
         set {
@@ -320,6 +450,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
         }
     }
+
     private let loadPositionsByReadingOrder: () async -> ReadResult<[[Locator]]>
     private var positionsByReadingOrder: [[Locator]] = []
 
@@ -499,11 +630,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     deinit {
-        pageTurnTransactionTask?.cancel()
         MainActor.assumeIsolated {
+            cancelOwnedNavigationWork()
             pageTurnTransaction?.resolve(.cancel)
-            pageTurnTransaction?.complete(with: false)
-            pageTurnSurfaceAnimator?.remove()
         }
         viewportPropagationTask?.cancel()
         accessibilityObserverTokens.forEach(notificationCenter.removeObserver)
@@ -638,9 +767,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         if appearanceChanged || contrastChanged {
             cancelActivePageTurn(reason: "trait-appearance")
         } else if
-            pageTurnTransaction == nil
-                && pageTurnController.isIdle
-                && pendingPageTurnGesture == nil
+            pageTurnTransaction == nil,
+            pageTurnController.isIdle,
+            pendingPageTurnGesture == nil
         {
             // Preserve idle-path cancellation for other trait noise.
             cancelActivePageTurn(reason: "trait-idle")
@@ -752,12 +881,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         /// selection interrupts that would otherwise hard-abort the turn.
         var didResolveCommitBeforePrepare = false
         var originalLocator: Locator?
+        var mutationResult = NavigationMutationResult.rejected(
+            .cancelled,
+            mayHaveMutated: false,
+            stage: .preflight
+        )
         var didObserveSurface = false
         private(set) var isInvalidated = false
         private(set) var terminalIntent: TerminalIntent?
         private(set) var isRunning = false
         private var isComplete = false
-        private var result = false
         private var terminalWaiter: CheckedContinuation<Void, Never>?
         private var completionWaiters: [CheckedContinuation<Void, Never>] = []
 
@@ -804,20 +937,38 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             resolve(.cancel)
         }
 
-        func waitForTerminalIntent() async -> TerminalIntent? {
-            if terminalIntent == nil, !isComplete {
-                await withCheckedContinuation { continuation in
-                    terminalWaiter = continuation
+        func waitForTerminalIntent(
+            operation: NavigationOperationToken
+        ) async -> TerminalIntent? {
+            let cancellationTask = Task { @MainActor [weak self] in
+                _ = await operation.waitForCancellation()
+                guard !Task.isCancelled else { return }
+                self?.resolve(.cancel)
+            }
+            defer { cancellationTask.cancel() }
+            return await withTaskCancellationHandler {
+                if terminalIntent == nil, !isComplete {
+                    await withCheckedContinuation { continuation in
+                        if terminalIntent != nil || isComplete {
+                            continuation.resume()
+                        } else {
+                            terminalWaiter = continuation
+                        }
+                    }
+                }
+                return terminalIntent
+            } onCancel: {
+                Task { @MainActor [weak self] in
+                    self?.resolve(.cancel)
                 }
             }
-            return terminalIntent
         }
 
-        func complete(with result: Bool) {
+        func complete(with result: NavigationMutationResult) {
             guard !isComplete else { return }
             isComplete = true
             isRunning = false
-            self.result = result
+            mutationResult = result
             let terminalWaiter = terminalWaiter
             self.terminalWaiter = nil
             terminalWaiter?.resume()
@@ -826,13 +977,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             waiters.forEach { $0.resume() }
         }
 
-        func waitForCompletion() async -> Bool {
+        func waitForCompletion() async -> NavigationMutationResult {
             if !isComplete {
                 await withCheckedContinuation { continuation in
                     completionWaiters.append(continuation)
                 }
             }
-            return result
+            return mutationResult
         }
     }
 
@@ -883,6 +1034,18 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Snapshot-driven trait re-entry during preview must not cancel the turn.
     private var isPreparingPageTurnSurface = false
     private var pageTurnTransactionTask: Task<Bool, Never>?
+    /// Cancellation recovery runs outside the transaction task so WebView
+    /// waiters don't inherit its cancelled state. The lease remains active
+    /// until the owning transaction runner has fully stopped mutating state.
+    private var pageTurnRecoveryTask: Task<Void, Never>?
+    private var pageTurnRecoveryTaskGeneration: UInt64?
+    private var pageTurnRecoverySessionID: UUID?
+    private var pageTurnRecoveryGeneration: UInt64 = 0
+    private var pageTurnRecoveryDrainWaiters: [CheckedContinuation<Void, Never>] = []
+    private var pageTurnRecoveryOperationWaiters: [
+        UUID: CheckedContinuation<NavigationResult, Never>
+    ] = [:]
+    private var pageTurnRecoveryOperationWaiterTasks: [UUID: Task<Void, Never>] = [:]
     var pageTurnNavigationForTesting: ((
         PageTurnSession,
         Locator?
@@ -905,6 +1068,20 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// `restorePageTurnLocator` after position→progression resolution so tests
     /// can assert the resolved locator without hanging on headless WebKit go.
     var pageTurnRestoreGoForTesting: ((Locator) async -> Bool)?
+    /// When set, replaces `paginationView.goToIndex` inside
+    /// `performLocatorNavigation` so tests can drive mutation/verify without
+    /// hanging on headless WebKit go.
+    var pageTurnGoToIndexForTesting: ((Locator) async -> NavigationResult)?
+    var pageTurnRestoreGoToIndexForTesting: ((Locator) async -> Bool)?
+    var linkLocatorForTesting: ((Link) async -> Locator?)?
+    var locatorNavigationLocationCalculationForTesting: (
+        () async -> (Locator?, NavigatorViewport?)
+    )?
+    var locatorNavigationDOMTargetVerifierForTesting: ((Locator) async -> Bool)?
+    var pageTurnLeaseAfterHardAbortRegistrationForTesting: (() async -> Void)?
+    private(set) var pageTurnRestoreUsedOperationTokenForTesting: Bool?
+    private(set) var pageTurnPoisonReloadLocatorForTesting: Locator?
+    private(set) var pageTurnHardAbortSnapHadExecutorLeaseForTesting: Bool?
     /// When set, `isLiveViewAtPageTurnOriginalLocator` uses this synthetic
     /// multi-column geometry instead of the live `UIScrollView`. Headless
     /// WebKit resets forced `contentSize` across `await` suspension points.
@@ -913,6 +1090,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         contentWidth: CGFloat,
         progression: Double
     )?
+    var pageTurnSnapsToPageForTesting: Bool?
+    var pageTurnVerticalLocationVerifierForTesting: ((PageLocation, Int) async -> Bool)?
     private(set) var pageTurnInteractionModeUpdateCountForTesting = 0
     private var coldPageTurnTargetIndexForTesting: Int?
     private var isColdPageTurnArmedForTesting = false
@@ -920,13 +1099,65 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private var didNavigateColdTargetForTesting = false
     private var didCaptureAfterColdNavigationForTesting = false
 
-    /// Hard-abort location restore is a single worker that fully finishes one
-    /// `restorePageTurnLocator` before starting the next. Superseded targets
-    /// replace `hardAbortRestoreRequest` but never cancel an in-flight
-    /// navigation (pagination/WebKit go does not honour Task cancel).
-    private var hardAbortRestoreRequest: (locator: Locator, snapAfterRestore: Bool)?
-    private var hardAbortLocationRestoreTask: Task<Void, Never>?
-    private var hardAbortLocationRestorePending = false
+    /// Each hard-abort synchronously reserves a mandatory executor request.
+    /// Multiple restores remain FIFO and never overlap.
+    private struct HardAbortRecoveryRequest {
+        let locator: Locator?
+        let snapAfterRestore: Bool
+    }
+
+    private final class HardAbortOperationWaiter {
+        let dependencyIDs: Set<UInt64>
+        private var terminalResults: [UInt64: NavigationResult] = [:]
+        private var terminalResult: NavigationResult?
+        private var continuation: CheckedContinuation<NavigationResult, Never>?
+
+        init(dependencyIDs: Set<UInt64>) {
+            self.dependencyIDs = dependencyIDs
+        }
+
+        func record(operationID: UInt64, result: NavigationResult) -> NavigationResult? {
+            guard terminalResult == nil, dependencyIDs.contains(operationID) else {
+                return nil
+            }
+            terminalResults[operationID] = result
+            guard terminalResults.count == dependencyIDs.count else { return nil }
+            return dependencyIDs.sorted()
+                .compactMap { terminalResults[$0] }
+                .first(where: { !$0.isApplied })
+                ?? .applied
+        }
+
+        func wait() async -> NavigationResult {
+            if let terminalResult { return terminalResult }
+            return await withCheckedContinuation { continuation in
+                if let terminalResult {
+                    continuation.resume(returning: terminalResult)
+                } else {
+                    self.continuation = continuation
+                }
+            }
+        }
+
+        func finish(with result: NavigationResult) {
+            guard terminalResult == nil else { return }
+            terminalResult = result
+            continuation?.resume(returning: result)
+            continuation = nil
+        }
+    }
+
+    private var pendingHardAbortRecoveryIDs: Set<UInt64> = []
+    private var hardAbortDrainWaiters: [CheckedContinuation<Void, Never>] = []
+    private var hardAbortLocationRestoreGeneration: UInt64 = 0
+    private var hardAbortLocationRestorePending: Bool {
+        !pendingHardAbortRecoveryIDs.isEmpty
+    }
+
+    private var hardAbortOperationWaiters: [
+        UUID: HardAbortOperationWaiter
+    ] = [:]
+    private var hardAbortOperationWaiterTasks: [UUID: Task<Void, Never>] = [:]
     /// Flushes a pan that began while restore was still running.
     private var hardAbortPanResumeTask: Task<Void, Never>?
 
@@ -942,55 +1173,123 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         )
     }
 
-    /// Enqueues the latest restore target. If a restore is already running, the
-    /// worker finishes it, then restores this newer target (true serialization).
+    /// Reserves the restore before this MainActor turn can release the active
+    /// mutation lease. Waiting is asynchronous; registration is not.
     private func queueHardAbortLocationRestore(
-        _ locator: Locator,
+        _ locator: Locator?,
         snapAfterRestore: Bool
     ) {
-        hardAbortRestoreRequest = (locator, snapAfterRestore)
-        hardAbortLocationRestorePending = true
-        ensureHardAbortLocationRestoreWorker()
+        let request = HardAbortRecoveryRequest(
+            locator: locator,
+            snapAfterRestore: snapAfterRestore
+        )
+        hardAbortLocationRestoreGeneration &+= 1
+        let generation = hardAbortLocationRestoreGeneration
+        _ = navigationExecutor.reserve(
+            intent: .mustRunRecovery("hard-abort-restore"),
+            timeout: navigationOperationTimeout,
+            registration: { [weak self] operationID in
+                self?.pendingHardAbortRecoveryIDs.insert(operationID)
+            },
+            completion: { [weak self] operationID, terminalResult in
+                self?.finishHardAbortRecovery(
+                    operationID: operationID,
+                    with: terminalResult
+                )
+            }
+        ) { [weak self] operation in
+            guard let self else { return .cancelled }
+            return await self.performHardAbortRecovery(
+                request,
+                generation: generation,
+                operation: operation
+            )
+        }
     }
 
-    private func ensureHardAbortLocationRestoreWorker() {
-        guard hardAbortLocationRestoreTask == nil else { return }
-        hardAbortLocationRestoreTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.hardAbortLocationRestoreTask = nil }
-            while true {
-                guard let request = self.hardAbortRestoreRequest else {
-                    self.hardAbortLocationRestorePending = false
-                    return
-                }
-                self.hardAbortRestoreRequest = nil
-                // Always run to completion — do not cancel mid-navigation.
-                _ = await self.restorePageTurnLocator(request.locator)
-                // A newer hard-abort may have replaced the target during await.
-                if self.hardAbortRestoreRequest != nil {
-                    continue
-                }
-                if request.snapAfterRestore {
-                    self.snapVisibleDocumentToPageBoundaries()
-                }
+    private func performHardAbortRecovery(
+        _ request: HardAbortRecoveryRequest,
+        generation: UInt64,
+        operation: NavigationOperationToken
+    ) async -> NavigationResult {
+        operation.beginRecovery()
+        let result: NavigationResult
+        if let locator = request.locator {
+            var restore = await restorePageTurnLocator(
+                locator,
+                operation: operation
+            )
+            if let cancellation = operation.check() {
+                restore = restore.replacingResult(
+                    cancellation,
+                    stableLocator: locator,
+                    failureStage: .stableLocationRestore
+                )
             }
+            guard restore.result.isApplied, restore.stableVerified else {
+                let failure = restore.result.isApplied
+                    ? NavigationResult.spreadNotLoaded
+                    : restore.result
+                poisonVisibleSpreads(with: failure)
+                return await recoverPoisonedSpreadsIfNeeded(
+                    after: failure,
+                    stableLocator: restore.stableLocator ?? locator,
+                    operation: operation
+                )
+            }
+            result = restore.result
+        } else {
+            result = operation.check() ?? .applied
         }
+        if !result.isApplied {
+            poisonVisibleSpreads(with: result)
+        }
+        let terminal = await recoverPoisonedSpreadsIfNeeded(
+            after: result,
+            stableLocator: request.locator ?? currentLocation,
+            operation: operation
+        )
+        if
+            terminal.isApplied,
+            request.snapAfterRestore,
+            hardAbortLocationRestoreGeneration == generation,
+            operation.check() == nil
+        {
+            pageTurnHardAbortSnapHadExecutorLeaseForTesting =
+                navigationExecutor.activeOperationCountForTesting == 1
+            snapVisibleDocumentToPageBoundaries()
+        }
+        return terminal
     }
 
     /// Waits until the restore worker is idle and no request remains.
     private func awaitHardAbortLocationRestoreIfNeeded() async {
         while hardAbortLocationRestorePending {
-            if hardAbortLocationRestoreTask == nil, hardAbortRestoreRequest != nil {
-                ensureHardAbortLocationRestoreWorker()
-            }
-            guard let task = hardAbortLocationRestoreTask else {
-                if hardAbortRestoreRequest == nil {
-                    hardAbortLocationRestorePending = false
+            await withCheckedContinuation { continuation in
+                if hardAbortLocationRestorePending {
+                    hardAbortDrainWaiters.append(continuation)
+                } else {
+                    continuation.resume()
                 }
-                return
             }
-            await task.value
         }
+    }
+
+    private func registerHardAbortOperationWaiter(
+        operation: NavigationOperationToken
+    ) -> (id: UUID, waiter: HardAbortOperationWaiter)? {
+        let dependencyIDs = Set(pendingHardAbortRecoveryIDs.filter {
+            $0 < operation.operationID
+        })
+        guard !dependencyIDs.isEmpty else { return nil }
+        let id = UUID()
+        let waiter = HardAbortOperationWaiter(dependencyIDs: dependencyIDs)
+        hardAbortOperationWaiters[id] = waiter
+        hardAbortOperationWaiterTasks[id] = Task { @MainActor [weak self] in
+            let result = await operation.waitForCancellation()
+            self?.finishHardAbortOperationWaiter(id, with: result)
+        }
+        return (id, waiter)
     }
 
     /// After restore drains, replay any pan that was buffered during restore.
@@ -999,27 +1298,229 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         hardAbortPanResumeTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.hardAbortPanResumeTask = nil }
+            await self.awaitPageTurnRecoveryDrainIfNeeded()
+            guard !Task.isCancelled else { return }
             await self.awaitHardAbortLocationRestoreIfNeeded()
+            guard !Task.isCancelled else { return }
             await self.resumePendingPageTurnGesture()
         }
     }
 
+    private func isCurrentPageTurnRecovery(
+        _ transaction: PageTurnTransaction,
+        generation: UInt64
+    ) -> Bool {
+        pageTurnRecoveryGeneration == generation
+            && pageTurnRecoverySessionID == transaction.session.id
+            && pageTurnTransaction === transaction
+    }
+
+    private func runPageTurnRecovery(
+        for transaction: PageTurnTransaction,
+        operation token: NavigationOperationToken,
+        operation: @escaping @MainActor (
+            EPUBNavigatorViewController,
+            PageTurnTransaction,
+            UInt64
+        ) async -> Void
+    ) async {
+        guard pageTurnTransaction === transaction else { return }
+
+        pageTurnRecoveryGeneration &+= 1
+        let generation = pageTurnRecoveryGeneration
+        pageTurnRecoverySessionID = transaction.session.id
+        token.beginRecovery()
+        guard isCurrentPageTurnRecovery(transaction, generation: generation) else {
+            return
+        }
+        // Recovery must not inherit cancellation from the mutation task, but
+        // it remains registered with the executor-owned token so its deadline
+        // cancels this task too.
+        let task = Task.detached { @MainActor in
+            await operation(self, transaction, generation)
+        }
+        pageTurnRecoveryTask = task
+        pageTurnRecoveryTaskGeneration = generation
+        let recoveryTaskID = token.registerRecoveryTask(task)
+        await task.value
+        token.unregisterRecoveryTask(recoveryTaskID)
+        if pageTurnRecoveryTaskGeneration == generation {
+            pageTurnRecoveryTask = nil
+            pageTurnRecoveryTaskGeneration = nil
+        }
+    }
+
+    private func finishPageTurnRecovery(
+        for transaction: PageTurnTransaction
+    ) {
+        guard pageTurnRecoverySessionID == transaction.session.id else { return }
+        pageTurnRecoverySessionID = nil
+        if pageTurnTransaction == nil {
+            pageTurnTransactionTask = nil
+        }
+        let waiters = pageTurnRecoveryDrainWaiters
+        pageTurnRecoveryDrainWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        finishPageTurnRecoveryOperationWaiters(with: .applied)
+    }
+
+    private func awaitPageTurnRecoveryDrainIfNeeded() async {
+        guard pageTurnRecoverySessionID != nil else { return }
+        await withCheckedContinuation { continuation in
+            if pageTurnRecoverySessionID == nil {
+                continuation.resume()
+            } else {
+                pageTurnRecoveryDrainWaiters.append(continuation)
+            }
+        }
+    }
+
+    private func awaitPageTurnRecoveryDrainIfNeeded(
+        operation: NavigationOperationToken
+    ) async -> NavigationResult {
+        guard pageTurnRecoverySessionID != nil else {
+            return operation.check() ?? .applied
+        }
+        let id = UUID()
+        pageTurnRecoveryOperationWaiterTasks[id] = Task { @MainActor [weak self] in
+            let result = await operation.waitForCancellation()
+            self?.finishPageTurnRecoveryOperationWaiter(id, with: result)
+        }
+        return await withCheckedContinuation { continuation in
+            if pageTurnRecoverySessionID == nil {
+                pageTurnRecoveryOperationWaiterTasks.removeValue(forKey: id)?.cancel()
+                continuation.resume(returning: operation.check() ?? .applied)
+            } else {
+                pageTurnRecoveryOperationWaiters[id] = continuation
+            }
+        }
+    }
+
+    private func awaitPageTurnNavigationLease() async {
+        repeat {
+            await awaitPageTurnRecoveryDrainIfNeeded()
+            await awaitHardAbortLocationRestoreIfNeeded()
+        } while pageTurnRecoverySessionID != nil || hardAbortLocationRestorePending
+    }
+
+    private func awaitPageTurnNavigationLease(
+        operation: NavigationOperationToken
+    ) async -> NavigationResult {
+        let hardAbortBoundary = registerHardAbortOperationWaiter(
+            operation: operation
+        )
+        if let hook = pageTurnLeaseAfterHardAbortRegistrationForTesting {
+            await hook()
+        }
+        repeat {
+            let recovery = await awaitPageTurnRecoveryDrainIfNeeded(operation: operation)
+            guard recovery.isApplied else {
+                if let hardAbortBoundary {
+                    finishHardAbortOperationWaiter(
+                        hardAbortBoundary.id,
+                        with: recovery
+                    )
+                }
+                return recovery
+            }
+        } while pageTurnRecoverySessionID != nil
+        if let hardAbortBoundary {
+            let hardAbort = await hardAbortBoundary.waiter.wait()
+            guard hardAbort.isApplied else { return hardAbort }
+        }
+        return operation.check() ?? .applied
+    }
+
+    private func finishPageTurnRecoveryOperationWaiter(
+        _ id: UUID,
+        with result: NavigationResult
+    ) {
+        pageTurnRecoveryOperationWaiterTasks.removeValue(forKey: id)?.cancel()
+        pageTurnRecoveryOperationWaiters.removeValue(forKey: id)?.resume(returning: result)
+    }
+
+    private func finishPageTurnRecoveryOperationWaiters(with result: NavigationResult) {
+        let ids = Array(pageTurnRecoveryOperationWaiters.keys)
+        ids.forEach { finishPageTurnRecoveryOperationWaiter($0, with: result) }
+    }
+
+    private func finishHardAbortOperationWaiter(
+        _ id: UUID,
+        with result: NavigationResult
+    ) {
+        hardAbortOperationWaiterTasks.removeValue(forKey: id)?.cancel()
+        hardAbortOperationWaiters.removeValue(forKey: id)?.finish(with: result)
+    }
+
+    private func finishHardAbortRecovery(
+        operationID: UInt64,
+        with result: NavigationResult
+    ) {
+        guard pendingHardAbortRecoveryIDs.remove(operationID) != nil else {
+            return
+        }
+
+        for waiterID in Array(hardAbortOperationWaiters.keys) {
+            guard let waiter = hardAbortOperationWaiters[waiterID],
+                  waiter.dependencyIDs.contains(operationID)
+            else {
+                continue
+            }
+            guard let terminalResult = waiter.record(
+                operationID: operationID,
+                result: result
+            ) else { continue }
+            finishHardAbortOperationWaiter(waiterID, with: terminalResult)
+        }
+
+        if pendingHardAbortRecoveryIDs.isEmpty {
+            let waiters = hardAbortDrainWaiters
+            hardAbortDrainWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+    }
+
     private func beginPageTurn(
-        to direction: EPUBSpreadView.Direction
+        to direction: EPUBSpreadView.Direction,
+        ownsPendingGesture: Bool = false
     ) async -> PageTurnSession? {
-        // Drain any hard-abort restore before opening a new session so a
-        // previous prepare's navigation cannot race the next gesture.
-        await awaitHardAbortLocationRestoreIfNeeded()
+        // Drain any recovery or hard-abort restore before opening a new session
+        // so a previous WebView navigation cannot race the next gesture.
+        await awaitPageTurnNavigationLease()
         // Recover from selection-interrupted stuck presentation for every style
         // so the user does not need to leave the book to get a clean page again.
+        let hasOrphanWork = ownsPendingGesture
+            ? hasInFlightPageTurnWorkExcludingPendingGesture
+            : hasInFlightPageTurnWork
+        if hasOrphanWork, pageTurnTransaction?.isRunning != true {
+            hardAbortInFlightPageTurn(
+                restorePreparedLocation: true,
+                reason: "beginPageTurn-orphan"
+            )
+            await awaitPageTurnNavigationLease()
+        }
+        return openPageTurnSession(to: direction)
+    }
+
+    private func beginPageTurn(
+        to direction: EPUBSpreadView.Direction,
+        operation: NavigationOperationToken
+    ) async -> NavigationValueResult<PageTurnSession> {
+        let firstLease = await awaitPageTurnNavigationLease(operation: operation)
+        guard firstLease.isApplied else { return .rejected(firstLease) }
         if hasInFlightPageTurnWork, pageTurnTransaction?.isRunning != true {
             hardAbortInFlightPageTurn(
                 restorePreparedLocation: true,
                 reason: "beginPageTurn-orphan"
             )
-            await awaitHardAbortLocationRestoreIfNeeded()
+            let recoveredLease = await awaitPageTurnNavigationLease(operation: operation)
+            guard recoveredLease.isApplied else { return .rejected(recoveredLease) }
         }
-        return openPageTurnSession(to: direction)
+        if let result = operation.check() { return .rejected(result) }
+        guard let session = openPageTurnSession(to: direction) else {
+            return .rejected(.spreadNotLoaded)
+        }
+        return .applied(session)
     }
 
     /// Opens a page-turn session assuming hard-abort restore is not pending.
@@ -1042,14 +1543,20 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private func performPageTurn(
         _ session: PageTurnSession,
         options: NavigatorGoOptions,
-        target: Locator? = nil
-    ) async -> Bool {
+        target: Locator? = nil,
+        operation: NavigationOperationToken
+    ) async -> NavigationMutationResult {
         guard let navigation = pageTurnNavigation(
             session,
             options: options,
-            target: target
+            target: target,
+            operation: operation
         ) else {
-            return false
+            return .rejected(
+                .spreadNotLoaded,
+                mayHaveMutated: false,
+                stage: .preflight
+            )
         }
         return await navigation()
     }
@@ -1057,23 +1564,33 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private func pageTurnNavigation(
         _ session: PageTurnSession,
         options: NavigatorGoOptions,
-        target: Locator?
-    ) -> (() async -> Bool)? {
+        target: Locator?,
+        operation: NavigationOperationToken
+    ) -> (() async -> NavigationMutationResult)? {
         if let pageTurnNavigationForTesting {
             return {
-                await pageTurnNavigationForTesting(session, target)
+                let applied = await pageTurnNavigationForTesting(session, target)
+                return applied
+                    ? .applied(mayHaveMutated: true)
+                    : .rejected(
+                        .spreadNotLoaded,
+                        mayHaveMutated: true,
+                        stage: .pageViewMutation
+                    )
             }
         }
         guard let paginationView else { return nil }
 
         if let target,
            let resourceIndex = readingOrder.firstIndexWithHREF(target.href),
-           let spreadIndex = spreads.firstIndexWithReadingOrderIndex(resourceIndex) {
+           let spreadIndex = spreads.firstIndexWithReadingOrderIndex(resourceIndex)
+        {
             return {
-                await paginationView.goToIndex(
+                await paginationView.goToIndexWithMutation(
                     spreadIndex,
                     location: .locator(target),
-                    options: options
+                    options: options,
+                    operation: operation
                 )
             }
         }
@@ -1083,24 +1600,32 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         let isRTL = (session.readingProgression == .rtl)
         let delta = isRTL ? -1 : 1
         return {
-            if let spreadView,
-               await spreadView.go(to: session.direction, options: options) {
-                return true
+            if let spreadView {
+                let withinSpread = await spreadView.go(
+                    to: session.direction,
+                    options: options,
+                    operation: operation
+                )
+                if withinSpread.result.isApplied || withinSpread.mayHaveMutated {
+                    return withinSpread
+                }
             }
             switch session.direction {
             case .left:
                 let location: PageLocation = isRTL ? .start : .end
-                return await paginationView.goToIndex(
+                return await paginationView.goToIndexWithMutation(
                     currentSpreadIndex - delta,
                     location: location,
-                    options: options
+                    options: options,
+                    operation: operation
                 )
             case .right:
                 let location: PageLocation = isRTL ? .end : .start
-                return await paginationView.goToIndex(
+                return await paginationView.goToIndexWithMutation(
                     currentSpreadIndex + delta,
                     location: location,
-                    options: options
+                    options: options,
+                    operation: operation
                 )
             }
         }
@@ -1116,7 +1641,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             transaction.session.id == session.id,
             !transaction.isRunning
         {
-            transaction.complete(with: false)
+            transaction.complete(with: transaction.mutationResult.replacingResult(
+                .cancelled,
+                stableLocator: transaction.mutationResult.stableLocator
+                    ?? transaction.originalLocator,
+                failureStage: .stableLocationRestore
+            ))
             pageTurnTransaction = nil
         }
         // Never leave a snapshot mounted after the controller is idle with no
@@ -1154,8 +1684,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// failure, resumed reverse). If prepare already moved the live page, only
     /// publish; otherwise perform the same instant navigation as `.none`.
     private func commitPageTurnAfterFailedSurfacePrepare(
-        _ transaction: PageTurnTransaction
-    ) async -> Bool {
+        _ transaction: PageTurnTransaction,
+        operation: NavigationOperationToken
+    ) async -> NavigationMutationResult {
         let session = transaction.session
         // Capture before cleanup: `cleanupPageTurnSurface` clears
         // `pageTurnSurfaceDidPrepareTarget`, which writes through to
@@ -1165,12 +1696,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         let originalLocator = transaction.originalLocator
         cleanupPageTurnSurface(session)
         if didPrepareTarget {
-            return await pageTurnController.commit(session) { [self] in
+            let committed = await pageTurnController.commit(session) { [self] in
                 defer { finishPageTurn(session) }
                 if isActivePageTurnCommitCancelled(session) {
                     await reversePageTurnAfterCancelledCommit(
                         session,
-                        originalLocator: originalLocator
+                        originalLocator: originalLocator,
+                        operation: operation
                     )
                     return false
                 }
@@ -1178,39 +1710,89 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 if isActivePageTurnCommitCancelled(session) {
                     await reversePageTurnAfterCancelledCommit(
                         session,
-                        originalLocator: originalLocator
+                        originalLocator: originalLocator,
+                        operation: operation
                     )
                     return false
                 }
+                // Locator navigation verifies the live target after this
+                // fallback returns. Let that outer commit publish it only after
+                // verification succeeds, as the normal surface path does.
+                guard pageTurnSurfaceTargetLocator == nil else {
+                    return true
+                }
                 return await publishCurrentLocationIfCommitStillActive(
                     session,
-                    originalLocator: originalLocator
+                    originalLocator: originalLocator,
+                    operation: operation
                 )
             }
+            guard committed else {
+                return .rejected(
+                    operation.check() ?? .spreadNotLoaded,
+                    mayHaveMutated: transaction.mutationResult.mayHaveMutated,
+                    stableLocator: transaction.mutationResult.stableLocator
+                        ?? originalLocator,
+                    stage: .publication
+                )
+            }
+            return transaction.mutationResult
         }
-        return await commitPageTurn(session, options: .none)
+        return await commitPageTurn(
+            session,
+            options: .none,
+            operation: operation
+        )
     }
 
     private func commitPageTurn(
         _ session: PageTurnSession,
-        options: NavigatorGoOptions
-    ) async -> Bool {
-        await pageTurnController.commit(session) { [self] in
+        options: NavigatorGoOptions,
+        operation: NavigationOperationToken
+    ) async -> NavigationMutationResult {
+        var mutation = NavigationMutationResult.rejected(
+            .cancelled,
+            mayHaveMutated: false,
+            stage: .preflight
+        )
+        let committed = await pageTurnController.commit(session) { [self] in
             defer { finishPageTurn(session) }
             // `.none` has no surface animator; honour invalidate the same way
             // surface commit checks shouldContinue / isInvalidated.
             if isActivePageTurnCommitCancelled(session) {
+                mutation = .rejected(
+                    .cancelled,
+                    mayHaveMutated: false,
+                    stage: .preflight
+                )
                 return false
             }
             // Capture before navigation so cancel recovery can re-locate even
             // when inverse page-turn fails (cross-resource cold chapter, etc.).
             let originalLocator = capturePageTurnCommitOriginalLocator(session)
-            let moved = await performPageTurn(session, options: options)
-            guard moved else { return false }
+            mutation = await performPageTurn(
+                session,
+                options: options,
+                operation: operation
+            )
+            .preservingStableLocator(originalLocator)
+            if let transaction = pageTurnTransaction,
+               transaction.session.id == session.id
+            {
+                transaction.mutationResult = mutation
+            }
+            guard mutation.result.isApplied else { return false }
             if isActivePageTurnCommitCancelled(session) {
                 await reversePageTurnAfterCancelledCommit(
                     session,
-                    originalLocator: originalLocator
+                    originalLocator: originalLocator,
+                    operation: operation
+                )
+                mutation = .rejected(
+                    .cancelled,
+                    mayHaveMutated: mutation.mayHaveMutated,
+                    stableLocator: originalLocator,
+                    stage: .stableLocationRestore
                 )
                 return false
             }
@@ -1224,17 +1806,51 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             if isActivePageTurnCommitCancelled(session) {
                 await reversePageTurnAfterCancelledCommit(
                     session,
-                    originalLocator: originalLocator
+                    originalLocator: originalLocator,
+                    operation: operation
+                )
+                mutation = .rejected(
+                    .cancelled,
+                    mayHaveMutated: mutation.mayHaveMutated,
+                    stableLocator: originalLocator,
+                    stage: .stableLocationRestore
                 )
                 return false
             }
+            // See the matching fallback branch above. An absolute locator turn
+            // must not publish until `finishLocatorNavigation` verifies it.
+            guard pageTurnSurfaceTargetLocator == nil else {
+                return true
+            }
             // Re-check after the async location calculation: cancel during
             // compute must not still notify the target location.
-            return await publishCurrentLocationIfCommitStillActive(
+            let published = await publishCurrentLocationIfCommitStillActive(
                 session,
-                originalLocator: originalLocator
+                originalLocator: originalLocator,
+                operation: operation
+            )
+            if !published {
+                mutation = .rejected(
+                    .spreadNotLoaded,
+                    mayHaveMutated: mutation.mayHaveMutated,
+                    stableLocator: originalLocator,
+                    stage: .publication
+                )
+            }
+            return published
+        }
+        if committed {
+            return mutation
+        }
+        if mutation.result.isApplied {
+            return .rejected(
+                .spreadNotLoaded,
+                mayHaveMutated: mutation.mayHaveMutated,
+                stableLocator: mutation.stableLocator,
+                stage: .publication
             )
         }
+        return mutation
     }
 
     private func capturePageTurnCommitOriginalLocator(
@@ -1264,16 +1880,27 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private func publishCurrentLocationIfCommitStillActive(
         _ session: PageTurnSession,
-        originalLocator: Locator?
+        originalLocator: Locator?,
+        operation: NavigationOperationToken
     ) async -> Bool {
         let calculate = pageTurnLocationCalculationForTesting
             ?? computeCurrentLocationAndViewport
-        let (location, newViewport) = await calculate()
+        let calculation = await calculateCurrentLocationAndViewport(
+            calculating: calculate,
+            operation: operation
+        )
+        guard case let .applied((location, newViewport)) = calculation else {
+            return false
+        }
         if isActivePageTurnCommitCancelled(session) {
             await reversePageTurnAfterCancelledCommit(
                 session,
-                originalLocator: originalLocator
+                originalLocator: originalLocator,
+                operation: operation
             )
+            return false
+        }
+        guard operation.check() == nil else {
             return false
         }
         return publishCurrentLocation(location: location, viewport: newViewport)
@@ -1281,8 +1908,38 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private func reversePageTurnAfterCancelledCommit(
         _ session: PageTurnSession,
-        originalLocator: Locator?
+        originalLocator: Locator?,
+        operation: NavigationOperationToken
     ) async {
+        guard
+            let transaction = pageTurnTransaction,
+            transaction.session.id == session.id
+        else {
+            return
+        }
+        await runPageTurnRecovery(
+            for: transaction,
+            operation: operation
+        ) { owner, transaction, generation in
+            await owner.performReversePageTurnAfterCancelledCommit(
+                transaction,
+                originalLocator: originalLocator,
+                recoveryGeneration: generation,
+                operation: operation
+            )
+        }
+    }
+
+    private func performReversePageTurnAfterCancelledCommit(
+        _ transaction: PageTurnTransaction,
+        originalLocator: Locator?,
+        recoveryGeneration: UInt64,
+        operation: NavigationOperationToken
+    ) async {
+        guard isCurrentPageTurnRecovery(transaction, generation: recoveryGeneration) else {
+            return
+        }
+        let session = transaction.session
         let inverse = PageTurnSession(
             direction: session.direction == .left ? .right : .left,
             readingProgression: session.readingProgression
@@ -1292,29 +1949,77 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // we skip locator/reload fallbacks. Use a location check (not full
         // surface geometry stability) so a false-positive reverse still falls
         // through without blocking cancel recovery on layout settling.
-        let restored = await pageTurnController.restorePreparedPage(
-            inverse: { [self] in
-                await performPageTurn(inverse, options: .none)
-            },
-            validateOriginalLocation: { [self] in
-                await isLiveViewAtPageTurnOriginalLocator(originalLocator)
-            },
-            originalLocation: { [self] in
-                guard let originalLocator else { return false }
-                return await restorePageTurnLocator(originalLocator)
-            }
+        let reverseMutation = await performPageTurn(
+            inverse,
+            options: .none,
+            operation: operation
         )
-        if restored {
+        let didReverse = reverseMutation.result.isApplied
+        guard isCurrentPageTurnRecovery(transaction, generation: recoveryGeneration) else {
             return
+        }
+        if didReverse {
+            let isOriginal = await isLiveViewAtPageTurnOriginalLocator(
+                originalLocator,
+                operation: operation
+            )
+            guard isCurrentPageTurnRecovery(transaction, generation: recoveryGeneration) else {
+                return
+            }
+            if isOriginal {
+                return
+            }
         }
         guard let originalLocator else {
             log(.error, "Cancelled page-turn could not reverse and has no original locator.")
+            failPageTurnRecovery(with: operation.check() ?? .spreadNotLoaded)
             return
         }
-        if await reloadPageTurnOriginalLocation(originalLocator) {
+        let restore = await restorePageTurnLocator(
+            originalLocator,
+            operation: operation
+        )
+        guard isCurrentPageTurnRecovery(transaction, generation: recoveryGeneration) else {
+            return
+        }
+        if restore.result.isApplied, restore.stableVerified {
+            let isOriginal = await isLiveViewAtPageTurnOriginalLocator(
+                originalLocator,
+                operation: operation
+            )
+            guard isCurrentPageTurnRecovery(transaction, generation: recoveryGeneration) else {
+                return
+            }
+            if isOriginal {
+                return
+            }
+        }
+        let didReload = await reloadPageTurnOriginalLocation(
+            originalLocator,
+            operation: operation
+        )
+        guard isCurrentPageTurnRecovery(transaction, generation: recoveryGeneration) else {
+            return
+        }
+        if didReload {
             return
         }
         log(.error, "Failed to restore the original location after a cancelled page-turn.")
+        failPageTurnRecovery(with: operation.check() ?? .spreadNotLoaded)
+    }
+
+    /// A recovery which cannot prove the stable locator must retire the live
+    /// generation before releasing the executor lease.
+    private func failPageTurnRecovery(with result: NavigationResult) {
+        poisonVisibleSpreads(with: result)
+        if deferredPoisonedPaginationReplacement == nil {
+            deferredPoisonedPaginationReplacement = .init(
+                stableLocator: pageTurnTransaction?.originalLocator
+                    ?? pageTurnSurfaceOriginalPreview?.location
+                    ?? currentLocation
+            )
+        }
+        paginationView?.isolateForDeferredReload()
     }
 
     /// Confirms cancel recovery landed on the saved original page.
@@ -1329,15 +2034,21 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// - Single-page reflowable / fixed-layout: resource index is definitive.
     /// Published `currentLocation` is not trusted: it can lag behind prepare
     /// navigation.
-    private func isLiveViewAtPageTurnOriginalLocator(_ locator: Locator?) async -> Bool {
+    private func isLiveViewAtPageTurnOriginalLocator(
+        _ locator: Locator?,
+        operation: NavigationOperationToken
+    ) async -> Bool {
         guard let locator, let paginationView else { return false }
-        await waitForPageTurnDisplayFrame()
+        func waitForVerificationFrame() async -> Bool {
+            await waitForPageTurnDisplayFrame(operation: operation).isApplied
+        }
+        guard await waitForVerificationFrame() else { return false }
         if
             let resourceIndex = readingOrder.firstIndexWithHREF(locator.href),
             let spreadIndex = spreads.firstIndexWithReadingOrderIndex(resourceIndex),
             paginationView.currentIndex != spreadIndex
         {
-            await waitForPageTurnDisplayFrame()
+            guard await waitForVerificationFrame() else { return false }
             if paginationView.currentIndex != spreadIndex {
                 return false
             }
@@ -1349,7 +2060,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
         if
             paginationView.currentView is EPUBReflowableSpreadView
-                || pageTurnMultiColumnGeometryForTesting != nil
+            || pageTurnMultiColumnGeometryForTesting != nil
         {
             func readGeometry() -> (
                 pageWidth: CGFloat,
@@ -1381,13 +2092,25 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             // load and reload often report 0 on the first frame. Wait one frame
             // and fail closed if layout is still unusable so restore can run.
             if geometry.pageWidth <= 0 || geometry.contentWidth <= 0 {
-                await waitForPageTurnDisplayFrame()
+                guard await waitForVerificationFrame() else { return false }
                 guard let retried = readGeometry() else {
                     return false
                 }
                 geometry = retried
                 if geometry.pageWidth <= 0 || geometry.contentWidth <= 0 {
-                    return false
+                    let calculation = await NavigationOperationWaiter<(
+                        Locator?, NavigatorViewport?
+                    )>().wait(
+                        operation: operation,
+                        work: computeCurrentLocationAndViewport,
+                        onAbandon: { [weak self] result in
+                            self?.failPageTurnRecovery(with: result)
+                        }
+                    )
+                    guard case let .applied((current, _)) = calculation else {
+                        return false
+                    }
+                    return pageTurnLocatorMatchesOriginal(current, locator)
                 }
             }
 
@@ -1395,7 +2118,50 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             let contentWidth = geometry.contentWidth
             let readLiveProgression = geometry.progression
             guard contentWidth > pageWidth + 0.5 else {
-                // Both dimensions valid and content fits one viewport: single page.
+                // In continuous scroll, a resource can be one column wide but
+                // many viewports tall. Verify the requested resource-local
+                // offset against PaginationView's outer live Y.
+                if locatorHasWithinResourceTarget(locator),
+                   let resourceIndex = readingOrder.firstIndexWithHREF(locator.href),
+                   let spreadIndex = spreads.firstIndexWithReadingOrderIndex(resourceIndex),
+                   paginationView.axis == .verticalContinuous
+                   || pageTurnVerticalLocationVerifierForTesting != nil
+                {
+                    let location = PageLocation.locator(
+                        resolvePageTurnLocatorForRestore(locator)
+                    )
+                    if let verify = pageTurnVerticalLocationVerifierForTesting {
+                        let verification = await NavigationOperationWaiter<Bool>().wait(
+                            operation: operation,
+                            work: { await verify(location, spreadIndex) },
+                            onAbandon: { [weak self] result in
+                                self?.failPageTurnRecovery(with: result)
+                            }
+                        )
+                        if case .applied(true) = verification {
+                            return true
+                        }
+                        return false
+                    }
+                    let verification = await NavigationOperationWaiter<Bool>().wait(
+                        operation: operation,
+                        work: {
+                            await paginationView.isAtVerticalLocation(
+                                location,
+                                at: spreadIndex
+                            )
+                        },
+                        onAbandon: { [weak self] result in
+                            self?.failPageTurnRecovery(with: result)
+                        }
+                    )
+                    if case .applied(true) = verification {
+                        return true
+                    }
+                    return false
+                }
+                // Horizontal content that fits one viewport has no additional
+                // within-resource page to verify.
                 return true
             }
 
@@ -1410,7 +2176,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 if pageTurnLocatorMatchesOriginal(live, locator) {
                     return true
                 }
-                await waitForPageTurnDisplayFrame()
+                guard await waitForVerificationFrame() else { return false }
                 let retriedProgression = readLiveProgression()
                 let retried = Locator(
                     href: locator.href,
@@ -1420,10 +2186,25 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 if pageTurnLocatorMatchesOriginal(retried, locator) {
                     return true
                 }
-                // Half-page tolerance for goToIndex column rounding.
-                let pageSpan = Double(pageWidth / contentWidth)
-                return abs(retriedProgression - expectedProgression)
-                    <= max(pageSpan * 0.51, 0.001)
+                let snapsToPage = pageTurnSnapsToPageForTesting
+                    ?? !(viewModel.scroll && viewModel.verticalText)
+                let reachable = EPUBReflowableSpreadView.reachableHorizontalProgression(
+                    requested: expectedProgression,
+                    pageWidth: pageWidth,
+                    contentWidth: contentWidth,
+                    isRTL: viewModel.readingProgression == .rtl,
+                    snapsToPage: snapsToPage
+                )
+                if snapsToPage {
+                    let pageSpan = Double(pageWidth / contentWidth)
+                    return abs(retriedProgression - reachable)
+                        <= max(pageSpan * 0.51, 0.001)
+                }
+                let pixelTolerance = Double(
+                    EPUBReflowableSpreadView.settlementPixelTolerance / contentWidth
+                )
+                return abs(retriedProgression - reachable)
+                    <= max(pixelTolerance, 0.000_001)
             }
 
             if let expectedPosition = locator.locations.position {
@@ -1433,7 +2214,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 ), livePosition == expectedPosition {
                     return true
                 }
-                await waitForPageTurnDisplayFrame()
+                guard await waitForVerificationFrame() else { return false }
                 if let retriedPosition = pageTurnPosition(
                     href: locator.href,
                     progression: readLiveProgression()
@@ -1443,6 +2224,20 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 // Position-only multi-column without a positions list cannot be
                 // verified from resource index alone — fail closed so restore runs.
                 return false
+            }
+
+            // A DOM target in a multi-column resource cannot be verified from
+            // the resource index: the live view may still be on another column.
+            if locatorHasPreciseDOMTarget(locator) {
+                guard
+                    let spreadView = paginationView.currentView as? EPUBSpreadView
+                else {
+                    return false
+                }
+                return await (spreadView.isLocatorVisible(
+                    locator,
+                    operation: operation
+                )).isApplied
             }
 
             // No within-resource anchor: resource index is the best available signal.
@@ -1475,6 +2270,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return positions[safeIndex].locations.position
     }
 
+    private func locatorHasWithinResourceTarget(_ locator: Locator) -> Bool {
+        locator.locations.progression != nil
+            || locator.locations.position != nil
+            || !locator.locations.fragments.isEmpty
+            || locator.locations.otherLocations["cssSelector"] != nil
+            || locator.text.highlight != nil
+    }
+
     private func pageTurnLocatorMatchesOriginal(
         _ current: Locator?,
         _ original: Locator
@@ -1503,70 +2306,184 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return false
     }
 
-    private func restorePageTurnLocator(_ locator: Locator) async -> Bool {
+    private func restorePageTurnLocator(
+        _ locator: Locator,
+        operation: NavigationOperationToken
+    ) async -> NavigationMutationResult {
+        // Recovery remains under the owning executor's deadline and watchdog.
+        // A fresh token would let a timed-out request continue without an active
+        // executor task to cancel it.
+        operation.beginRecovery()
+        pageTurnRestoreUsedOperationTokenForTesting = true
         if let pageTurnOriginalLocationRestoreForTesting {
             return await pageTurnOriginalLocationRestoreForTesting()
+                ? NavigationMutationResult.applied(
+                    mayHaveMutated: true,
+                    stableLocator: locator
+                ).verifiedStableLocation()
+                : .rejected(
+                    operation.check() ?? .spreadNotLoaded,
+                    mayHaveMutated: true,
+                    stableLocator: locator,
+                    stage: .stableLocationRestore
+                )
         }
-        // Reflowable `go(to:)` only scrolls by progression/fragments. Fill in
-        // progression from the positions list when the saved Locator is
-        // position-only so same-resource multi-column restore can land.
         let resolved = resolvePageTurnLocatorForRestore(locator)
-        if let pageTurnRestoreGoForTesting {
-            return await pageTurnRestoreGoForTesting(resolved)
+        let mutation: NavigationMutationResult
+        if let restoreGo = pageTurnRestoreGoForTesting {
+            mutation = await restoreGo(resolved)
+                ? .applied(mayHaveMutated: true, stableLocator: resolved)
+                : .rejected(
+                    .spreadNotLoaded,
+                    mayHaveMutated: true,
+                    stableLocator: resolved,
+                    stage: .stableLocationRestore
+                )
+        } else if let restoreGo = pageTurnRestoreGoToIndexForTesting {
+            mutation = await restoreGo(resolved)
+                ? .applied(mayHaveMutated: true, stableLocator: resolved)
+                : .rejected(
+                    .spreadNotLoaded,
+                    mayHaveMutated: true,
+                    stableLocator: resolved,
+                    stage: .stableLocationRestore
+                )
+        } else {
+            guard
+                let paginationView,
+                let resourceIndex = readingOrder.firstIndexWithHREF(locator.href),
+                let spreadIndex = spreads.firstIndexWithReadingOrderIndex(resourceIndex)
+            else {
+                return .rejected(
+                    .spreadNotLoaded,
+                    mayHaveMutated: false,
+                    stableLocator: resolved,
+                    stage: .stableLocationRestore
+                )
+            }
+            mutation = await (paginationView.goToIndexWithMutation(
+                spreadIndex,
+                location: .locator(resolved),
+                options: .none,
+                waitForLoad: true,
+                operation: operation
+            )).preservingStableLocator(resolved)
         }
-        guard
-            let paginationView,
-            let resourceIndex = readingOrder.firstIndexWithHREF(locator.href),
-            let spreadIndex = spreads.firstIndexWithReadingOrderIndex(resourceIndex)
-        else {
-            return false
+        guard mutation.result.isApplied else { return mutation }
+        if let result = operation.check() {
+            return .rejected(
+                result,
+                mayHaveMutated: mutation.mayHaveMutated,
+                stableLocator: mutation.stableLocator ?? resolved,
+                stage: .stableLocationRestore
+            )
         }
-        return await paginationView.goToIndex(
-            spreadIndex,
-            location: .locator(resolved),
-            options: .none
+        let verified = await isLiveViewAtPageTurnOriginalLocator(
+            resolved,
+            operation: operation
         )
+        guard verified else {
+            return .rejected(
+                operation.check() ?? .spreadNotLoaded,
+                mayHaveMutated: mutation.mayHaveMutated,
+                stableLocator: mutation.stableLocator ?? resolved,
+                stage: .stableLocationRestore
+            )
+        }
+        return mutation.verifiedStableLocation()
     }
 
     /// Prefer an explicit progression; otherwise map `locations.position` to
     /// the matching entry in `positionsByReadingOrder`.
     private func resolvePageTurnLocatorForRestore(_ locator: Locator) -> Locator {
+        resolveLocatorProgression(locator) ?? locator
+    }
+
+    /// Fills in progression from `positionsByReadingOrder` when the locator
+    /// has a position but no progression. Pure position locators return `nil`
+    /// when they cannot be mapped. Locators that already have a precise DOM
+    /// target keep the original locator so navigation can still proceed.
+    func resolveLocatorProgression(_ locator: Locator) -> Locator? {
         if locator.locations.progression != nil {
             return locator
         }
-        guard
+        guard locator.locations.position != nil else {
+            return locator
+        }
+        if locatorHasPreciseDOMTarget(locator) {
+            return locator
+        }
+        if
             let expectedPosition = locator.locations.position,
             let resourceIndex = readingOrder.firstIndexWithHREF(locator.href),
             let positions = positionsByReadingOrder.getOrNil(resourceIndex),
-            let match = positions.first(where: { $0.locations.position == expectedPosition })
-        else {
-            return locator
+            let match = positions.first(where: { $0.locations.position == expectedPosition }),
+            let progression = match.locations.progression
+        {
+            return locator.copy { locations in
+                locations.progression = progression
+            }
         }
-        return match
+        return nil
+    }
+
+    private func locatorHasPreciseDOMTarget(_ locator: Locator) -> Bool {
+        locator.text.highlight != nil
+            || !locator.locations.fragments.isEmpty
+            || locator.locations.cssSelector != nil
+            || locator.locations.domRange != nil
     }
 
     private func runPageTurn(
         to direction: EPUBSpreadView.Direction,
-        options: NavigatorGoOptions
-    ) async -> Bool {
-        guard let session = await beginPageTurn(to: direction) else { return false }
+        options: NavigatorGoOptions,
+        operation: NavigationOperationToken
+    ) async -> NavigationMutationResult {
+        let beginning = await beginPageTurn(to: direction, operation: operation)
+        guard case let .applied(session) = beginning else {
+            return .rejected(
+                beginning.result,
+                mayHaveMutated: false,
+                stage: .preflight
+            )
+        }
         guard !Task.isCancelled else {
             finishPageTurn(session)
-            return false
+            return .rejected(
+                .cancelled,
+                mayHaveMutated: false,
+                stage: .preflight
+            )
         }
 
-        return await commitPageTurn(session, options: options)
+        return await commitPageTurn(
+            session,
+            options: options,
+            operation: operation
+        )
     }
 
     private func turnWithPageSurface(
         to direction: EPUBSpreadView.Direction,
         style: EPUBPageTurnStyle,
-        target: Locator? = nil
-    ) async -> Bool {
-        guard let session = await beginPageTurn(to: direction) else { return false }
+        target: Locator? = nil,
+        operation: NavigationOperationToken
+    ) async -> NavigationMutationResult {
+        let beginning = await beginPageTurn(to: direction, operation: operation)
+        guard case let .applied(session) = beginning else {
+            return .rejected(
+                beginning.result,
+                mayHaveMutated: false,
+                stage: .preflight
+            )
+        }
         guard !Task.isCancelled else {
             finishPageTurn(session)
-            return false
+            return .rejected(
+                .cancelled,
+                mayHaveMutated: false,
+                stage: .preflight
+            )
         }
         let transaction = PageTurnTransaction(
             session: session,
@@ -1579,7 +2496,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // commit before prepare so a failed surface overlay still navigates.
         transaction.didResolveCommitBeforePrepare = true
         transaction.resolve(.commit)
-        return await Self.runPageTurnTransaction(transaction) { self }
+        return await Self.runPageTurnTransaction(
+            transaction,
+            operation: operation
+        ) { self }
     }
 
     private func pageTurnRootView(for style: EPUBPageTurnStyle) -> UIView? {
@@ -1658,18 +2578,29 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private static func waitForPageTurnPreview(
-        calculating: () async -> (Locator?, NavigatorViewport?),
+        calculating: @escaping () async -> (Locator?, NavigatorViewport?),
         displayFrameWaiter: (() async -> Void)?,
+        operation: NavigationOperationToken,
         isCancelled: () -> Bool = { Task.isCancelled }
     ) async -> PageTurnPreview? {
         for _ in 0 ..< 60 {
-            guard !isCancelled() else { return nil }
-            let result = await calculating()
-            guard !isCancelled() else { return nil }
+            guard !isCancelled(), operation.check() == nil else { return nil }
+            let calculation = await NavigationOperationWaiter<(
+                Locator?, NavigatorViewport?
+            )>().wait(
+                operation: operation,
+                work: calculating
+            )
+            guard case let .applied(result) = calculation else { return nil }
+            guard !isCancelled(), operation.check() == nil else { return nil }
             if let location = result.0, let viewport = result.1 {
                 return PageTurnPreview(location: location, viewport: viewport)
             }
-            await waitForPageTurnDisplayFrame(displayFrameWaiter)
+            let frame = await NavigationOperationWaiter<Void>().wait(
+                operation: operation,
+                work: { await waitForPageTurnDisplayFrame(displayFrameWaiter) }
+            )
+            guard frame.result.isApplied else { return nil }
         }
         return nil
     }
@@ -1706,9 +2637,31 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         pageTurnDisplayFrameWaiter = nil
     }
 
+    private func waitForPageTurnDisplayFrame(
+        operation: NavigationOperationToken
+    ) async -> NavigationResult {
+        if let result = operation.check() { return result }
+        let cancellationTask = Task { @MainActor [weak self] in
+            _ = await operation.waitForCancellation()
+            self?.pageTurnDisplayFrameWaiter?.cancel()
+            self?.pageTurnDisplayFrameWaiter = nil
+        }
+        await waitForPageTurnDisplayFrame()
+        cancellationTask.cancel()
+        return operation.check() ?? .applied
+    }
+
     private func waitForPageTurnDisplayFrames() async {
         await waitForPageTurnDisplayFrame()
         await waitForPageTurnDisplayFrame()
+    }
+
+    private func waitForPageTurnDisplayFrames(
+        operation: NavigationOperationToken
+    ) async -> NavigationResult {
+        let first = await waitForPageTurnDisplayFrame(operation: operation)
+        guard first.isApplied else { return first }
+        return await waitForPageTurnDisplayFrame(operation: operation)
     }
 
     private static func waitForPageTurnDisplayFrames(
@@ -1728,17 +2681,48 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return
         }
         transaction.start()
-        pageTurnTransactionTask = Task { @MainActor [weak self, transaction] in
-            await Self.runPageTurnTransaction(transaction) { [weak self] in
-                self
+        let relativeDirection: NavigationRelativeDirection =
+            transaction.session.direction == .left ? .backward : .forward
+        let executor = navigationExecutor
+        let timeout = navigationOperationTimeout
+        let owner = WeakNavigationOwner(self)
+        pageTurnTransactionTask = Task { @MainActor [owner, transaction] in
+            let result = await executor.submit(
+                intent: .relative(relativeDirection),
+                timeout: timeout
+            ) { [owner, transaction] operation in
+                let stableLocator = owner.value?.currentLocation
+                let mutation = await Self.runPageTurnTransaction(
+                    transaction,
+                    operation: operation
+                ) {
+                    owner.value
+                }
+                let terminalMutation = operation.check().map {
+                    mutation.replacingResult(
+                        $0,
+                        stableLocator: mutation.stableLocator ?? stableLocator,
+                        failureStage: mutation.failureStage ?? .pageViewMutation
+                    )
+                } ?? mutation
+                guard let navigator = owner.value else {
+                    return terminalMutation.result
+                }
+                return await navigator.finalizeNavigationMutation(
+                    terminalMutation,
+                    stableLocator: stableLocator,
+                    operation: operation
+                )
             }
+            return result.isApplied
         }
     }
 
     private static func runPageTurnTransaction(
         _ transaction: PageTurnTransaction,
+        operation: NavigationOperationToken,
         navigator: @escaping @MainActor () -> EPUBNavigatorViewController?
-    ) async -> Bool {
+    ) async -> NavigationMutationResult {
         if Task.isCancelled {
             transaction.resolve(.cancel)
         }
@@ -1755,6 +2739,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         } else {
             prepared = await preparePageTurnSurface(
                 transaction,
+                operation: operation,
                 navigator: navigator
             )
         }
@@ -1762,34 +2747,53 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         if Task.isCancelled {
             transaction.resolve(.cancel)
         }
-        guard let intent = await transaction.waitForTerminalIntent() else {
-            transaction.complete(with: false)
-            return false
+        guard let intent = await transaction.waitForTerminalIntent(
+            operation: operation
+        ) else {
+            let result = transaction.mutationResult.replacingResult(
+                operation.check() ?? .cancelled,
+                stableLocator: transaction.mutationResult.stableLocator
+                    ?? transaction.originalLocator,
+                failureStage: .preflight
+            )
+            transaction.complete(with: result)
+            return result
         }
         guard
             let owner = navigator(),
             owner.pageTurnTransaction === transaction
         else {
-            transaction.complete(with: false)
-            return false
+            let result = transaction.mutationResult.replacingResult(
+                operation.check() ?? .cancelled,
+                stableLocator: transaction.mutationResult.stableLocator
+                    ?? transaction.originalLocator,
+                failureStage: .preflight
+            )
+            transaction.complete(with: result)
+            return result
         }
-        owner.pageTurnTransactionTask = nil
-
-        let result: Bool
+        let result: NavigationMutationResult
         if transaction.style == .none {
             if intent == .commit {
                 result = await owner.commitPageTurn(
                     transaction.session,
-                    options: .none
+                    options: .none,
+                    operation: operation
                 )
             } else {
                 owner.finishPageTurn(transaction.session)
-                result = false
+                result = transaction.mutationResult.replacingResult(
+                    .cancelled,
+                    stableLocator: transaction.mutationResult.stableLocator
+                        ?? transaction.originalLocator,
+                    failureStage: .preflight
+                )
             }
         } else if intent == .commit, transaction.isPrepared {
             result = await owner.commitPageTurnSurface(
                 transaction,
-                progress: transaction.progress
+                progress: transaction.progress,
+                operation: operation
             )
         } else if intent == .commit {
             // Committed intent with a failed surface prepare (interactive pan,
@@ -1797,25 +2801,58 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             // failure mid-prepare). Always degrade to instant navigation rather
             // than cancel-restore and swallow the page turn.
             result = await owner.commitPageTurnAfterFailedSurfacePrepare(
-                transaction
+                transaction,
+                operation: operation
             )
         } else {
-            let restored = await owner.restorePageTurnSurface(
-                transaction.session
-            )
-            if !restored {
-                _ = await owner.releaseFailedPageTurnRestore(
-                    transaction.session
+            var stableVerified = false
+            await owner.runPageTurnRecovery(
+                for: transaction,
+                operation: operation
+            ) { owner, transaction, generation in
+                let restored = await owner.restorePageTurnSurface(
+                    transaction.session,
+                    recoveryTransaction: transaction,
+                    recoveryGeneration: generation,
+                    operation: operation
                 )
+                guard owner.isCurrentPageTurnRecovery(
+                    transaction,
+                    generation: generation
+                ) else {
+                    return
+                }
+                if restored {
+                    stableVerified = true
+                } else {
+                    stableVerified = await owner.releaseFailedPageTurnRestore(
+                        transaction.session,
+                        operation: operation
+                    )
+                }
             }
-            result = false
+            let rejected = NavigationMutationResult.rejected(
+                operation.check() ?? .cancelled,
+                mayHaveMutated: transaction.mutationResult.mayHaveMutated,
+                stableLocator: transaction.mutationResult.stableLocator
+                    ?? transaction.originalLocator,
+                stage: .stableLocationRestore
+            )
+            result = stableVerified
+                ? rejected.verifiedStableLocation()
+                : rejected
         }
 
         transaction.complete(with: result)
+        guard owner.pageTurnTransaction === transaction else {
+            owner.finishPageTurnRecovery(for: transaction)
+            return result
+        }
         // Always detach this transaction and attempt pending reverse resume.
         // Do not require isIdle first: a failed restore can leave the controller
         // non-idle, which previously skipped resume and dropped the reverse.
         if owner.pageTurnTransaction === transaction {
+            owner.pageTurnTransactionTask = nil
             owner.pageTurnTransaction = nil
         }
         if owner.pageTurnTransaction == nil, owner.pageTurnSurfaceAnimator != nil {
@@ -1828,6 +2865,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
         owner.releasePageTurnNavigatorNavigationLock()
         owner.applyDeferredPageTurnInteractionMode()
+        owner.finishPageTurnRecovery(for: transaction)
         await owner.resumePendingPageTurnGesture()
         return result
     }
@@ -1838,8 +2876,42 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         !Task.isCancelled && !transaction.isPrepareCancelled
     }
 
+    /// Keeps a strong navigator reference scoped to surface installation. A
+    /// task which later waits on navigation/WebKit/test gates must only retain
+    /// the weak provider closure so deinit can cancel that task.
+    private static func installPageTurnSurface(
+        _ transaction: PageTurnTransaction,
+        navigator: @escaping @MainActor () -> EPUBNavigatorViewController?
+    ) async -> Bool {
+        guard let owner = navigator() else { return false }
+        var style = transaction.style
+        var didInstall = await owner.installPageTurnSurface(
+            transaction.session,
+            style: style
+        )
+        if !didInstall, style == .simulation, isPageTurnPrepareActive(transaction) {
+            style = .push
+            didInstall = await owner.installPageTurnSurface(
+                transaction.session,
+                style: style
+            )
+            if didInstall {
+                transaction.style = .push
+            } else if isPageTurnPrepareActive(transaction) {
+                transaction.style = .none
+                owner.forceReleaseOrphanPageTurnSurface()
+                return true
+            }
+        }
+        return didInstall
+            && owner.pageTurnTransaction === transaction
+            && owner.pageTurnController.isTracking(transaction.session)
+            && isPageTurnPrepareActive(transaction)
+    }
+
     private static func preparePageTurnSurface(
         _ transaction: PageTurnTransaction,
+        operation: NavigationOperationToken,
         navigator: @escaping @MainActor () -> EPUBNavigatorViewController?
     ) async -> Bool {
         let session = transaction.session
@@ -1859,39 +2931,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         else {
             return fail("precondition")
         }
-        let installed: Bool
-        if let owner = navigator() {
-            var style = transaction.style
-            var didInstall = await owner.installPageTurnSurface(
-                session,
-                style: style
-            )
-            // Simulation needs a full-page host + Metal rasterization. When that
-            // is unavailable but a plain snapshot root is, degrade to push so the
-            // turn still completes instead of failing silently.
-            if !didInstall, style == .simulation, isPageTurnPrepareActive(transaction) {
-                style = .push
-                didInstall = await owner.installPageTurnSurface(
-                    session,
-                    style: style
-                )
-                if didInstall {
-                    transaction.style = .push
-                } else if isPageTurnPrepareActive(transaction) {
-                    // Final degradation: `.none` needs no snapshot root and still
-                    // commits via instant navigation instead of failing closed.
-                    transaction.style = .none
-                    owner.forceReleaseOrphanPageTurnSurface()
-                    return true
-                }
-            }
-            installed = didInstall
-                && owner.pageTurnTransaction === transaction
-                && owner.pageTurnController.isTracking(session)
-                && isPageTurnPrepareActive(transaction)
-        } else {
-            installed = false
-        }
+        let installed = await installPageTurnSurface(
+            transaction,
+            navigator: navigator
+        )
         guard installed else {
             return fail("install")
         }
@@ -1906,6 +2949,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             let originalPreview = await waitForPageTurnPreview(
                 calculating: originalCalculation,
                 displayFrameWaiter: navigator()?.pageTurnDisplayFrameWaiterForTesting,
+                operation: operation,
                 isCancelled: { !isPageTurnPrepareActive(transaction) }
             )
         else {
@@ -1918,19 +2962,21 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         guard let navigation = navigator()?.pageTurnNavigation(
             session,
             options: .none,
-            target: transaction.target
+            target: transaction.target,
+            operation: operation
         )
         else {
             return fail("navigation-missing")
         }
-        if
-            let owner = navigator(),
-            let coldTarget = owner.coldPageTurnTargetIndexForTesting
-        {
-            owner.didBeginWithColdTargetForTesting =
-                owner.paginationView?.loadedViews[coldTarget] == nil
+        if let coldTarget = navigator()?.coldPageTurnTargetIndexForTesting {
+            navigator()?.didBeginWithColdTargetForTesting =
+                navigator()?.paginationView?.loadedViews[coldTarget] == nil
         }
-        let moved = await navigation()
+        let mutation = await navigation()
+        transaction.mutationResult = mutation.preservingStableLocator(
+            transaction.originalLocator
+        )
+        let moved = mutation.result.isApplied
         // Mark as soon as navigation succeeds so cancel landing between this
         // return and the guards below still triggers reverse restore.
         if moved {
@@ -1952,20 +2998,18 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             var targetPreview = await waitForPageTurnPreview(
                 calculating: targetCalculation,
                 displayFrameWaiter: navigator()?.pageTurnDisplayFrameWaiterForTesting,
+                operation: operation,
                 isCancelled: { !isPageTurnPrepareActive(transaction) }
             )
         else {
             return fail("target-preview")
         }
         guard isPageTurnPrepareActive(transaction) else { return fail("cancelled-after-target-preview") }
-        if
-            let coldTarget = navigator()?.coldPageTurnTargetIndexForTesting,
-            let owner = navigator()
-        {
-            owner.didNavigateColdTargetForTesting =
-                owner.didBeginWithColdTargetForTesting
-                    && owner.paginationView?.currentIndex == coldTarget
-                    && owner.paginationView?.loadedViews[coldTarget] != nil
+        if let coldTarget = navigator()?.coldPageTurnTargetIndexForTesting {
+            navigator()?.didNavigateColdTargetForTesting =
+                navigator()?.didBeginWithColdTargetForTesting == true
+                    && navigator()?.paginationView?.currentIndex == coldTarget
+                    && navigator()?.paginationView?.loadedViews[coldTarget] != nil
         }
         var isTargetPreviewStable = false
         for _ in 0 ..< 3 {
@@ -1986,6 +3030,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 let refreshedPreview = await waitForPageTurnPreview(
                     calculating: refreshedCalculation,
                     displayFrameWaiter: navigator()?.pageTurnDisplayFrameWaiterForTesting,
+                    operation: operation,
                     isCancelled: { !isPageTurnPrepareActive(transaction) }
                 )
             else {
@@ -2009,13 +3054,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         guard navigator()?.capturePageTurnTargetSurface() == true else {
             return fail("capture-target")
         }
-        if
-            navigator()?.isColdPageTurnArmedForTesting == true,
-            let owner = navigator()
-        {
-            owner.didCaptureAfterColdNavigationForTesting =
-                owner.didNavigateColdTargetForTesting
-                    && owner.pageTurnSurfaceAnimator?.hasTarget == true
+        if navigator()?.isColdPageTurnArmedForTesting == true {
+            navigator()?.didCaptureAfterColdNavigationForTesting =
+                navigator()?.didNavigateColdTargetForTesting == true
+                    && navigator()?.pageTurnSurfaceAnimator?.hasTarget == true
         }
         await waitForPageTurnDisplayFrames(
             navigator()?.pageTurnDisplayFrameWaiterForTesting
@@ -2129,23 +3171,47 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private func commitPageTurnSurface(
         _ transaction: PageTurnTransaction,
-        progress: CGFloat
-    ) async -> Bool {
+        progress: CGFloat,
+        operation: NavigationOperationToken
+    ) async -> NavigationMutationResult {
         let session = transaction.session
-        guard let animator = pageTurnSurfaceAnimator else { return false }
+        guard let animator = pageTurnSurfaceAnimator else {
+            return .rejected(
+                .spreadNotLoaded,
+                mayHaveMutated: transaction.mutationResult.mayHaveMutated,
+                stableLocator: transaction.mutationResult.stableLocator
+                    ?? transaction.originalLocator,
+                stage: .publication
+            )
+        }
         pageTurnWillValidateCommitForTesting?()
         guard await matchPageTurnSurfaceIdentities() else {
-            return await cancelPageTurnSurface(session)
+            _ = await cancelPageTurnSurface(session, operation: operation)
+            return .rejected(
+                operation.check() ?? .spreadNotLoaded,
+                mayHaveMutated: transaction.mutationResult.mayHaveMutated,
+                stableLocator: transaction.mutationResult.stableLocator
+                    ?? transaction.originalLocator,
+                stage: .stableLocationRestore
+            )
         }
         guard
             pageTurnTransaction === transaction,
+            !transaction.isInvalidated,
             transaction.terminalIntent == .commit,
             pageTurnController.isTracking(session)
         else {
-            return await cancelPageTurnSurface(session)
+            _ = await cancelPageTurnSurface(session, operation: operation)
+            return .rejected(
+                operation.check() ?? .cancelled,
+                mayHaveMutated: transaction.mutationResult.mayHaveMutated,
+                stableLocator: transaction.mutationResult.stableLocator
+                    ?? transaction.originalLocator,
+                stage: .stableLocationRestore
+            )
         }
         let remaining = 1 - min(max(progress, 0), 1)
-        return await pageTurnController.commit(session) { [self] in
+        let committed = await pageTurnController.commit(session) { [self] in
             var canCleanup = false
             defer {
                 if canCleanup {
@@ -2160,7 +3226,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 shouldContinue: { !transaction.isInvalidated }
             )
             guard didAnimate, !transaction.isInvalidated else {
-                _ = await recoverOriginalPageTurnAfterCommitFailure(animator)
+                _ = await recoverOriginalPageTurnAfterCommitFailure(
+                    animator,
+                    operation: operation
+                )
                 // Always release the surface after a failed commit so the next
                 // turn is not blocked by an orphan animator.
                 canCleanup = true
@@ -2168,18 +3237,27 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
             await waitForPageTurnDisplayFrames()
             guard !transaction.isInvalidated else {
-                _ = await recoverOriginalPageTurnAfterCommitFailure(animator)
+                _ = await recoverOriginalPageTurnAfterCommitFailure(
+                    animator,
+                    operation: operation
+                )
                 canCleanup = true
                 return false
             }
             guard await matchCommittedPageTurnSurfaceIdentity() else {
                 log(.error, "Page-turn surface identity changed after commit; recovering then releasing the surface.")
-                _ = await recoverOriginalPageTurnAfterCommitFailure(animator)
+                _ = await recoverOriginalPageTurnAfterCommitFailure(
+                    animator,
+                    operation: operation
+                )
                 canCleanup = true
                 return false
             }
             guard let targetPreview = pageTurnSurfaceTargetPreview else {
-                _ = await recoverOriginalPageTurnAfterCommitFailure(animator)
+                _ = await recoverOriginalPageTurnAfterCommitFailure(
+                    animator,
+                    operation: operation
+                )
                 canCleanup = true
                 return false
             }
@@ -2190,25 +3268,54 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             )
             await waitForPageTurnDisplayFrames()
             guard !transaction.isInvalidated else {
-                _ = await recoverOriginalPageTurnAfterCommitFailure(animator)
+                _ = await recoverOriginalPageTurnAfterCommitFailure(
+                    animator,
+                    operation: operation
+                )
                 canCleanup = true
                 return false
             }
             guard await matchCommittedPageTurnSurfaceIdentity() else {
                 log(.error, "Page-turn surface identity changed before publication; recovering then releasing the surface.")
-                _ = await recoverOriginalPageTurnAfterCommitFailure(animator)
+                _ = await recoverOriginalPageTurnAfterCommitFailure(
+                    animator,
+                    operation: operation
+                )
                 canCleanup = true
                 return false
             }
-            let published = await publishPageTurnLocation(transaction)
-            guard published else {
-                log(.error, "Failed to publish the committed page-turn location.")
-                _ = await recoverOriginalPageTurnAfterCommitFailure(animator)
+            guard
+                pageTurnTransaction === transaction,
+                !transaction.isInvalidated,
+                transaction.terminalIntent == .commit
+            else {
+                _ = await recoverOriginalPageTurnAfterCommitFailure(
+                    animator,
+                    operation: operation
+                )
                 canCleanup = true
                 return false
             }
-            if let target = pageTurnSurfaceTargetLocator {
-                delegate?.navigator(self, didJumpTo: target)
+            if pageTurnSurfaceTargetLocator == nil {
+                let published = await publishPageTurnLocation(
+                    transaction,
+                    operation: operation
+                )
+                guard published else {
+                    log(.error, "Failed to publish the committed page-turn location.")
+                    _ = await recoverOriginalPageTurnAfterCommitFailure(
+                        animator,
+                        operation: operation
+                    )
+                    canCleanup = true
+                    return false
+                }
+                // Publication is the final irreversible commit for a relative
+                // surface turn. All frame and identity checks must happen
+                // before it; a deadline firing during cosmetic cleanup cannot
+                // negate a location notification which was already delivered.
+                canCleanup = true
+                return true
             }
             await waitForPageTurnDisplayFrames()
             if transaction.isInvalidated {
@@ -2226,23 +3333,45 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             canCleanup = true
             return true
         }
+        guard committed else {
+            return .rejected(
+                operation.check() ?? .spreadNotLoaded,
+                mayHaveMutated: transaction.mutationResult.mayHaveMutated,
+                stableLocator: transaction.mutationResult.stableLocator
+                    ?? transaction.originalLocator,
+                stage: .stableLocationRestore
+            )
+        }
+        return transaction.mutationResult
     }
 
     private func recoverOriginalPageTurnAfterCommitFailure(
-        _ animator: EPUBPageTurnSurfaceAnimator
+        _ animator: EPUBPageTurnSurfaceAnimator,
+        operation: NavigationOperationToken
     ) async -> Bool {
         guard
             let originalPreview = pageTurnSurfaceOriginalPreview,
             let originalLocator = pageTurnTransaction?.originalLocator
         else {
+            failPageTurnRecovery(with: .spreadNotLoaded)
             return false
         }
-        let didRestoreLocation = await restorePageTurnOriginalLocation()
-        let restored = didRestoreLocation
-            ? await isLiveViewAtPageTurnOriginalLocator(originalPreview.location)
+        let restore = await restorePageTurnLocator(
+            originalLocator,
+            operation: operation
+        )
+        let restored = restore.result.isApplied && restore.stableVerified
+            ? await isLiveViewAtPageTurnOriginalLocator(
+                originalPreview.location,
+                operation: operation
+            )
             : false
         if !restored {
-            guard await reloadPageTurnOriginalLocation(originalLocator) else {
+            guard await reloadPageTurnOriginalLocation(
+                originalLocator,
+                operation: operation
+            ) else {
+                failPageTurnRecovery(with: operation.check() ?? .spreadNotLoaded)
                 return false
             }
         }
@@ -2251,7 +3380,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             previewLocationDidChange: originalPreview.location,
             viewport: originalPreview.viewport
         )
-        await waitForPageTurnDisplayFrames()
+        guard await waitForPageTurnDisplayFrames(operation: operation).isApplied else {
+            failPageTurnRecovery(with: operation.check() ?? .cancelled)
+            return false
+        }
         animator.render(progress: 0)
         // Snapshot recapture is best-effort. Cancel/failure recovery already
         // restored the live page; callers cleanup the surface either way.
@@ -2261,16 +3393,37 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return true
     }
 
-    private func restorePageTurnSurface(_ session: PageTurnSession) async -> Bool {
+    private func restorePageTurnSurface(
+        _ session: PageTurnSession,
+        recoveryTransaction: PageTurnTransaction? = nil,
+        recoveryGeneration: UInt64? = nil,
+        operation: NavigationOperationToken
+    ) async -> Bool {
+        let recoveryIsCurrent: @MainActor () -> Bool = { [self] in
+            guard
+                let recoveryTransaction,
+                let recoveryGeneration
+            else {
+                return true
+            }
+            return isCurrentPageTurnRecovery(
+                recoveryTransaction,
+                generation: recoveryGeneration
+            )
+        }
+        guard recoveryIsCurrent() else { return false }
         let animator = pageTurnSurfaceAnimator
         return await pageTurnController.restoreCover(
             session,
             rebound: { [self] _ in
+                guard recoveryIsCurrent() else { return false }
                 _ = await animator?.animate(to: 0, duration: 0.18)
+                guard recoveryIsCurrent() else { return false }
                 var restored = true
                 if pageTurnSurfaceDidPrepareTarget {
                     if let pageTurnPreparedPageRestoreForTesting {
                         restored = await pageTurnPreparedPageRestoreForTesting()
+                        guard recoveryIsCurrent() else { return false }
                     } else {
                         let inverse = PageTurnSession(
                             direction: session.direction == .left ? .right : .left,
@@ -2278,18 +3431,41 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                         )
                         restored = await pageTurnController.restorePreparedPage(
                             inverse: { [self] in
-                                await performPageTurn(inverse, options: .none)
+                                guard recoveryIsCurrent() else { return false }
+                                let result = await performPageTurn(
+                                    inverse,
+                                    options: .none,
+                                    operation: operation
+                                )
+                                return recoveryIsCurrent() && result.result.isApplied
                             },
                             validateOriginalLocation: { [self] in
-                                await isLiveViewAtPageTurnOriginalLocator(
+                                guard recoveryIsCurrent() else { return false }
+                                let result = await isLiveViewAtPageTurnOriginalLocator(
                                     pageTurnSurfaceOriginalPreview?.location
-                                        ?? pageTurnTransaction?.originalLocator
+                                        ?? pageTurnTransaction?.originalLocator,
+                                    operation: operation
                                 )
+                                return recoveryIsCurrent() && result
                             },
                             originalLocation: { [self] in
-                                await restorePageTurnOriginalLocation()
+                                guard recoveryIsCurrent() else { return false }
+                                guard
+                                    let originalLocation = pageTurnTransaction?.originalLocator
+                                    ?? pageTurnSurfaceOriginalPreview?.location
+                                else {
+                                    return false
+                                }
+                                let result = await restorePageTurnLocator(
+                                    originalLocation,
+                                    operation: operation
+                                )
+                                return recoveryIsCurrent()
+                                    && result.result.isApplied
+                                    && result.stableVerified
                             }
                         )
+                        guard recoveryIsCurrent() else { return false }
                     }
                     if !restored {
                         log(.error, "Failed to restore the original page-turn location.")
@@ -2301,9 +3477,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                         previewLocationDidChange: originalPreview.location,
                         viewport: originalPreview.viewport
                     )
-                    await waitForPageTurnDisplayFrames()
+                    guard await waitForPageTurnDisplayFrames(operation: operation).isApplied else {
+                        return false
+                    }
+                    guard recoveryIsCurrent() else { return false }
                 } else if restored {
-                    await waitForPageTurnDisplayFrames()
+                    guard await waitForPageTurnDisplayFrames(operation: operation).isApplied else {
+                        return false
+                    }
+                    guard recoveryIsCurrent() else { return false }
                 }
                 // Recapture is cosmetic for the cancel path: cleanup removes
                 // the surface immediately after a successful rebound. Do not
@@ -2314,29 +3496,48 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 return restored
             },
             cleanup: { [self] in
+                guard recoveryIsCurrent() else { return }
                 cleanupPageTurnSurface(session)
             },
             finish: { [self] session in
+                guard recoveryIsCurrent() else { return }
                 finishPageTurn(session)
             }
         )
     }
 
-    private func cancelPageTurnSurface(_ session: PageTurnSession) async -> Bool {
-        if !(await restorePageTurnSurface(session)) {
-            _ = await releaseFailedPageTurnRestore(session)
+    private func cancelPageTurnSurface(
+        _ session: PageTurnSession,
+        operation: NavigationOperationToken
+    ) async -> Bool {
+        operation.beginRecovery()
+        let task = Task.detached { @MainActor in
+            await Self.restoreCancelledPageTurn(
+                self,
+                session: session,
+                operation: operation
+            )
         }
+        let recoveryTaskID = operation.registerRecoveryTask(task)
+        await task.value
+        operation.unregisterRecoveryTask(recoveryTaskID)
         return false
     }
 
-    private func restorePageTurnOriginalLocation() async -> Bool {
-        guard
-            let originalLocation = pageTurnTransaction?.originalLocator
-                ?? pageTurnSurfaceOriginalPreview?.location
-        else {
-            return false
+    private static func restoreCancelledPageTurn(
+        _ navigator: EPUBNavigatorViewController,
+        session: PageTurnSession,
+        operation: NavigationOperationToken
+    ) async {
+        if await !navigator.restorePageTurnSurface(
+            session,
+            operation: operation
+        ) {
+            _ = await navigator.releaseFailedPageTurnRestore(
+                session,
+                operation: operation
+            )
         }
-        return await restorePageTurnLocator(originalLocation)
     }
 
     private struct PageTurnLiveGeometry: Equatable {
@@ -2346,12 +3547,28 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         let contentOffset: CGPoint
     }
 
-    private func waitForStablePageTurnLiveView(at location: Locator?) async -> Bool {
+    private func waitForStablePageTurnLiveView(
+        at location: Locator?,
+        operation: NavigationOperationToken
+    ) async -> Bool {
         guard let location else { return false }
         var previous: PageTurnLiveGeometry?
         for _ in 0 ..< 60 {
-            await waitForPageTurnDisplayFrame()
-            let (current, _) = await computeCurrentLocationAndViewport()
+            guard await waitForPageTurnDisplayFrame(operation: operation).isApplied else {
+                return false
+            }
+            let calculation = await NavigationOperationWaiter<(
+                Locator?, NavigatorViewport?
+            )>().wait(
+                operation: operation,
+                work: computeCurrentLocationAndViewport,
+                onAbandon: { [weak self] result in
+                    self?.failPageTurnRecovery(with: result)
+                }
+            )
+            guard case let .applied((current, _)) = calculation else {
+                return false
+            }
             guard
                 current?.href.isEquivalentTo(location.href) == true,
                 current?.locations == location.locations
@@ -2424,7 +3641,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             pageTurnController.invalidatePreCommitSession()?.id == session.id
         {
             transaction.resolve(.cancel)
-            transaction.complete(with: false)
+            transaction.complete(with: transaction.mutationResult.replacingResult(
+                .cancelled,
+                stableLocator: transaction.mutationResult.stableLocator
+                    ?? transaction.originalLocator,
+                failureStage: .preflight
+            ))
             pageTurnTransactionTask?.cancel()
             pageTurnTransactionTask = nil
             pageTurnTransaction = nil
@@ -2452,16 +3674,45 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                     || pageTurnTransaction?.didPrepareTarget == true
             )
 
+        // Mandatory recovery must be visible to the executor before cancelling
+        // the active transaction can let its operation release the lease.
+        if needsLocationRestore, let originalLocator {
+            queueHardAbortLocationRestore(
+                originalLocator,
+                snapAfterRestore: snapDocuments
+            )
+        } else if snapDocuments {
+            // Snapping mutates pagination and spread offsets, so even a
+            // restore-free hard abort must serialize it with user navigation.
+            queueHardAbortLocationRestore(nil, snapAfterRestore: true)
+        }
+
         cancelActivePageTurn(reason: reason)
         pageTurnDisplayFrameWaiter?.cancel()
         pageTurnDisplayFrameWaiter = nil
+        let isDrainingRecovery = pageTurnRecoverySessionID != nil
+        pageTurnRecoveryTask?.cancel()
         pageTurnTransactionTask?.cancel()
-        pageTurnTransactionTask = nil
+        if !isDrainingRecovery {
+            pageTurnTransactionTask = nil
+        }
         if let transaction = pageTurnTransaction {
             transaction.invalidate()
             transaction.resolve(.cancel)
-            transaction.complete(with: false)
+            transaction.complete(with: transaction.mutationResult.replacingResult(
+                .cancelled,
+                stableLocator: transaction.mutationResult.stableLocator
+                    ?? transaction.originalLocator,
+                failureStage: .stableLocationRestore
+            ))
             pageTurnTransaction = nil
+        }
+        // A recovery lease ends only when the old runner has actually
+        // unwound. Ownership checks retire its state commits immediately, but
+        // new navigation must keep waiting for the in-flight WebKit work.
+        if isDrainingRecovery {
+            poisonVisibleSpreads(with: .cancelled)
+            pageTurnRecoveryGeneration &+= 1
         }
         pendingPageTurnGesture = nil
         pageTurnSurfaceAnimator?.cancelAnimation()
@@ -2472,22 +3723,184 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         if let session = pageTurnController.activeSession {
             _ = pageTurnController.finish(session)
         }
-        // Snap web/pagination offsets even when no surface remains — selection
-        // handle drags leave mid-page contentOffset for every page-turn style.
-        // Selection handle paths may pass snapDocuments: false so mid-page
-        // offset remains for native handles.
-        if snapDocuments {
-            snapVisibleDocumentToPageBoundaries()
-        }
         releasePageTurnNavigatorNavigationLock()
         applyDeferredPageTurnInteractionMode()
+    }
 
-        if needsLocationRestore, let originalLocator {
-            queueHardAbortLocationRestore(
-                originalLocator,
-                snapAfterRestore: snapDocuments
+    private func poisonVisibleSpreads(with result: NavigationResult) {
+        guard let loadedViews = paginationView?.loadedViews.values else { return }
+        for view in loadedViews {
+            (view as? EPUBSpreadView)?.poison(with: result)
+        }
+    }
+
+    /// Replaces every poisoned WebView generation and restores the last
+    /// published stable locator before the executor releases its lease.
+    private func replacePoisonedPagination(
+        stableLocator: Locator?,
+        replacementLocator: Locator? = nil,
+        operation: NavigationOperationToken
+    ) async -> NavigationResult {
+        guard let paginationView else { return .spreadNotLoaded }
+        if deferredPoisonedPaginationReplacement == nil {
+            let hasPoisonedView = paginationView.loadedViews.values.contains {
+                ($0 as? EPUBSpreadView)?.isPoisoned == true
+            }
+            guard hasPoisonedView else { return .applied }
+            deferredPoisonedPaginationReplacement = .init(
+                stableLocator: stableLocator ?? currentLocation
+            )
+            paginationView.isolateForDeferredReload()
+        }
+        guard let deferred = deferredPoisonedPaginationReplacement else {
+            return .applied
+        }
+        if let result = operation.check() { return result }
+
+        let rawStableLocator = replacementLocator ?? deferred.stableLocator
+        let locator = rawStableLocator.flatMap { resolveLocatorProgression($0) }
+        if rawStableLocator != nil, locator == nil {
+            paginationView.isolateForDeferredReload()
+            pageTurnPoisonReloadLocatorForTesting = nil
+            return .spreadNotLoaded
+        }
+        pageTurnPoisonReloadLocatorForTesting = locator
+        let targetIndex: Int
+        if
+            let href = locator?.href,
+            let resourceIndex = readingOrder.firstIndexWithHREF(href),
+            let spreadIndex = spreads.firstIndexWithReadingOrderIndex(resourceIndex)
+        {
+            targetIndex = spreadIndex
+        } else {
+            targetIndex = min(currentSpreadIndex, max(0, spreads.count - 1))
+        }
+        let replacementMutation = await paginationView.goToIndexWithMutation(
+            targetIndex,
+            location: PageLocation(locator),
+            options: .none,
+            operation: operation
+        )
+        guard replacementMutation.result.isApplied else {
+            paginationView.isolateForDeferredReload()
+            return replacementMutation.result
+        }
+        guard
+            let replacement = paginationView.loadedViews[targetIndex] as? EPUBSpreadView,
+            !replacement.isPoisoned
+        else {
+            paginationView.isolateForDeferredReload()
+            return .spreadNotLoaded
+        }
+        guard paginationView.currentIndex == targetIndex else {
+            paginationView.isolateForDeferredReload()
+            return .superseded
+        }
+        if let locator {
+            let verified = await verifyLocatorNavigation(
+                locator,
+                moved: true,
+                expectedSpreadIndex: targetIndex,
+                operation: operation
+            )
+            guard verified.isApplied else {
+                paginationView.isolateForDeferredReload()
+                return verified
+            }
+        }
+        if let result = operation.check() {
+            paginationView.isolateForDeferredReload()
+            return result
+        }
+        deferredPoisonedPaginationReplacement = nil
+        return .applied
+    }
+
+    private func recoverPoisonedSpreadsIfNeeded(
+        after result: NavigationResult,
+        stableLocator: Locator?,
+        operation: NavigationOperationToken
+    ) async -> NavigationResult {
+        guard deferredPoisonedPaginationReplacement != nil
+            || paginationView?.loadedViews.values.contains(where: {
+                ($0 as? EPUBSpreadView)?.isPoisoned == true
+            }) == true
+        else {
+            return result
+        }
+        if deferredPoisonedPaginationReplacement == nil {
+            deferredPoisonedPaginationReplacement = .init(
+                stableLocator: stableLocator ?? currentLocation
+            )
+            paginationView?.isolateForDeferredReload()
+        }
+        operation.beginRecovery()
+        let task = Task.detached { @MainActor [weak self] in
+            guard let self else { return NavigationResult.cancelled }
+            return await self.replacePoisonedPagination(
+                stableLocator: stableLocator,
+                operation: operation
             )
         }
+        let recoveryTaskID = operation.registerRecoveryTask(task)
+        let recovery = await task.value
+        operation.unregisterRecoveryTask(recoveryTaskID)
+        return recovery.isApplied ? result : recovery
+    }
+
+    /// Closes the transaction only after a partial mutation has either restored
+    /// and verified its stable locator or isolated the untrusted generation.
+    private func finalizeNavigationMutation(
+        _ mutation: NavigationMutationResult,
+        stableLocator fallbackStableLocator: Locator?,
+        operation: NavigationOperationToken
+    ) async -> NavigationResult {
+        let stableLocator = mutation.stableLocator ?? fallbackStableLocator
+        if !mutation.result.isApplied,
+           mutation.mayHaveMutated,
+           !mutation.stableVerified
+        {
+            var restored = false
+            if operation.check() == nil, let stableLocator {
+                let restore = await restorePageTurnLocator(
+                    stableLocator,
+                    operation: operation
+                )
+                restored = restore.result.isApplied && restore.stableVerified
+            }
+            if !restored {
+                poisonVisibleSpreads(with: mutation.result)
+            }
+        }
+        return await recoverPoisonedSpreadsIfNeeded(
+            after: mutation.result,
+            stableLocator: stableLocator,
+            operation: operation
+        )
+    }
+
+    /// Retires a poisoned generation before the next user mutation. Running
+    /// this only after that mutation could restore the old stable locator over
+    /// a newly applied target while the public API still returned success.
+    private func replacePoisonedPaginationIfNeeded(
+        stableLocator: Locator?,
+        replacementLocator: Locator? = nil,
+        operation: NavigationOperationToken
+    ) async -> NavigationResult {
+        guard deferredPoisonedPaginationReplacement != nil
+            || paginationView?.loadedViews.values.contains(where: {
+                ($0 as? EPUBSpreadView)?.isPoisoned == true
+            }) == true
+        else {
+            return .applied
+        }
+        operation.beginRecovery()
+        return await replacePoisonedPagination(
+            stableLocator: deferredPoisonedPaginationReplacement?.stableLocator
+                ?? stableLocator,
+            replacementLocator: replacementLocator,
+            operation: operation
+        )
     }
 
     private func abortPageTurnInterruptedBySelection(snapDocuments: Bool = true) {
@@ -2507,9 +3920,6 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             reason: "selection-interrupt",
             snapDocuments: snapDocuments
         )
-        if snapDocuments {
-            snapVisibleDocumentToPageBoundaries()
-        }
         updatePageTurnInteractionMode()
     }
 
@@ -2530,20 +3940,31 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// clear / hard-abort with snap, etc.).
     private(set) var pageTurnSnapDocumentCountForTesting = 0
 
-    private var hasInFlightPageTurnWork: Bool {
+    private var hasInFlightPageTurnWorkExcludingPendingGesture: Bool {
         pageTurnTransaction != nil
+            || pageTurnRecoverySessionID != nil
             || !pageTurnController.isIdle
             || pageTurnSurfaceAnimator != nil
-            || pendingPageTurnGesture != nil
             || hardAbortLocationRestorePending
     }
 
-    private func releaseFailedPageTurnRestore(_ session: PageTurnSession) async -> Bool {
+    private var hasInFlightPageTurnWork: Bool {
+        hasInFlightPageTurnWorkExcludingPendingGesture
+            || pendingPageTurnGesture != nil
+    }
+
+    private func releaseFailedPageTurnRestore(
+        _ session: PageTurnSession,
+        operation: NavigationOperationToken
+    ) async -> Bool {
         guard pageTurnController.isTracking(session) else { return false }
         if
             pageTurnSurfaceDidPrepareTarget,
             let animator = pageTurnSurfaceAnimator,
-            !(await recoverOriginalPageTurnAfterCommitFailure(animator))
+            await !recoverOriginalPageTurnAfterCommitFailure(
+                animator,
+                operation: operation
+            )
         {
             // A real pagination failure is allowed to use the navigator's
             // existing loading/error path, but a transaction may never leave
@@ -2552,7 +3973,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             finishPageTurn(session, didMove: false)
             return false
         }
-        await waitForPageTurnDisplayFrames()
+        guard await waitForPageTurnDisplayFrames(operation: operation).isApplied else {
+            failPageTurnRecovery(with: operation.check() ?? .cancelled)
+            return false
+        }
         cleanupPageTurnSurface(session)
         finishPageTurn(session)
         return true
@@ -2565,7 +3989,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             && pageTurnSurfaceAnimator?.hasMountedSurface == false
     }
 
-    private func reloadPageTurnOriginalLocation(_ locator: Locator) async -> Bool {
+    private func reloadPageTurnOriginalLocation(
+        _ locator: Locator,
+        operation: NavigationOperationToken
+    ) async -> Bool {
         guard let paginationView, on(.load(locator)) else { return false }
         spreads = EPUBSpread.makeSpreads(
             for: publication,
@@ -2586,7 +4013,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             pageCount: spreads.count,
             readingProgression: viewModel.readingProgression
         )
-        guard await waitForStablePageTurnLiveView(at: locator) else { return false }
+        guard await waitForStablePageTurnLiveView(
+            at: locator,
+            operation: operation
+        ) else {
+            failPageTurnRecovery(with: operation.check() ?? .spreadNotLoaded)
+            return false
+        }
         return on(.loaded)
     }
 
@@ -2609,38 +4042,57 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private func goUsingExistingPath(
         to direction: EPUBSpreadView.Direction,
-        options: NavigatorGoOptions
-    ) async -> Bool {
+        options: NavigatorGoOptions,
+        operation: NavigationOperationToken
+    ) async -> NavigationMutationResult {
         guard
             let paginationView,
             on(.move(direction))
         else {
-            return false
+            return .rejected(
+                .spreadNotLoaded,
+                mayHaveMutated: false,
+                stage: .preflight
+            )
         }
 
-        if
-            let spreadView = paginationView.currentView as? EPUBSpreadView,
-            await spreadView.go(to: direction, options: options)
-        {
-            on(.moved)
-            return true
+        if let spreadView = paginationView.currentView as? EPUBSpreadView {
+            let withinSpread = await spreadView.go(
+                to: direction,
+                options: options,
+                operation: operation
+            )
+            if withinSpread.result.isApplied || withinSpread.mayHaveMutated {
+                on(.moved)
+                return withinSpread
+            }
         }
 
         let isRTL = (viewModel.readingProgression == .rtl)
         let delta = isRTL ? -1 : 1
-        let moved: Bool = await {
+        let mutation: NavigationMutationResult = await {
             switch direction {
             case .left:
                 let location: PageLocation = isRTL ? .start : .end
-                return await paginationView.goToIndex(currentSpreadIndex - delta, location: location, options: options)
+                return await paginationView.goToIndexWithMutation(
+                    currentSpreadIndex - delta,
+                    location: location,
+                    options: options,
+                    operation: operation
+                )
             case .right:
                 let location: PageLocation = isRTL ? .end : .start
-                return await paginationView.goToIndex(currentSpreadIndex + delta, location: location, options: options)
+                return await paginationView.goToIndexWithMutation(
+                    currentSpreadIndex + delta,
+                    location: location,
+                    options: options,
+                    operation: operation
+                )
             }
         }()
 
         on(.moved)
-        return moved
+        return mutation
     }
 
     /// Goes to the next or previous page in the given scroll direction.
@@ -2648,6 +4100,73 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         to direction: EPUBSpreadView.Direction,
         options: NavigatorGoOptions
     ) async -> Bool {
+        invalidateCurrentLocationRefresh()
+        let relativeDirection: NavigationRelativeDirection = direction == .left
+            ? .backward
+            : .forward
+        let result = await navigationExecutor.submit(
+            intent: .relative(relativeDirection),
+            timeout: navigationOperationTimeout
+        ) { [weak self] operation in
+            guard let self else { return .cancelled }
+            let stableLocator = currentLocation
+            let mutation = await performRelativeNavigation(
+                to: direction,
+                options: options,
+                operation: operation
+            )
+            return await finalizeNavigationMutation(
+                mutation,
+                stableLocator: stableLocator,
+                operation: operation
+            )
+        }
+        return result.isApplied
+    }
+
+    private func performRelativeNavigation(
+        to direction: EPUBSpreadView.Direction,
+        options: NavigatorGoOptions,
+        operation: NavigationOperationToken
+    ) async -> NavigationMutationResult {
+        let stableLocator = currentLocation
+        if let result = operation.check() {
+            return .rejected(
+                result,
+                mayHaveMutated: false,
+                stableLocator: stableLocator,
+                stage: .preflight
+            )
+        }
+        let snapshotSettle = await snapshotProvider.settleCapture(operation: operation)
+        guard snapshotSettle.isApplied else {
+            return .rejected(
+                snapshotSettle,
+                mayHaveMutated: false,
+                stableLocator: stableLocator,
+                stage: .settleRecovery
+            )
+        }
+        let recovery = await replacePoisonedPaginationIfNeeded(
+            stableLocator: currentLocation,
+            operation: operation
+        )
+        guard recovery.isApplied else {
+            return .rejected(
+                recovery,
+                mayHaveMutated: false,
+                stableLocator: stableLocator,
+                stage: .stableLocationRestore
+            )
+        }
+        if let result = operation.check() {
+            return .rejected(
+                result,
+                mayHaveMutated: false,
+                stableLocator: stableLocator,
+                stage: .preflight
+            )
+        }
         let accessibilityStatus = accessibilityStatusProvider()
         let style = effectivePageTurnStyle(
             userStyle: pageTurnStyle,
@@ -2655,46 +4174,82 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             isVoiceOverRunning: accessibilityStatus.isVoiceOverRunning
         )
         snapshotProvider.invalidate()
-        return await routePageTurn(
+        let mutation = await routePageTurn(
             to: direction,
             options: options,
             axis: paginationView?.axis,
             isReduceMotionEnabled: accessibilityStatus.isReduceMotionEnabled,
             isVoiceOverRunning: accessibilityStatus.isVoiceOverRunning,
             usingExistingPath: { [self] direction, options in
-                await goUsingExistingPath(to: direction, options: options)
+                await goUsingExistingPath(
+                    to: direction,
+                    options: options,
+                    operation: operation
+                )
             },
             usingPageTurn: { [self] direction, options in
                 if style == .none {
-                    return await turnWithPageSurface(to: direction, style: .none)
+                    return await turnWithPageSurface(
+                        to: direction,
+                        style: .none,
+                        operation: operation
+                    )
                 }
                 if style == .simulation, options.animated {
-                    return await turnWithPageSurface(to: direction, style: .simulation)
+                    return await turnWithPageSurface(
+                        to: direction,
+                        style: .simulation,
+                        operation: operation
+                    )
                 }
                 if style == .push, options.animated {
-                    return await turnWithPageSurface(to: direction, style: .push)
+                    return await turnWithPageSurface(
+                        to: direction,
+                        style: .push,
+                        operation: operation
+                    )
                 }
-                return await runPageTurn(to: direction, options: options)
+                return await runPageTurn(
+                    to: direction,
+                    options: options,
+                    operation: operation
+                )
             },
             usingCover: { [self] direction, options in
                 if options.animated {
-                    return await turnWithPageSurface(to: direction, style: .cover)
+                    return await turnWithPageSurface(
+                        to: direction,
+                        style: .cover,
+                        operation: operation
+                    )
                 }
-                return await runPageTurn(to: direction, options: options)
+                return await runPageTurn(
+                    to: direction,
+                    options: options,
+                    operation: operation
+                )
             }
         )
+        if let result = operation.check() {
+            return mutation.replacingResult(
+                result,
+                stableLocator: stableLocator,
+                failureStage: mutation.failureStage ?? .pageViewMutation
+            )
+        }
+        return mutation.preservingStableLocator(stableLocator)
     }
 
-    func routePageTurn(
+    func routePageTurn<Result>(
         to direction: EPUBSpreadView.Direction,
         options: NavigatorGoOptions,
         axis: PaginationView.Axis?,
         isReduceMotionEnabled: Bool,
         isVoiceOverRunning: Bool,
-        usingExistingPath: (EPUBSpreadView.Direction, NavigatorGoOptions) async -> Bool,
-        usingPageTurn: (EPUBSpreadView.Direction, NavigatorGoOptions) async -> Bool,
-        usingCover: (EPUBSpreadView.Direction, NavigatorGoOptions) async -> Bool
-    ) async -> Bool {
+        usingExistingPath: (EPUBSpreadView.Direction, NavigatorGoOptions) async -> Result,
+        usingPageTurn: (EPUBSpreadView.Direction, NavigatorGoOptions) async -> Result,
+        usingCover: (EPUBSpreadView.Direction, NavigatorGoOptions) async -> Result
+    ) async -> Result {
         var routedOptions = options
         if isReduceMotionEnabled || isVoiceOverRunning {
             routedOptions.animated = false
@@ -2824,6 +4379,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private var needsReloadSpreadsOnActive = false
+    private var scheduledReloadMutationTask: Task<Void, Never>?
 
     private func reloadSpreads() {
         snapshotProvider.invalidate()
@@ -2848,7 +4404,37 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return
         }
 
-        _reloadSpreads()
+        scheduleExecutorReload(reason: "spread-reload")
+    }
+
+    private func scheduleExecutorReload(reason: String) {
+        scheduledReloadMutationTask?.cancel()
+        scheduledReloadMutationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let stableLocator = currentLocation
+            _ = await navigationExecutor.submit(
+                intent: .reload(reason),
+                timeout: navigationOperationTimeout
+            ) { [weak self] operation in
+                guard let self else { return .cancelled }
+                if let result = operation.check() { return result }
+                _reloadSpreads()
+                guard let paginationView else { return .spreadNotLoaded }
+                let targetIndex = currentSpreadIndex
+                while paginationView.loadedViews[targetIndex] == nil {
+                    if let result = operation.check() {
+                        poisonVisibleSpreads(with: result)
+                        return await recoverPoisonedSpreadsIfNeeded(
+                            after: result,
+                            stableLocator: stableLocator,
+                            operation: operation
+                        )
+                    }
+                    try? await Task.sleep(nanoseconds: 1_000_000)
+                }
+                return .applied
+            }
+        }
     }
 
     private func _reloadSpreads() {
@@ -2984,7 +4570,30 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private func scheduleSnapshotMutationDrain() {
         guard !isDrainingSnapshotMutations else { return }
         snapshotProvider.deferReload { [weak self] in
-            self?.drainSnapshotMutations()
+            self?.scheduleExecutorSnapshotMutationDrain()
+        }
+    }
+
+    private func scheduleExecutorSnapshotMutationDrain() {
+        snapshotProvider.performDeferredMutation { [weak self] in
+            guard let self else { return }
+            _ = await navigationExecutor.submit(
+                intent: .reload("snapshot-mutation"),
+                timeout: navigationOperationTimeout
+            ) { [weak self] operation in
+                guard let self else { return .cancelled }
+                if let result = operation.check() { return result }
+                drainSnapshotMutations()
+                if let result = operation.check() {
+                    poisonVisibleSpreads(with: result)
+                    return await recoverPoisonedSpreadsIfNeeded(
+                        after: result,
+                        stableLocator: currentLocation,
+                        operation: operation
+                    )
+                }
+                return .applied
+            }
         }
     }
 
@@ -3163,11 +4772,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         defer { isInstallingPageTurnSurface = false }
         guard let rootView = delegate?.pageTurnRootView(for: self),
               let animator = EPUBPageTurnSurfaceAnimator(
-                rootView: rootView,
-                documentView: view,
-                style: .cover,
-                physicalCompletionDirection: session.physicalCompletionDirection,
-                isForward: session.isForward
+                  rootView: rootView,
+                  documentView: view,
+                  style: .cover,
+                  physicalCompletionDirection: session.physicalCompletionDirection,
+                  isForward: session.isForward
               )
         else {
             pageTurnTransaction = nil
@@ -3189,6 +4798,23 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         to direction: EPUBSpreadView.Direction
     ) async -> Bool {
         await beginPageTurn(to: direction) != nil
+    }
+
+    func beginPageTurnForTesting(
+        to direction: EPUBSpreadView.Direction,
+        operation: NavigationOperationToken
+    ) async -> NavigationResult {
+        let beginning = await beginPageTurn(to: direction, operation: operation)
+        if case let .applied(session) = beginning {
+            finishPageTurn(session)
+        }
+        return beginning.result
+    }
+
+    func awaitPageTurnNavigationLeaseForTesting(
+        operation: NavigationOperationToken
+    ) async -> NavigationResult {
+        await awaitPageTurnNavigationLease(operation: operation)
     }
 
     /// Queues a hard-abort location restore without aborting a live turn.
@@ -3218,6 +4844,36 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             && pendingPageTurnGesture == nil
     }
 
+    var isNavigationQuiescentForTesting: Bool {
+        isPageTurnIdleForTesting
+            && pageTurnRecoverySessionID == nil
+            && pageTurnRecoveryOperationWaiters.isEmpty
+            && hardAbortOperationWaiters.isEmpty
+            && navigationExecutor.activeOperationCountForTesting == 0
+            && navigationExecutor.pendingOperationCountForTesting == 0
+            && navigationExecutor.waiterCountForTesting == 0
+            && snapshotProvider.isIdle
+    }
+
+    func setNavigationOperationTimeoutForTesting(
+        _ timeout: NavigationOperationTimeout
+    ) {
+        navigationOperationTimeout = timeout
+    }
+
+    var navigationQuiescenceDiagnosticsForTesting: String {
+        [
+            "executorActive=\(navigationExecutor.activeOperationCountForTesting)",
+            "executorPending=\(navigationExecutor.pendingOperationCountForTesting)",
+            "executorWaiters=\(navigationExecutor.waiterCountForTesting)",
+            "recovery=\(pageTurnRecoverySessionID == nil ? 0 : 1)",
+            "recoveryWaiters=\(pageTurnRecoveryOperationWaiters.count)",
+            "hardAbortPending=\(pendingHardAbortRecoveryIDs.count)",
+            "hardAbortWaiters=\(hardAbortOperationWaiters.count)",
+            "snapshotIdle=\(snapshotProvider.isIdle ? 1 : 0)",
+        ].joined(separator: ",")
+    }
+
     var isPageTurnControllerIdleForTesting: Bool {
         pageTurnController.isIdle && pageTurnTransaction == nil
     }
@@ -3229,15 +4885,69 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     func isLiveViewAtPageTurnOriginalLocatorForTesting(
         _ locator: Locator?
     ) async -> Bool {
-        await isLiveViewAtPageTurnOriginalLocator(locator)
+        let operation = NavigationOperation(
+            operationID: 0,
+            intent: .absolute("test-live-location-verification"),
+            timeout: navigationOperationTimeout
+        )
+        return await isLiveViewAtPageTurnOriginalLocator(
+            locator,
+            operation: operation
+        )
+    }
+
+    func isLiveViewAtPageTurnOriginalLocatorForTesting(
+        _ locator: Locator?,
+        operation: NavigationOperationToken
+    ) async -> Bool {
+        await isLiveViewAtPageTurnOriginalLocator(
+            locator,
+            operation: operation
+        )
     }
 
     func restorePageTurnLocatorForTesting(_ locator: Locator) async -> Bool {
-        await restorePageTurnLocator(locator)
+        let result = await navigationExecutor.submit(
+            intent: .reload("test-page-turn-locator-restore"),
+            timeout: navigationOperationTimeout
+        ) { [weak self] operation in
+            guard let self else { return .cancelled }
+            return await restorePageTurnLocator(
+                locator,
+                operation: operation
+            ).result
+        }
+        return result.isApplied
     }
 
     func resolvePageTurnLocatorForRestoreForTesting(_ locator: Locator) -> Locator {
         resolvePageTurnLocatorForRestore(locator)
+    }
+
+    func resolveLocatorProgressionForTesting(_ locator: Locator) -> Locator? {
+        resolveLocatorProgression(locator)
+    }
+
+    func replacePoisonedPaginationForTesting(
+        stableLocator: Locator?,
+        operation: NavigationOperationToken
+    ) async -> NavigationResult {
+        deferredPoisonedPaginationReplacement = .init(stableLocator: stableLocator)
+        return await replacePoisonedPagination(
+            stableLocator: stableLocator,
+            operation: operation
+        )
+    }
+
+    func verifyLocatorNavigationForTesting(
+        _ locator: Locator,
+        operation: NavigationOperationToken
+    ) async -> NavigationResult {
+        await verifyLocatorNavigation(
+            locator,
+            moved: true,
+            operation: operation
+        )
     }
 
     func recaptureCurrentPageTurnSurfaceForTesting() -> Bool {
@@ -3430,13 +5140,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private func accessibilityStatusDidChange() {
         cancelActivePageTurn(reason: "accessibilityStatus")
+        // The status change is synchronous on the main actor. Mark the active
+        // transaction again after any cancellation callbacks/re-entrant state
+        // transitions, closing the identity-validation publication window.
+        pageTurnTransaction?.invalidate()
         updatePageTurnInteractionMode()
     }
 
     private func updatePageTurnInteractionMode() {
         guard
             !hasDeferredPageTurnInteractionModeUpdate
-                || (pageTurnTransaction == nil && pageTurnController.isIdle)
+            || (pageTurnTransaction == nil && pageTurnController.isIdle)
         else {
             return
         }
@@ -3570,6 +5284,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         to direction: EPUBSpreadView.Direction,
         velocityX: CGFloat = 0
     ) -> Bool {
+        if pageTurnRecoverySessionID != nil {
+            return bufferPageTurnPanDuringHardAbortRestore(
+                to: direction,
+                velocityX: velocityX
+            )
+        }
         guard shouldBeginPageTurnPan(to: direction) else {
             return false
         }
@@ -3582,6 +5302,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             )
             pageTurnPendingQueueCountForTesting += 1
             transaction.resolve(.cancel)
+            pageTurnTransactionTask?.cancel()
             return true
         }
         // Orphan recovery may queue a restore; buffer the pan rather than
@@ -3661,7 +5382,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         guard
             pageTurnTransaction == nil,
             pageTurnController.isIdle,
-            let session = await beginPageTurn(to: pending.direction)
+            let session = await beginPageTurn(
+                to: pending.direction,
+                ownsPendingGesture: true
+            )
         else {
             if pageTurnTransaction == nil, pageTurnController.isIdle {
                 pendingPageTurnGesture = nil
@@ -3846,7 +5570,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         )
     }
 
-    private func currentLocationCalculation() -> (
+    private func currentLocationCalculation(
+        ignoringPendingLocator: Bool = false
+    ) -> (
         () async -> (Locator?, NavigatorViewport?)
     ) {
         if case .initializing = state {
@@ -3856,7 +5582,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
         // Returns any pending locator to prevent returning invalid locations
         // while loading it.
-        if let pendingLocator = state.pendingLocator {
+        if !ignoringPendingLocator, let pendingLocator = state.pendingLocator {
             return { (pendingLocator, nil) }
         }
 
@@ -3928,6 +5654,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private func computeCurrentLocationAndViewport() async -> (Locator?, NavigatorViewport?) {
         await currentLocationCalculation()()
+    }
+
+    private func publishLiveCurrentLocationIgnoringPendingLocator(
+        operation: NavigationOperationToken
+    ) async -> Bool {
+        let calculate = pageTurnLocationCalculationForTesting
+            ?? currentLocationCalculation(ignoringPendingLocator: true)
+        return await publishCurrentLocation(
+            calculating: calculate,
+            operation: operation
+        )
     }
 
     public func firstVisibleElementLocator() async -> Locator? {
@@ -4061,14 +5798,22 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private var notifiedCurrentLocation: Locator?
 
     private func publishPageTurnLocation(
-        _ transaction: PageTurnTransaction
+        _ transaction: PageTurnTransaction,
+        operation: NavigationOperationToken
     ) async -> Bool {
         let calculate = pageTurnLocationCalculationForTesting
             ?? computeCurrentLocationAndViewport
-        let (location, newViewport) = await calculate()
+        let calculation = await calculateCurrentLocationAndViewport(
+            calculating: calculate,
+            operation: operation
+        )
+        guard case let .applied((location, newViewport)) = calculation else {
+            return false
+        }
         guard
             pageTurnTransaction === transaction,
-            !transaction.isInvalidated
+            !transaction.isInvalidated,
+            operation.check() == nil
         else {
             return false
         }
@@ -4076,16 +5821,55 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     @discardableResult
-    private func publishCurrentLocation() async -> Bool {
-        await publishCurrentLocation(calculating: computeCurrentLocationAndViewport)
+    private func publishCurrentLocation(
+        operation: NavigationOperationToken
+    ) async -> Bool {
+        await publishCurrentLocation(
+            calculating: computeCurrentLocationAndViewport,
+            operation: operation
+        )
     }
 
     @discardableResult
     func publishCurrentLocation(
-        calculating calculate: () async -> (Locator?, NavigatorViewport?)
+        calculating calculate: @escaping () async -> (Locator?, NavigatorViewport?)
     ) async -> Bool {
-        let (location, newViewport) = await calculate()
+        let (location, viewport) = await calculate()
+        return publishCurrentLocation(location: location, viewport: viewport)
+    }
+
+    @discardableResult
+    func publishCurrentLocation(
+        calculating calculate: @escaping () async -> (Locator?, NavigatorViewport?),
+        operation: NavigationOperationToken
+    ) async -> Bool {
+        let calculation = await calculateCurrentLocationAndViewport(
+            calculating: calculate,
+            operation: operation
+        )
+        guard case let .applied((location, newViewport)) = calculation else {
+            return false
+        }
+        guard operation.check() == nil else { return false }
         return publishCurrentLocation(location: location, viewport: newViewport)
+    }
+
+    private func calculateCurrentLocationAndViewport(
+        calculating calculate: @escaping () async -> (Locator?, NavigatorViewport?),
+        operation: NavigationOperationToken
+    ) async -> NavigationValueResult<(Locator?, NavigatorViewport?)> {
+        let location: Locator?
+        let newViewport: NavigatorViewport?
+        switch await NavigationOperationWaiter<(Locator?, NavigatorViewport?)>().wait(
+            operation: operation,
+            work: calculate
+        ) {
+        case let .applied(calculation):
+            (location, newViewport) = calculation
+        case .rejected:
+            return .rejected(operation.check() ?? .cancelled)
+        }
+        return .applied((location, newViewport))
     }
 
     private func publishCurrentLocation(
@@ -4107,10 +5891,21 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private var currentLocationRefreshWaiters: [CheckedContinuation<Void, Never>] = []
     private var isCurrentLocationRefreshRunning = false
+    private var currentLocationRefreshRevision: UInt64 = 0
+
+    private func invalidateCurrentLocationRefresh() {
+        currentLocationRefreshRevision &+= 1
+    }
 
     private lazy var updateCurrentLocation = execute(
         // If we're not in an `idle` state, we postpone the notification.
-        when: { [weak self] in self?.state == .idle },
+        // A released navigator must also stop the polling loop; otherwise the
+        // weak nil owner can keep rescheduling this closure forever and prevent
+        // the test runner (or host process) from becoming quiescent.
+        when: { [weak self] in
+            guard let self else { return true }
+            return state == .idle
+        },
         pollingInterval: 0.1
     ) { [weak self] in
         guard let self else { return }
@@ -4122,15 +5917,48 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     func performCurrentLocationRefresh(
-        calculating calculate: () async -> (Locator?, NavigatorViewport?)
+        calculating calculate: @escaping () async -> (Locator?, NavigatorViewport?)
     ) async {
         guard !isCurrentLocationRefreshRunning else { return }
         isCurrentLocationRefreshRunning = true
-        await publishCurrentLocation(calculating: calculate)
-        isCurrentLocationRefreshRunning = false
-        let waiters = currentLocationRefreshWaiters
-        currentLocationRefreshWaiters.removeAll()
-        waiters.forEach { $0.resume() }
+        defer {
+            isCurrentLocationRefreshRunning = false
+            let waiters = currentLocationRefreshWaiters
+            currentLocationRefreshWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+        let refreshRevision = currentLocationRefreshRevision
+        let targetStamp = currentLocationCommitTargetStamp()
+        let operation = NavigationOperation(
+            operationID: 0,
+            intent: .reload("idle-location-refresh"),
+            timeout: navigationOperationTimeout
+        )
+        let deadline = operation.remainingNanoseconds
+        let deadlineTask = Task { @MainActor in
+            if deadline > 0 {
+                try? await Task.sleep(nanoseconds: deadline)
+            }
+            guard !Task.isCancelled else { return }
+            operation.cancel(as: .timedOut)
+        }
+        defer { deadlineTask.cancel() }
+        let calculation = await NavigationOperationWaiter<(
+            Locator?, NavigatorViewport?
+        )>().wait(
+            operation: operation,
+            work: calculate
+        )
+        guard case let .applied((location, viewport)) = calculation else {
+            return
+        }
+        if
+            refreshRevision == currentLocationRefreshRevision,
+            targetStamp == currentLocationCommitTargetStamp()
+        {
+            // Validation and publication form one synchronous commit point.
+            _ = publishCurrentLocation(location: location, viewport: viewport)
+        }
     }
 
     private func awaitCurrentLocationRefresh() async {
@@ -4162,18 +5990,48 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
             _ = await transaction.waitForCompletion()
         }
-        await pageTurnController.settleRecovering { [weak self] session in
-            guard let self else { return false }
-            if !(await restorePageTurnSurface(session)) {
-                return await releaseFailedPageTurnRestore(session)
+        await awaitPageTurnRecoveryDrainIfNeeded()
+        _ = await navigationExecutor.submit(
+            intent: .reload("settle-page-turn-recovery"),
+            timeout: navigationOperationTimeout
+        ) { [weak self] operation in
+            guard let self else { return .cancelled }
+            let snapshotSettle = await snapshotProvider.settle(operation: operation)
+            guard snapshotSettle.isApplied else { return snapshotSettle }
+            operation.beginRecovery()
+            var recoveryResult = NavigationResult.applied
+            await pageTurnController.settleRecovering(
+                refreshCurrentLocation: false
+            ) { [weak self] session in
+                guard let self else {
+                    recoveryResult = .cancelled
+                    return false
+                }
+                if await !restorePageTurnSurface(
+                    session,
+                    operation: operation
+                ) {
+                    let released = await releaseFailedPageTurnRestore(
+                        session,
+                        operation: operation
+                    )
+                    recoveryResult = operation.check()
+                        ?? (released ? .applied : .spreadNotLoaded)
+                    return released
+                }
+                return true
             }
-            return true
+            if let result = operation.check() { return result }
+            guard recoveryResult.isApplied else { return recoveryResult }
+            return await publishCurrentLocation(operation: operation)
+                ? .applied
+                : .spreadNotLoaded
         }
         await awaitHardAbortLocationRestoreIfNeeded()
         if let panResume = hardAbortPanResumeTask {
             await panResume.value
         }
-        await snapshotProvider.settle()
+        await navigationExecutor.waitUntilIdle()
     }
 
     private func pageTurnDirection(from options: NavigatorGoOptions) -> EPUBSpreadView.Direction? {
@@ -4191,9 +6049,68 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func go(to locator: Locator, options: NavigatorGoOptions) async -> Bool {
-        await snapshotProvider.settle()
+        invalidateCurrentLocationRefresh()
+        let normalized = publication.normalizeLocator(locator)
+        let result = await navigationExecutor.submit(
+            intent: .absolute(normalized.href.string),
+            timeout: navigationOperationTimeout
+        ) { [weak self] operation in
+            guard let self else { return .cancelled }
+            let stableLocator = currentLocation
+            let result = await performLocatorNavigation(
+                to: normalized,
+                options: options,
+                operation: operation,
+                stableLocator: stableLocator
+            )
+            return await recoverPoisonedSpreadsIfNeeded(
+                after: result,
+                stableLocator: stableLocator,
+                operation: operation
+            )
+        }
+        return result.isApplied
+    }
+
+    func performLocatorNavigationForTesting(
+        to locator: Locator,
+        options: NavigatorGoOptions = .init(animated: false),
+        operation: NavigationOperationToken,
+        stableLocator: Locator? = nil
+    ) async -> NavigationResult {
+        await performLocatorNavigation(
+            to: locator,
+            options: options,
+            operation: operation,
+            stableLocator: stableLocator
+        )
+    }
+
+    private func performLocatorNavigation(
+        to locator: Locator,
+        options: NavigatorGoOptions,
+        operation: NavigationOperationToken,
+        stableLocator: Locator?
+    ) async -> NavigationResult {
+        if let result = operation.check() { return result }
+        let settleResult = await snapshotProvider.settleCapture(operation: operation)
+        guard settleResult.isApplied else { return settleResult }
+        // `settle()` can suspend while gestures and recovery callbacks run.
+        // Acquire the navigation lease afterwards so it is still valid when
+        // the jump starts mutating pagination/WebView state.
+        let leaseResult = await awaitPageTurnNavigationLease(operation: operation)
+        guard leaseResult.isApplied else { return leaseResult }
+        guard let locator = resolveLocatorProgression(locator) else {
+            return .failed(EPUBNavigatorViewController.EPUBError.spreadNotLoaded)
+        }
+        let recovery = await replacePoisonedPaginationIfNeeded(
+            stableLocator: currentLocation,
+            replacementLocator: locator,
+            operation: operation
+        )
+        guard recovery.isApplied else { return recovery }
+        if let result = operation.check() { return result }
         snapshotProvider.invalidate()
-        let locator = publication.normalizeLocator(locator)
         let options = EPUBPageTurnInteraction.discreteNavigationOptions(
             options,
             axis: paginationView?.axis,
@@ -4202,25 +6119,47 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
         if options.animated,
            paginationView?.axis == .horizontalPaged,
-           let direction = pageTurnDirection(from: options) {
+           let direction = pageTurnDirection(from: options)
+        {
             switch currentEffectivePageTurnStyle() {
             case .push:
-                return await turnWithPageSurface(
+                let mutation = await turnWithPageSurface(
                     to: direction,
                     style: .push,
-                    target: locator
+                    target: locator,
+                    operation: operation
+                )
+                return await finishLocatorNavigation(
+                    locator,
+                    mutation: mutation,
+                    operation: operation,
+                    stableLocator: stableLocator
                 )
             case .cover:
-                return await turnWithPageSurface(
+                let mutation = await turnWithPageSurface(
                     to: direction,
                     style: .cover,
-                    target: locator
+                    target: locator,
+                    operation: operation
+                )
+                return await finishLocatorNavigation(
+                    locator,
+                    mutation: mutation,
+                    operation: operation,
+                    stableLocator: stableLocator
                 )
             case .simulation:
-                return await turnWithPageSurface(
+                let mutation = await turnWithPageSurface(
                     to: direction,
                     style: .simulation,
-                    target: locator
+                    target: locator,
+                    operation: operation
+                )
+                return await finishLocatorNavigation(
+                    locator,
+                    mutation: mutation,
+                    operation: operation,
+                    stableLocator: stableLocator
                 )
             case .none:
                 break
@@ -4233,22 +6172,419 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             let spreadIndex = spreads.firstIndexWithReadingOrderIndex(index),
             on(.jump(locator))
         else {
-            return false
+            return .spreadNotLoaded
         }
 
-        let success = await paginationView.goToIndex(spreadIndex, location: .locator(locator), options: options)
-        on(.jumped)
-        if success {
-            delegate?.navigator(self, didJumpTo: locator)
+        let mutation: NavigationMutationResult
+        if let goToIndex = pageTurnGoToIndexForTesting {
+            // This hook replaces the mutation itself, so its result is always
+            // treated as potentially having changed the visible position.
+            mutation = await .init(result: goToIndex(locator), mayHaveMutated: true)
+        } else {
+            mutation = await paginationView.goToIndexWithMutation(
+                spreadIndex,
+                location: .locator(locator),
+                options: options,
+                operation: operation
+            )
         }
-        return success
+        return await finishLocatorNavigation(
+            locator,
+            mutation: mutation,
+            expectedSpreadIndex: spreadIndex,
+            operation: operation,
+            stableLocator: stableLocator,
+            emitJumped: true
+        )
+    }
+
+    private func finishLocatorNavigation(
+        _ locator: Locator,
+        mutation: NavigationMutationResult,
+        expectedSpreadIndex: Int? = nil,
+        operation: NavigationOperationToken,
+        stableLocator: Locator?,
+        emitJumped: Bool = false
+    ) async -> NavigationResult {
+        let stableLocator = mutation.stableLocator ?? stableLocator
+        let moved = mutation.mayHaveMutated
+        let verified: NavigationResult
+        if !mutation.result.isApplied {
+            verified = mutation.result
+        } else {
+            verified = await verifyLocatorNavigation(
+                locator,
+                moved: moved,
+                expectedSpreadIndex: expectedSpreadIndex,
+                operation: operation
+            )
+        }
+        if verified.isApplied {
+            guard
+                let pagination = paginationView,
+                let spread = pagination.currentView as? EPUBSpreadView
+            else {
+                return await restoreAfterFailedLocatorNavigation(
+                    .spreadNotLoaded,
+                    moved: moved,
+                    stableLocator: stableLocator,
+                    operation: operation,
+                    emitJumped: emitJumped
+                )
+            }
+            let commitIndex = pagination.currentIndex
+            let paginationGeneration = pagination.generation
+            let spreadGeneration = spread.spreadGeneration
+            let targetStamp = LocatorCommitTargetStamp(
+                pagination: ObjectIdentifier(pagination),
+                paginationGeneration: paginationGeneration,
+                paginationViewportRevision: pagination.viewportRevision,
+                index: commitIndex,
+                spread: ObjectIdentifier(spread),
+                spreadGeneration: spreadGeneration,
+                spreadViewportRevision: spread.viewportRevision
+            )
+            let calculate = locatorNavigationLocationCalculationForTesting
+                ?? computeCurrentLocationAndViewport
+            let calculation = await calculateCurrentLocationAndViewport(
+                calculating: calculate,
+                operation: operation
+            )
+            guard case let .applied((location?, newViewport)) = calculation else {
+                return await restoreAfterFailedLocatorNavigation(
+                    calculation.result,
+                    moved: moved,
+                    stableLocator: stableLocator,
+                    operation: operation,
+                    emitJumped: emitJumped
+                )
+            }
+            guard location.href.isEquivalentTo(locator.href) else {
+                return await restoreAfterFailedLocatorNavigation(
+                    .spreadNotLoaded,
+                    moved: moved,
+                    stableLocator: stableLocator,
+                    operation: operation,
+                    emitJumped: emitJumped
+                )
+            }
+            guard calculatedLocator(location, matchesNavigationTarget: locator) else {
+                return await restoreAfterFailedLocatorNavigation(
+                    .spreadNotLoaded,
+                    moved: moved,
+                    stableLocator: stableLocator,
+                    operation: operation,
+                    emitJumped: emitJumped
+                )
+            }
+            if locatorHasPreciseDOMTarget(locator) {
+                let visibility = await verifyDOMTargetVisibility(
+                    locator,
+                    in: spread,
+                    operation: operation
+                )
+                guard visibility.isApplied else {
+                    return await restoreAfterFailedLocatorNavigation(
+                        visibility,
+                        moved: moved,
+                        stableLocator: stableLocator,
+                        operation: operation,
+                        emitJumped: emitJumped
+                    )
+                }
+            }
+            guard
+                paginationView === pagination,
+                pagination.generation == paginationGeneration,
+                pagination.currentIndex == commitIndex,
+                pagination.currentView === spread,
+                spread.spreadGeneration == spreadGeneration,
+                LocatorCommitTargetStamp(
+                    pagination: ObjectIdentifier(pagination),
+                    paginationGeneration: pagination.generation,
+                    paginationViewportRevision: pagination.viewportRevision,
+                    index: pagination.currentIndex,
+                    spread: ObjectIdentifier(spread),
+                    spreadGeneration: spread.spreadGeneration,
+                    spreadViewportRevision: spread.viewportRevision
+                ) == targetStamp,
+                expectedSpreadIndex.map({ $0 == commitIndex }) ?? true,
+                operation.check(
+                    paginationGeneration: paginationGeneration
+                ) == nil
+            else {
+                return await restoreAfterFailedLocatorNavigation(
+                    operation.check(
+                        paginationGeneration: paginationGeneration
+                    ) ?? .superseded,
+                    moved: moved,
+                    stableLocator: stableLocator,
+                    operation: operation,
+                    emitJumped: emitJumped
+                )
+            }
+            // This is the final synchronous transaction commit. Delegate code
+            // may re-enter navigation, so no later check can invalidate it.
+            let committedLocation = location.preservingTargetAnchors(from: locator)
+            guard publishCurrentLocation(location: committedLocation, viewport: newViewport) else {
+                return await restoreAfterFailedLocatorNavigation(
+                    .spreadNotLoaded,
+                    moved: moved,
+                    stableLocator: stableLocator,
+                    operation: operation,
+                    emitJumped: emitJumped
+                )
+            }
+            if emitJumped {
+                on(.jumped)
+            }
+            delegate?.navigator(self, didJumpTo: locator)
+            return verified
+        }
+        return await restoreAfterFailedLocatorNavigation(
+            verified,
+            moved: moved,
+            stableLocator: stableLocator,
+            operation: operation,
+            emitJumped: emitJumped
+        )
+    }
+
+    private struct LocatorCommitTargetStamp: Equatable {
+        let pagination: ObjectIdentifier
+        let paginationGeneration: UInt64
+        let paginationViewportRevision: UInt64
+        let index: Int
+        let spread: ObjectIdentifier
+        let spreadGeneration: UInt64
+        let spreadViewportRevision: UInt64
+    }
+
+    private func currentLocationCommitTargetStamp() -> LocatorCommitTargetStamp? {
+        guard
+            let pagination = paginationView,
+            let spread = pagination.currentView as? EPUBSpreadView
+        else {
+            return nil
+        }
+        return LocatorCommitTargetStamp(
+            pagination: ObjectIdentifier(pagination),
+            paginationGeneration: pagination.generation,
+            paginationViewportRevision: pagination.viewportRevision,
+            index: pagination.currentIndex,
+            spread: ObjectIdentifier(spread),
+            spreadGeneration: spread.spreadGeneration,
+            spreadViewportRevision: spread.viewportRevision
+        )
+    }
+
+    private func calculatedLocator(
+        _ calculated: Locator,
+        matchesNavigationTarget target: Locator
+    ) -> Bool {
+        guard calculated.href.isEquivalentTo(target.href) else { return false }
+
+        if let expectedPosition = target.locations.position {
+            let actualPosition = calculated.locations.position
+                ?? calculated.locations.progression.flatMap {
+                    pageTurnPosition(href: target.href, progression: $0)
+                }
+            guard actualPosition == expectedPosition else { return false }
+        }
+
+        if let expectedProgression = target.locations.progression {
+            guard let actualProgression = calculated.locations.progression else {
+                return false
+            }
+            if abs(actualProgression - expectedProgression) >= 0.001 {
+                guard
+                    paginationView?.axis == .horizontalPaged,
+                    let spread = paginationView?.currentView as? EPUBReflowableSpreadView,
+                    spread.scrollView.bounds.width > 0,
+                    spread.scrollView.contentSize.width > 0
+                else {
+                    return false
+                }
+                let pageWidth = spread.scrollView.bounds.width
+                let contentWidth = spread.scrollView.contentSize.width
+                let snapsToPage = !(viewModel.scroll && viewModel.verticalText)
+                let reachable = EPUBReflowableSpreadView.reachableHorizontalProgression(
+                    requested: expectedProgression,
+                    pageWidth: pageWidth,
+                    contentWidth: contentWidth,
+                    isRTL: viewModel.readingProgression == .rtl,
+                    snapsToPage: snapsToPage
+                )
+                let tolerance = snapsToPage
+                    ? max(Double(pageWidth / contentWidth) * 0.51, 0.001)
+                    : max(
+                        Double(EPUBReflowableSpreadView.settlementPixelTolerance / contentWidth),
+                        0.000_001
+                    )
+                guard abs(actualProgression - reachable) <= tolerance else {
+                    return false
+                }
+            }
+        }
+
+        if
+            !target.locations.fragments.isEmpty,
+            !calculated.locations.fragments.isEmpty,
+            calculated.locations.fragments != target.locations.fragments
+        {
+            return false
+        }
+        if let expected = target.locations.domRange,
+           let actual = calculated.locations.domRange,
+           actual != expected
+        {
+            return false
+        }
+        if let expected = target.locations.cssSelector,
+           let actual = calculated.locations.cssSelector,
+           actual != expected
+        {
+            return false
+        }
+        if let expected = target.text.highlight,
+           let actual = calculated.text.highlight,
+           actual != expected
+        {
+            return false
+        }
+        return true
+    }
+
+    private func verifyDOMTargetVisibility(
+        _ locator: Locator,
+        in spread: EPUBSpreadView,
+        operation: NavigationOperationToken
+    ) async -> NavigationResult {
+        guard let verifier = locatorNavigationDOMTargetVerifierForTesting else {
+            return await spread.isLocatorVisible(locator, operation: operation)
+        }
+        let verification = await NavigationOperationWaiter<Bool>().wait(
+            operation: operation,
+            work: { await verifier(locator) }
+        )
+        if case .applied(true) = verification {
+            return .applied
+        }
+        return verification.result.isApplied
+            ? .spreadNotLoaded
+            : verification.result
+    }
+
+    private func restoreAfterFailedLocatorNavigation(
+        _ result: NavigationResult,
+        moved: Bool,
+        stableLocator: Locator?,
+        operation: NavigationOperationToken,
+        emitJumped: Bool
+    ) async -> NavigationResult {
+        var restored = false
+        if moved, let stableLocator {
+            let restore = await restorePageTurnLocator(
+                stableLocator,
+                operation: operation
+            )
+            restored = restore.result.isApplied && restore.stableVerified
+            if restored {
+                restored = await publishLiveCurrentLocationIgnoringPendingLocator(
+                    operation: operation
+                )
+            }
+        }
+        if moved, !restored {
+            // We cannot safely leave a partially mutated reading position live.
+            // Defer a poisoned replacement to an executor-owned recovery; an
+            // already-expired operation cannot extend its absolute deadline.
+            poisonVisibleSpreads(with: result)
+        }
+        if emitJumped {
+            on(.jumped)
+        }
+        return result
+    }
+
+    private func verifyLocatorNavigation(
+        _ locator: Locator,
+        moved: Bool,
+        expectedSpreadIndex: Int? = nil,
+        operation: NavigationOperationToken
+    ) async -> NavigationResult {
+        guard moved else { return .spreadNotLoaded }
+        if let result = operation.check() { return result }
+        if let expectedSpreadIndex, currentSpreadIndex != expectedSpreadIndex {
+            return .superseded
+        }
+        guard
+            let index = readingOrder.firstIndexWithHREF(locator.href),
+            spreads[currentSpreadIndex].contains(index: index)
+        else {
+            return .spreadNotLoaded
+        }
+        let hasDOMTarget = locator.text.highlight != nil
+            || !locator.locations.fragments.isEmpty
+            || locator.locations.otherLocations["cssSelector"] != nil
+            || locator.locations.domRange != nil
+        if hasDOMTarget,
+           paginationView?.axis != .verticalContinuous,
+           let spreadView = paginationView?.currentView as? EPUBSpreadView
+        {
+            let visibility = await verifyDOMTargetVisibility(
+                locator,
+                in: spreadView,
+                operation: operation
+            )
+            guard visibility.isApplied else { return visibility }
+            if let result = operation.check() { return result }
+            return .applied
+        }
+        guard await isLiveViewAtPageTurnOriginalLocator(
+            locator,
+            operation: operation
+        ) else {
+            return .spreadNotLoaded
+        }
+        // Publish only while this operation still owns the executor lease and
+        // target spread after reading live resource-local geometry.
+        if let result = operation.check() { return result }
+        return .applied
     }
 
     public func go(to link: Link, options: NavigatorGoOptions) async -> Bool {
-        guard let locator = await publication.locate(link) else {
-            return false
+        invalidateCurrentLocationRefresh()
+        let result = await navigationExecutor.submit(
+            intent: .absolute(link.href),
+            timeout: navigationOperationTimeout
+        ) { [weak self] operation in
+            guard let self else { return .cancelled }
+            let stableLocator = currentLocation
+            let locate = linkLocatorForTesting ?? { [publication] link in
+                await publication.locate(link)
+            }
+            let resolution = await NavigationOperationWaiter<Locator?>().wait(
+                operation: operation,
+                work: { await locate(link) }
+            )
+            guard case let .applied(locator?) = resolution else {
+                return operation.check() ?? .spreadNotLoaded
+            }
+            let normalized = publication.normalizeLocator(locator)
+            let navigation = await performLocatorNavigation(
+                to: normalized,
+                options: options,
+                operation: operation,
+                stableLocator: stableLocator
+            )
+            return await recoverPoisonedSpreadsIfNeeded(
+                after: navigation,
+                stableLocator: stableLocator,
+                operation: operation
+            )
         }
-        return await go(to: locator, options: options)
+        return result.isApplied
     }
 
     @discardableResult
@@ -4402,6 +6738,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func submitPreferences(_ preferences: EPUBPreferences) {
+        if preferences.scroll != viewModel.preferences.scroll {
+            cancelActivePageTurn(reason: "submitPreferences-layout")
+        }
         snapshotProvider.invalidate()
         guard snapshotProvider.isIdle else {
             snapshotProvider.deferPreferences { [weak self] in
@@ -4537,7 +6876,6 @@ extension EPUBNavigatorViewController: EPUBNavigatorViewModelDelegate {
             }
         }
     }
-
 }
 
 extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
@@ -4819,7 +7157,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         if hasInFlightPageTurnWork {
             abortPageTurnInterruptedBySelection(snapDocuments: true)
         } else {
-            snapVisibleDocumentToPageBoundaries()
+            queueHardAbortLocationRestore(nil, snapAfterRestore: true)
             updatePageTurnInteractionMode()
         }
     }
@@ -4842,8 +7180,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         snapshotProvider.invalidate()
         if spreadView.hasActiveMedia {
             cancelActivePageTurn(reason: "activeMedia")
-        } else if currentSelection == nil {
-        }
+        } else if currentSelection == nil {}
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, present viewController: UIViewController) {
@@ -4851,7 +7188,8 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     }
 
     func spreadViewDidTerminate() {
-        reloadSpreads()
+        poisonVisibleSpreads(with: .webContentTerminated)
+        scheduleExecutorReload(reason: "web-content-termination")
     }
 }
 
@@ -4992,5 +7330,27 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
 
     func paginationView(_ paginationView: PaginationView, positionCountAtIndex index: Int) -> Int {
         spreads[index].positionCount(in: readingOrder, positionsByReadingOrder: positionsByReadingOrder)
+    }
+}
+
+private extension Locator {
+    func preservingTargetAnchors(from target: Locator) -> Locator {
+        copy(
+            locations: { locations in
+                if !target.locations.fragments.isEmpty {
+                    locations.fragments = target.locations.fragments
+                }
+                if let position = target.locations.position {
+                    locations.position = position
+                }
+                for (key, value) in target.locations.otherLocations {
+                    locations.otherLocations[key] = value
+                }
+            },
+            text: { text in
+                guard target.text.highlight != nil else { return }
+                text = target.text
+            }
+        )
     }
 }

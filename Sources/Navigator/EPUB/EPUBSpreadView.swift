@@ -65,7 +65,9 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         didSet { updateNativeHorizontalPaging() }
     }
 
-    var allowsPageTurn: Bool { true }
+    var allowsPageTurn: Bool {
+        true
+    }
 
     let webView: WebView
 
@@ -101,8 +103,61 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         loadState == .terminated
     }
 
+    /// Generations are invalidated before pending work is released, so a late
+    /// WebKit callback can never be accepted by a newer navigation operation.
+    private(set) var spreadGeneration: UInt64 = 1
+    private(set) var webViewGeneration: UInt64 = 1
+    private(set) var viewportRevision: UInt64 = 0
+    private(set) var isPoisoned = false
+
     private var spreadLoadTask: Task<Void, Never>?
+    private var nativeLoadFallbackTask: Task<Void, Never>?
     private(set) var didReportNavigationFailure = false
+    private var pendingJavaScriptEvaluations: [UUID: JavaScriptEvaluation] = [:]
+    private var javaScriptEvaluationTimeoutTasks: [UUID: Task<Void, Never>] = [:]
+    private var javaScriptEvaluationCancellationTasks: [UUID: Task<Void, Never>] = [:]
+
+    enum JavaScriptEffect {
+        case readOnly
+        case positionMutation
+    }
+
+    private enum JavaScriptEvaluationError: Error {
+        case timedOut
+        case cancelled
+        case superseded
+        case spreadNotLoaded
+        case webContentTerminated
+    }
+
+    @MainActor
+    private final class JavaScriptEvaluation {
+        let webViewGeneration: UInt64
+        private var continuation: CheckedContinuation<NavigationValueResult<Any>, Never>?
+        private var result: NavigationValueResult<Any>?
+
+        init(webViewGeneration: UInt64) {
+            self.webViewGeneration = webViewGeneration
+        }
+
+        func wait() async -> NavigationValueResult<Any> {
+            if let result { return result }
+            return await withCheckedContinuation { continuation in
+                if let result {
+                    continuation.resume(returning: result)
+                } else {
+                    self.continuation = continuation
+                }
+            }
+        }
+
+        func finish(_ result: NavigationValueResult<Any>) {
+            guard self.result == nil else { return }
+            self.result = result
+            continuation?.resume(returning: result)
+            continuation = nil
+        }
+    }
 
     required init(
         viewModel: EPUBNavigatorViewModel,
@@ -161,16 +216,40 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// Called when the spread view is removed from the view hierarchy, to
     /// clear pending operations and retain cycles.
     func clear() {
+        terminateGeneration(with: .cancelled, poisoned: isPoisoned)
+    }
+
+    /// Makes every callback from this WebView generation untrustworthy before
+    /// resolving waiters. The view must be detached and replaced by Pagination.
+    func poison(with result: NavigationResult) {
+        guard !isPoisoned else { return }
+        isPoisoned = true
+        terminateGeneration(with: result, poisoned: true)
+    }
+
+    private func terminateGeneration(
+        with result: NavigationResult,
+        poisoned: Bool
+    ) {
+        if poisoned {
+            isPoisoned = true
+        }
         loadState = .terminated
+        spreadGeneration &+= 1
+        webViewGeneration &+= 1
         activeMediaDocuments.removeAll()
         hasActiveMedia = false
         webView.stopLoading()
 
         spreadLoadTask?.cancel()
         spreadLoadTask = nil
+        nativeLoadFallbackTask?.cancel()
+        nativeLoadFallbackTask = nil
         onSpreadLoadedCallbacks.complete()
+        completePendingJavaScriptEvaluations(with: result)
 
-        // Disable JS messages to break WKUserContentController reference.
+        // Disable JS messages to break WKUserContentController reference and
+        // reject messages from the retired document generation.
         disableJSMessages()
     }
 
@@ -243,18 +322,180 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// Evaluates the given JavaScript into the resource's HTML page.
     @discardableResult
     func evaluateScript(_ script: String, inHREF href: AnyURL? = nil) async -> Result<Any, Error> {
-        await spreadLoaded()
+        let timeout = UInt64(max(0, javaScriptEvaluationTimeout) * 1000)
+        let operation = NavigationOperation(
+            operationID: 0,
+            intent: .absolute("legacy-script"),
+            timeout: .milliseconds(timeout)
+        )
+        switch await evaluateScript(
+            script,
+            inHREF: href,
+            operation: operation,
+            effect: .readOnly
+        ) {
+        case let .applied(value):
+            return .success(value)
+        case let .rejected(result):
+            return .failure(error(for: result))
+        }
+    }
+
+    /// Evaluates JavaScript under the owning mutation's absolute deadline.
+    /// Timeout after submission poisons this WebView generation.
+    @discardableResult
+    func evaluateScript(
+        _ script: String,
+        inHREF href: AnyURL? = nil,
+        operation: NavigationOperationToken,
+        effect: JavaScriptEffect = .positionMutation
+    ) async -> NavigationValueResult<Any> {
+        operation.bindSpreadGeneration(spreadGeneration)
+        let loadResult = await spreadLoaded(operation: operation)
+        guard loadResult.isApplied else {
+            return .rejected(loadResult)
+        }
+        if let result = operation.check(spreadGeneration: spreadGeneration) {
+            return .rejected(result)
+        }
+        guard loadState == .loaded, !isPoisoned else {
+            return .rejected(isTerminated ? .webContentTerminated : .spreadNotLoaded)
+        }
+        if effect == .positionMutation {
+            viewportRevision &+= 1
+        }
 
         log(.trace, "Evaluate script: \(script)")
-        return await withCheckedContinuation { continuation in
-            webView.evaluateJavaScript(script) { [weak self] res, error in
-                if let error = error {
-                    self?.log(.error, error)
-                    continuation.resume(returning: .failure(error))
-                } else {
-                    continuation.resume(returning: .success(res ?? ()))
+        let id = UUID()
+        let generation = webViewGeneration
+        let evaluation = JavaScriptEvaluation(webViewGeneration: generation)
+        pendingJavaScriptEvaluations[id] = evaluation
+        let delay = operation.remainingNanoseconds
+        javaScriptEvaluationTimeoutTasks[id] = Task { @MainActor [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: delay)
+            }
+            guard !Task.isCancelled, let self else { return }
+            if completePendingJavaScriptEvaluation(id, with: .rejected(.timedOut)),
+               effect == .positionMutation
+            {
+                poison(with: .timedOut)
+            }
+        }
+        javaScriptEvaluationCancellationTasks[id] = Task { @MainActor [weak self] in
+            let result = await operation.waitForCancellation()
+            guard !Task.isCancelled, let self else { return }
+            if completePendingJavaScriptEvaluation(id, with: .rejected(result)),
+               effect == .positionMutation
+            {
+                poison(with: result)
+            }
+        }
+
+        beginJavaScriptEvaluation(script) { [weak self] value, error in
+            guard let self else { return }
+            guard generation == webViewGeneration, !isPoisoned else {
+                completePendingJavaScriptEvaluation(id, with: .rejected(.superseded))
+                return
+            }
+            if let error {
+                log(.error, error)
+                completePendingJavaScriptEvaluation(id, with: .rejected(.failed(error)))
+            } else {
+                completePendingJavaScriptEvaluation(id, with: .applied(value ?? ()))
+            }
+        }
+
+        return await withTaskCancellationHandler {
+            await evaluation.wait()
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if completePendingJavaScriptEvaluation(id, with: .rejected(.cancelled)),
+                   effect == .positionMutation
+                {
+                    poison(with: .cancelled)
                 }
             }
+        }
+    }
+
+    func beginJavaScriptEvaluation(
+        _ script: String,
+        completionHandler: @escaping (Any?, Error?) -> Void
+    ) {
+        webView.evaluateJavaScript(script, completionHandler: completionHandler)
+    }
+
+    func isLocatorVisible(
+        _ locator: Locator,
+        operation: NavigationOperationToken
+    ) async -> NavigationResult {
+        guard let json = try? locator.jsonString() else {
+            return .spreadNotLoaded
+        }
+        let result = await evaluateScript(
+            "readium.locatorIsVisible(\(json))",
+            inHREF: locator.href,
+            operation: operation,
+            effect: .readOnly
+        )
+        switch result {
+        case let .applied(value):
+            return (value as? Bool) == true ? .applied : .spreadNotLoaded
+        case let .rejected(result):
+            return result
+        }
+    }
+
+    var javaScriptEvaluationTimeout: TimeInterval {
+        5
+    }
+
+    @discardableResult
+    private func completePendingJavaScriptEvaluation(
+        _ id: UUID,
+        with result: NavigationValueResult<Any>
+    ) -> Bool {
+        guard let evaluation = pendingJavaScriptEvaluations.removeValue(forKey: id) else {
+            return false
+        }
+        javaScriptEvaluationTimeoutTasks.removeValue(forKey: id)?.cancel()
+        javaScriptEvaluationCancellationTasks.removeValue(forKey: id)?.cancel()
+        evaluation.finish(result)
+        return true
+    }
+
+    private func completePendingJavaScriptEvaluations(with result: NavigationResult) {
+        let timeoutTasks = javaScriptEvaluationTimeoutTasks.values
+        javaScriptEvaluationTimeoutTasks.removeAll()
+        timeoutTasks.forEach { $0.cancel() }
+        let cancellationTasks = javaScriptEvaluationCancellationTasks.values
+        javaScriptEvaluationCancellationTasks.removeAll()
+        cancellationTasks.forEach { $0.cancel() }
+        let evaluations = pendingJavaScriptEvaluations.values
+        pendingJavaScriptEvaluations.removeAll()
+        for evaluation in evaluations {
+            evaluation.finish(.rejected(result))
+        }
+    }
+
+    private func error(for result: NavigationResult) -> Error {
+        switch result {
+        case let .failed(error):
+            return error
+        case .cancelled:
+            return CancellationError()
+        case .timedOut:
+            return JavaScriptEvaluationError.timedOut
+        case .superseded:
+            return JavaScriptEvaluationError.superseded
+        case .spreadNotLoaded:
+            return JavaScriptEvaluationError.spreadNotLoaded
+        case .webContentTerminated:
+            return JavaScriptEvaluationError.webContentTerminated
+        case .applied:
+            return JavaScriptEvaluationError.cancelled
         }
     }
 
@@ -525,9 +766,111 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             return
         }
 
-        await withCheckedContinuation { continuation in
-            whenSpreadLoaded {
-                continuation.resume()
+        let waiter = SpreadLoadWaiter()
+        whenSpreadLoaded {
+            waiter.finish()
+        }
+        await withTaskCancellationHandler {
+            await waiter.wait()
+        } onCancel: {
+            Task { @MainActor in
+                waiter.finish()
+            }
+        }
+    }
+
+    /// Waits for load using the mutation's existing absolute deadline.
+    func spreadLoaded(operation: NavigationOperationToken) async -> NavigationResult {
+        if let result = operation.check(spreadGeneration: spreadGeneration) {
+            return result
+        }
+        switch loadState {
+        case .loaded:
+            return .applied
+        case .terminated:
+            return isPoisoned ? .webContentTerminated : .spreadNotLoaded
+        case .loading:
+            break
+        }
+
+        let waiter = SpreadLoadResultWaiter()
+        whenSpreadLoaded { [weak self] in
+            guard let self else {
+                waiter.finish(.cancelled)
+                return
+            }
+            if let result = operation.check(spreadGeneration: spreadGeneration) {
+                waiter.finish(result)
+            } else if loadState == .loaded {
+                waiter.finish(.applied)
+            } else {
+                waiter.finish(isPoisoned ? .webContentTerminated : .spreadNotLoaded)
+            }
+        }
+        let delay = operation.remainingNanoseconds
+        let deadlineTask = Task { @MainActor [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: delay)
+            }
+            guard !Task.isCancelled else { return }
+            waiter.finish(.timedOut)
+            self?.poison(with: .timedOut)
+        }
+        let result = await withTaskCancellationHandler {
+            await waiter.wait()
+        } onCancel: {
+            Task { @MainActor in waiter.finish(.cancelled) }
+        }
+        deadlineTask.cancel()
+        return result
+    }
+
+    func scheduleNativeReflowableLoadFallback() {
+        nativeLoadFallbackTask?.cancel()
+        let generation = webViewGeneration
+        nativeLoadFallbackTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            guard
+                !Task.isCancelled,
+                loadState == .loading,
+                generation == webViewGeneration
+            else { return }
+            probeNativeReflowableReadiness(
+                generation: generation,
+                deadline: DispatchTime.now().uptimeNanoseconds + 2_000_000_000
+            )
+        }
+    }
+
+    private func probeNativeReflowableReadiness(
+        generation: UInt64,
+        deadline: UInt64
+    ) {
+        guard
+            loadState == .loading,
+            generation == webViewGeneration,
+            DispatchTime.now().uptimeNanoseconds < deadline
+        else { return }
+
+        beginJavaScriptEvaluation(
+            "document.documentElement != null && typeof readium === 'object' && typeof readium.scrollToPosition === 'function'"
+        ) { [weak self] value, error in
+            guard let self else { return }
+            guard
+                loadState == .loading,
+                generation == webViewGeneration
+            else { return }
+            if error == nil, (value as? NSNumber)?.boolValue == true {
+                spreadDidLoad(())
+                return
+            }
+            nativeLoadFallbackTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 50_000_000)
+                self?.probeNativeReflowableReadiness(
+                    generation: generation,
+                    deadline: deadline
+                )
             }
         }
     }
@@ -602,14 +945,58 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
     // MARK: - Location and progression.
 
+    func bindNavigationOperation(_ operation: NavigationOperationToken) {
+        operation.bindSpreadGeneration(spreadGeneration)
+    }
+
+    func isolateNavigationGeneration(with result: NavigationResult) {
+        poison(with: result)
+    }
+
     /// Current progression in the resource with given href.
     func progression(in index: ReadingOrder.Index) -> ClosedRange<Double> {
         // To be overridden in subclasses if the resource supports a progression.
         0 ... 1
     }
 
-    func go(to location: PageLocation, animated: Bool) async {
+    func go(
+        to location: PageLocation,
+        animated: Bool,
+        waitForLoad: Bool
+    ) async -> Bool {
         fatalError("go(to:) must be implemented in subclasses")
+    }
+
+    func go(
+        to location: PageLocation,
+        animated: Bool,
+        waitForLoad: Bool,
+        operation: NavigationOperationToken
+    ) async -> NavigationMutationResult {
+        if let result = operation.check(spreadGeneration: spreadGeneration) {
+            return .init(
+                result: result,
+                mayHaveMutated: false,
+                failureStage: .preflight
+            )
+        }
+        let applied = await go(
+            to: location,
+            animated: animated,
+            waitForLoad: waitForLoad
+        )
+        if let result = operation.check(spreadGeneration: spreadGeneration) {
+            return .init(
+                result: result,
+                mayHaveMutated: true,
+                failureStage: .pageViewMutation
+            )
+        }
+        return .init(
+            result: applied ? .applied : .spreadNotLoaded,
+            mayHaveMutated: true,
+            failureStage: applied ? nil : .pageViewMutation
+        )
     }
 
     enum Direction: CustomStringConvertible {
@@ -627,6 +1014,35 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     func go(to direction: Direction, options: NavigatorGoOptions) async -> Bool {
         // The default implementation of a spread view considers that its content is entirely visible on screen.
         false
+    }
+
+    func go(
+        to direction: Direction,
+        options: NavigatorGoOptions,
+        operation: NavigationOperationToken
+    ) async -> NavigationMutationResult {
+        if let result = operation.check(spreadGeneration: spreadGeneration) {
+            return .rejected(
+                result,
+                mayHaveMutated: false,
+                stage: .preflight
+            )
+        }
+        let applied = await go(to: direction, options: options)
+        if let result = operation.check(spreadGeneration: spreadGeneration) {
+            return .rejected(
+                result,
+                mayHaveMutated: true,
+                stage: .pageViewMutation
+            )
+        }
+        return applied
+            ? .applied(mayHaveMutated: true)
+            : .rejected(
+                .spreadNotLoaded,
+                mayHaveMutated: true,
+                stage: .pageViewMutation
+            )
     }
 
     func findFirstVisibleElementLocator() async -> Locator? {
@@ -791,28 +1207,28 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     }
 
     private static let activeMediaScript = """
-        (() => {
-            const documentToken = globalThis.crypto?.randomUUID?.()
-                ?? `${Date.now()}-${performance.now()}-${Math.random()}`;
-            const report = () => {
-                const active = Array.from(document.querySelectorAll('audio,video'))
-                    .some(media => !media.paused && !media.ended);
-                window.webkit.messageHandlers.activeMediaChanged.postMessage({
-                    document: documentToken,
-                    active: active
-                });
-            };
-            for (const event of ['play', 'pause', 'ended', 'emptied']) {
-                document.addEventListener(event, report, true);
-            }
-            window.addEventListener('pagehide', () => {
-                window.webkit.messageHandlers.activeMediaChanged.postMessage({
-                    document: documentToken,
-                    active: false
-                });
+    (() => {
+        const documentToken = globalThis.crypto?.randomUUID?.()
+            ?? `${Date.now()}-${performance.now()}-${Math.random()}`;
+        const report = () => {
+            const active = Array.from(document.querySelectorAll('audio,video'))
+                .some(media => !media.paused && !media.ended);
+            window.webkit.messageHandlers.activeMediaChanged.postMessage({
+                document: documentToken,
+                active: active
             });
-        })();
-        """
+        };
+        for (const event of ['play', 'pause', 'ended', 'emptied']) {
+            document.addEventListener(event, report, true);
+        }
+        window.addEventListener('pagehide', () => {
+            window.webkit.messageHandlers.activeMediaChanged.postMessage({
+                document: documentToken,
+                active: false
+            });
+        });
+    })();
+    """
 
     // MARK: - Decorator
 
@@ -906,6 +1322,7 @@ extension EPUBSpreadView: WKNavigationDelegate {
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        poison(with: .webContentTerminated)
         delegate?.spreadViewDidTerminate()
     }
 
@@ -937,6 +1354,61 @@ extension EPUBSpreadView: WKNavigationDelegate {
     }
 }
 
+@MainActor
+private final class SpreadLoadWaiter: @unchecked Sendable {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var isFinished = false
+
+    func wait() async {
+        guard !Task.isCancelled else {
+            finish()
+            return
+        }
+        await withCheckedContinuation { continuation in
+            if isFinished {
+                continuation.resume()
+            } else {
+                self.continuation = continuation
+                if Task.isCancelled {
+                    finish()
+                }
+            }
+        }
+    }
+
+    func finish() {
+        guard !isFinished else { return }
+        isFinished = true
+        let continuation = continuation
+        self.continuation = nil
+        continuation?.resume()
+    }
+}
+
+@MainActor
+private final class SpreadLoadResultWaiter: @unchecked Sendable {
+    private var continuation: CheckedContinuation<NavigationResult, Never>?
+    private var result: NavigationResult?
+
+    func wait() async -> NavigationResult {
+        if let result { return result }
+        return await withCheckedContinuation { continuation in
+            if let result {
+                continuation.resume(returning: result)
+            } else {
+                self.continuation = continuation
+            }
+        }
+    }
+
+    func finish(_ result: NavigationResult) {
+        guard self.result == nil else { return }
+        self.result = result
+        continuation?.resume(returning: result)
+        continuation = nil
+    }
+}
+
 extension EPUBSpreadView: UIScrollViewDelegate {
     func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
         scrollView.isUserInteractionEnabled = true
@@ -960,7 +1432,7 @@ extension EPUBSpreadView: UIScrollViewDelegate {
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        // Do not remove, overridden in subclasses.
+        viewportRevision &+= 1
     }
 }
 
@@ -1013,7 +1485,7 @@ final class PageTurnAnimationFrameWaiter: NSObject {
         }
     }
 
-    private override init() {
+    override private init() {
         super.init()
     }
 
@@ -1053,7 +1525,7 @@ final class PageTurnAnimationFrameWaiter: NSObject {
         isFinished = true
         displayLink?.invalidate()
         displayLink = nil
-        let continuation = self.continuation
+        let continuation = continuation
         self.continuation = nil
         continuation?.resume()
     }

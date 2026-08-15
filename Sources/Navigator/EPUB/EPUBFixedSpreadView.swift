@@ -152,16 +152,28 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
     }
 
     override func spreadDidLoad() async {
-        for continuation in goToContinuations {
-            continuation.resume()
-        }
-        goToContinuations.removeAll()
+        completeGoToWaiters(returning: true)
     }
 
     override func evaluateScript(_ script: String, inHREF href: AnyURL? = nil) async -> Result<Any, any Error> {
         let href = href?.string ?? ""
         let script = "spread.eval('\(href)', `\(script.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "`", with: "\\`"))`);"
         return await super.evaluateScript(script)
+    }
+
+    override func evaluateScript(
+        _ script: String,
+        inHREF href: AnyURL? = nil,
+        operation: NavigationOperationToken,
+        effect: JavaScriptEffect = .positionMutation
+    ) async -> NavigationValueResult<Any> {
+        let href = href?.string ?? ""
+        let wrapped = "spread.eval('\(href)', `\(script.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "`", with: "\\`"))`);"
+        return await super.evaluateScript(
+            wrapped,
+            operation: operation,
+            effect: effect
+        )
     }
 
     override func convertPointToNavigatorSpace(_ point: CGPoint) -> CGPoint {
@@ -193,18 +205,94 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
 
     // MARK: - Location and progression
 
-    private var goToContinuations: [CheckedContinuation<Void, Never>] = []
+    override func clear() {
+        super.clear()
+        completeGoToWaiters(returning: false)
+    }
 
-    override func go(to location: PageLocation, animated: Bool) async {
+    private var goToWaiters: [GoToWaiter] = []
+
+    override func go(
+        to location: PageLocation,
+        animated: Bool,
+        waitForLoad: Bool
+    ) async -> Bool {
         // Fixed layout resources are always fully visible so we don't use the
         // location.
 
         if isSpreadLoaded {
-            return
-        } else {
-            await withCheckedContinuation { continuation in
-                goToContinuations.append(continuation)
+            return true
+        }
+        guard waitForLoad else { return false }
+        let waiter = GoToWaiter()
+        goToWaiters.append(waiter)
+        return await withTaskCancellationHandler {
+            await waiter.wait()
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                waiter.resume(returning: false)
+                self?.goToWaiters.removeAll { $0 === waiter }
             }
+        }
+    }
+
+    override func go(
+        to location: PageLocation,
+        animated: Bool,
+        waitForLoad: Bool,
+        operation: NavigationOperationToken
+    ) async -> NavigationMutationResult {
+        if isSpreadLoaded {
+            let result = operation.check(spreadGeneration: spreadGeneration) ?? .applied
+            return .init(
+                result: result,
+                mayHaveMutated: false,
+                failureStage: result.isApplied ? nil : .preflight
+            )
+        }
+        guard waitForLoad else {
+            return .init(
+                result: .spreadNotLoaded,
+                mayHaveMutated: false,
+                failureStage: .targetLoad
+            )
+        }
+        let result = await spreadLoaded(operation: operation)
+        return .init(
+            result: result,
+            mayHaveMutated: false,
+            failureStage: result.isApplied ? nil : .targetLoad
+        )
+    }
+
+    private func completeGoToWaiters(returning result: Bool) {
+        for waiter in goToWaiters {
+            waiter.resume(returning: result)
+        }
+        goToWaiters.removeAll()
+    }
+
+    @MainActor
+    private final class GoToWaiter: @unchecked Sendable {
+        private var continuation: CheckedContinuation<Bool, Never>?
+        private var result: Bool?
+
+        func wait() async -> Bool {
+            await withCheckedContinuation { continuation in
+                if let result {
+                    continuation.resume(returning: result)
+                } else {
+                    self.continuation = continuation
+                }
+            }
+        }
+
+        func resume(returning result: Bool) {
+            guard self.result == nil else { return }
+            self.result = result
+            let continuation = continuation
+            self.continuation = nil
+            continuation?.resume(returning: result)
         }
     }
 }
