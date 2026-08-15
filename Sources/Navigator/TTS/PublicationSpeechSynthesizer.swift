@@ -26,7 +26,7 @@ public class PublicationSpeechSynthesizer: Loggable {
     public typealias TokenizerFactory = (_ defaultLanguage: Language?) -> ContentTokenizer
 
     /// Returns whether the `publication` can be played with a `PublicationSpeechSynthesizer`.
-    nonisolated public static func canSpeak(publication: Publication) -> Bool {
+    public nonisolated static func canSpeak(publication: Publication) -> Bool {
         publication.content() != nil
     }
 
@@ -187,7 +187,7 @@ public class PublicationSpeechSynthesizer: Loggable {
     }
 
     /// The default content tokenizer will split the `Content.Element` items into individual sentences.
-    nonisolated public static let defaultTokenizerFactory: TokenizerFactory = { defaultLanguage in
+    public nonisolated static let defaultTokenizerFactory: TokenizerFactory = { defaultLanguage in
         makeTextContentTokenizer(
             defaultLanguage: defaultLanguage,
             contextSnippetLength: 50,
@@ -198,6 +198,7 @@ public class PublicationSpeechSynthesizer: Loggable {
     }
 
     // MARK: - Playback / prefetch state machine
+
     //
     // Invariants (review every entry point against these — do not update fields ad hoc):
     //
@@ -759,7 +760,7 @@ public class PublicationSpeechSynthesizer: Loggable {
         let oldPrefetchTask = invalidatePrefetch()
         operationGeneration &+= 1
         let generation = operationGeneration
-        let prefetchGeneration = self.prefetchGeneration
+        let prefetchGeneration = prefetchGeneration
         setStartText(from: startLocator)
         resetIterator(nil)
         let weakSynthesizer = WeakPublicationSpeechSynthesizer(self)
@@ -786,14 +787,15 @@ public class PublicationSpeechSynthesizer: Loggable {
                 await result.value()
             },
             onCancel: {
+                guard result.claim(false) else { return }
                 task.cancel()
-                result.finish(false)
                 Task { @MainActor in
                     weakSynthesizer.value?.cancelInitialPrefetchIfCurrent(
                         operationGeneration: generation,
                         startLocator: startLocator,
                         prefetchGeneration: prefetchGeneration
                     )
+                    result.completeClaimedResult()
                 }
             }
         )
@@ -817,7 +819,7 @@ public class PublicationSpeechSynthesizer: Loggable {
         ) == true else {
             return false
         }
-        guard let utterance = await Self.nextUtterance(
+        guard let utterance = await nextUtterance(
             weakSynthesizer: weakSynthesizer,
             direction: .forward,
             generation: generation
@@ -835,9 +837,9 @@ public class PublicationSpeechSynthesizer: Loggable {
             request.utterance,
             maximumDuration: Self.maximumSingleUtterancePrefetchDuration
         ),
-        prefetchDuration.isFinite,
-        prefetchDuration > 0,
-        prefetchDuration <= Self.maximumSingleUtterancePrefetchDuration
+            prefetchDuration.isFinite,
+            prefetchDuration > 0,
+            prefetchDuration <= Self.maximumSingleUtterancePrefetchDuration
         else { return false }
         guard !Task.isCancelled else { return false }
         return weakSynthesizer.value?.commitInitialPrefetch(
@@ -1458,7 +1460,12 @@ public class PublicationSpeechSynthesizer: Loggable {
             }
             return false
         case let .failure(error):
-            guard let self = weakSynthesizer.value else { return false }
+            guard
+                let self = weakSynthesizer.value,
+                self.isCurrentPlayingOperation(generation)
+            else {
+                return false
+            }
             self.invalidatePrefetch()
             self.state = .paused(utterance)
             self.delegate?.publicationSpeechSynthesizer(
@@ -2425,8 +2432,8 @@ public class PublicationSpeechSynthesizer: Loggable {
         else {
             return
         }
-        cancelPlaybackTask()
-        invalidatePrefetch()
+        playbackOperation?.task.cancel()
+        _ = invalidatePrefetch()
     }
 
     @discardableResult
@@ -2733,14 +2740,20 @@ public class PublicationSpeechSynthesizer: Loggable {
 /// Bridges the operation-owned initial preparation task back to its caller
 /// without making the caller's task the owner of preparation work.
 private final class InitialPrefetchResult: @unchecked Sendable {
+    private enum State {
+        case pending
+        case claimed(Bool)
+        case completed(Bool)
+    }
+
     private let lock = NSLock()
-    private var result: Bool?
+    private var state: State = .pending
     private var continuation: CheckedContinuation<Bool, Never>?
 
     func value() async -> Bool {
         await withCheckedContinuation { continuation in
             lock.lock()
-            if let result {
+            if case let .completed(result) = state {
                 lock.unlock()
                 continuation.resume(returning: result)
             } else {
@@ -2750,14 +2763,33 @@ private final class InitialPrefetchResult: @unchecked Sendable {
         }
     }
 
-    func finish(_ result: Bool) {
+    @discardableResult
+    func finish(_ result: Bool) -> Bool {
+        guard claim(result) else { return false }
+        completeClaimedResult()
+        return true
+    }
+
+    @discardableResult
+    func claim(_ result: Bool) -> Bool {
         lock.lock()
-        guard self.result == nil else {
+        guard case .pending = state else {
+            lock.unlock()
+            return false
+        }
+        state = .claimed(result)
+        lock.unlock()
+        return true
+    }
+
+    func completeClaimedResult() {
+        lock.lock()
+        guard case let .claimed(result) = state else {
             lock.unlock()
             return
         }
-        self.result = result
-        let continuation = self.continuation
+        state = .completed(result)
+        let continuation = continuation
         self.continuation = nil
         lock.unlock()
         continuation?.resume(returning: result)
@@ -2787,7 +2819,7 @@ private final class DetachedTaskLifecycleHandle: @unchecked Sendable {
 
     func cancelTask() {
         lock.lock()
-        let task = self.task
+        let task = task
         self.task = nil
         lock.unlock()
         task?.cancel()

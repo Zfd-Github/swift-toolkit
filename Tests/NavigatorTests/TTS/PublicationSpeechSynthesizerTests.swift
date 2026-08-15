@@ -130,6 +130,9 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         XCTAssertEqual(synthesizer.state, .stopped)
         // Invalidate wakes the waiter; cancel completes the pending engine work.
         XCTAssertEqual(engine.cancelPrefetchCount, 1)
+        try await waitUntil {
+            !synthesizer.isWaitingForForwardPrefetchForTesting
+        }
     }
 
     func testPauseDuringForwardPrefetchWaitDoesNotDeadlock() async throws {
@@ -154,6 +157,18 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
             return XCTFail("Expected paused state after pause during wait")
         }
         XCTAssertEqual(engine.cancelPrefetchCount, 1)
+        try await waitUntil {
+            !synthesizer.isWaitingForForwardPrefetchForTesting
+        }
+
+        synthesizer.resume()
+        try await waitUntil {
+            engine.spokenTexts == ["first", "first"] && engine.hasPendingPrefetch
+        }
+        engine.completeSpeech()
+        try await waitUntil { synthesizer.isWaitingForForwardPrefetchForTesting }
+        engine.completePrefetch(returning: 5)
+        try await waitUntil { engine.spokenTexts == ["first", "first", "second"] }
         synthesizer.stop()
     }
 
@@ -500,7 +515,7 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
 
             func makeTokenizer(language: Language?) -> ContentTokenizer {
                 { [self] element in
-                    try self.tokenize(element, language: language)
+                    try tokenize(element, language: language)
                 }
             }
 
@@ -569,6 +584,63 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         XCTAssertFalse(didPrefetch)
         XCTAssertEqual(engine.cancelPrefetchCount, 1)
         synthesizer.stop()
+    }
+
+    func testCancelledInitialPrefetchReturnsOnlyAfterEngineCleanup() async throws {
+        var returnedResult: Bool?
+        var observedCleanupBeforeReturn = false
+        let engine = PrefetchingTTSEngine(
+            defersPrefetch: true,
+            cancelsPendingPrefetch: true,
+            onCancelPrefetch: {
+                observedCleanupBeforeReturn = returnedResult == nil
+            }
+        )
+        let synthesizer = try makeSynthesizer(
+            elements: [textElement("first")],
+            engine: engine
+        )
+        let prefetchTask = Task {
+            let result = await synthesizer.prefetch()
+            returnedResult = result
+            return result
+        }
+
+        try await waitUntil { engine.hasPendingPrefetch }
+        let cancelledIdentifier = try XCTUnwrap(engine.prefetchedIdentifiers.first)
+        prefetchTask.cancel()
+
+        let didPrefetch = await prefetchTask.value
+        XCTAssertFalse(didPrefetch)
+        XCTAssertTrue(observedCleanupBeforeReturn)
+        XCTAssertEqual(engine.cancelPrefetchCount, 1)
+
+        synthesizer.start()
+        try await waitUntil { engine.spokenTexts == ["first"] }
+        XCTAssertNotEqual(engine.spokenIdentifiers.first, cancelledIdentifier)
+        XCTAssertEqual(engine.cancelPrefetchCount, 2)
+
+        synthesizer.stop()
+        engine.completeSpeech()
+    }
+
+    func testCancellationClaimsBeforeResponsiveWorkerCanFinish() async throws {
+        let engine = CancellationResponsivePrefetchEngine()
+        let synthesizer = try makeSynthesizer(
+            elements: [textElement("first")],
+            engine: engine
+        )
+        let prefetchTask = Task { await synthesizer.prefetch() }
+
+        try await waitUntil { engine.hasPendingPrefetch }
+        prefetchTask.cancel()
+
+        let didPrefetch = await prefetchTask.value
+        XCTAssertFalse(didPrefetch)
+        let cleanupCountBeforeStop = engine.cancelPrefetchCount
+        synthesizer.stop()
+
+        XCTAssertEqual(cleanupCountBeforeStop, 1)
     }
 
     func testAlreadyCancelledCallerRejectsSynchronousInitialPrefetchCompletion() async throws {
@@ -958,6 +1030,32 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         engine.completeSpeech()
         try await waitUntil { engine.spokenTexts == ["first", "second"] }
         XCTAssertEqual(engine.maximumConcurrentSpeeches, 1)
+        synthesizer.stop()
+        engine.completeSpeech()
+    }
+
+    func testCancelledSpeechFailureDoesNotAffectReplacementOperation() async throws {
+        let delegate = RecordingSpeechSynthesizerDelegate()
+        let engine = SpeechEngine(completesOnCancellation: false)
+        let synthesizer = try makeSynthesizer(
+            elements: [textElement("first"), textElement("second")],
+            engine: engine
+        )
+        synthesizer.delegate = delegate
+
+        synthesizer.start()
+        try await waitUntil { engine.spokenTexts == ["first"] }
+        synthesizer.next()
+
+        engine.failSpeech()
+        try await waitUntil { engine.spokenTexts == ["first", "second"] }
+
+        XCTAssertEqual(delegate.failedUtteranceTexts, [])
+        XCTAssertFalse(delegate.states.contains { state in
+            guard case let .paused(utterance) = state else { return false }
+            return utterance.text == "first"
+        })
+
         synthesizer.stop()
         engine.completeSpeech()
     }
@@ -2201,7 +2299,7 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
 
         try await waitUntil { !tokenizer.inputs.isEmpty }
         try await waitUntil {
-            tokenizer.inputs.count >= 2 || synthesizer.state == .stopped
+            tokenizer.inputs.count >= 2
         }
         XCTAssertEqual(iteratorFactoryCalls, 1)
         XCTAssertEqual(tokenizer.inputs, ["kept body", "kept body"])
@@ -2406,6 +2504,7 @@ final class PublicationSpeechSynthesizerTests: XCTestCase {
         // worker must not keep the synthesizer alive.
         synthesizer = nil
         try await waitUntil { weakSynthesizer == nil }
+        try await waitUntil { !engine.hasPendingSpeech }
     }
 
     func testReleasingSynthesizerDuringForwardPrefetchWaitAllowsDeinit() async throws {
@@ -2699,6 +2798,7 @@ private final class ReentrantTokenizer {
 @MainActor
 private final class RecordingSpeechSynthesizerDelegate: PublicationSpeechSynthesizerDelegate {
     private(set) var states: [PublicationSpeechSynthesizer.State] = []
+    private(set) var failedUtteranceTexts: [String] = []
     var onStateChange: ((PublicationSpeechSynthesizer.State) -> Void)?
 
     func publicationSpeechSynthesizer(
@@ -2713,7 +2813,9 @@ private final class RecordingSpeechSynthesizerDelegate: PublicationSpeechSynthes
         _ synthesizer: PublicationSpeechSynthesizer,
         utterance: PublicationSpeechSynthesizer.Utterance,
         didFailWithError error: PublicationSpeechSynthesizer.Error
-    ) {}
+    ) {
+        failedUtteranceTexts.append(utterance.text)
+    }
 }
 
 private final class IteratorContentService: ContentService {
@@ -3033,6 +3135,85 @@ private final class SpeechEngine: TTSEngine {
         guard !speechContinuations.isEmpty else { return }
         speechContinuations.removeFirst().resume(returning: .success(()))
     }
+
+    func failSpeech() {
+        guard !speechContinuations.isEmpty else { return }
+        let error = NSError(
+            domain: "PublicationSpeechSynthesizerTests",
+            code: 1
+        )
+        speechContinuations.removeFirst().resume(returning: .failure(.other(error)))
+    }
+}
+
+@MainActor
+private final class CancellationResponsivePrefetchEngine: TTSPrefetchingEngine {
+    nonisolated let availableVoices: [TTSVoice] = []
+    private(set) var cancelPrefetchCount = 0
+    private var request: CancellationResponsivePrefetchRequest?
+
+    var hasPendingPrefetch: Bool {
+        request != nil
+    }
+
+    func speak(
+        _ utterance: TTSUtterance,
+        onSpeakRange: @escaping (Range<String.Index>) -> Void
+    ) async -> Result<Void, TTSError> {
+        .success(())
+    }
+
+    func prefetch(
+        _ utterance: TTSUtterance,
+        maximumDuration: TimeInterval
+    ) async -> TimeInterval? {
+        let request = CancellationResponsivePrefetchRequest()
+        self.request = request
+        return await withTaskCancellationHandler {
+            await request.value()
+        } onCancel: {
+            request.resume(returning: nil)
+        }
+    }
+
+    func cancelPrefetch() {
+        cancelPrefetchCount += 1
+        let request = request
+        self.request = nil
+        request?.resume(returning: nil)
+    }
+}
+
+private final class CancellationResponsivePrefetchRequest: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<TimeInterval?, Never>?
+    private var result: TimeInterval??
+
+    func value() async -> TimeInterval? {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if let result {
+                lock.unlock()
+                continuation.resume(returning: result)
+            } else {
+                self.continuation = continuation
+                lock.unlock()
+            }
+        }
+    }
+
+    func resume(returning result: TimeInterval?) {
+        lock.lock()
+        guard self.result == nil else {
+            lock.unlock()
+            return
+        }
+        self.result = .some(result)
+        let continuation = continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: result)
+    }
 }
 
 @MainActor
@@ -3057,6 +3238,7 @@ private final class PrefetchingTTSEngine: TTSPrefetchingEngine {
     private let cancelsPendingPrefetch: Bool
     private let completesSpeechOnCancellation: Bool
     private let onPrefetch: (() -> Void)?
+    private let onCancelPrefetch: (() -> Void)?
     private var prefetchCallCount = 0
     private var activePrefetchCount = 0
 
@@ -3071,7 +3253,8 @@ private final class PrefetchingTTSEngine: TTSPrefetchingEngine {
         clampsPrefetchDuration: Bool = true,
         cancelsPendingPrefetch: Bool = false,
         completesSpeechOnCancellation: Bool = true,
-        onPrefetch: (() -> Void)? = nil
+        onPrefetch: (() -> Void)? = nil,
+        onCancelPrefetch: (() -> Void)? = nil
     ) {
         self.availableVoices = availableVoices
         self.defersPrefetch = defersPrefetch
@@ -3084,6 +3267,7 @@ private final class PrefetchingTTSEngine: TTSPrefetchingEngine {
         self.cancelsPendingPrefetch = cancelsPendingPrefetch
         self.completesSpeechOnCancellation = completesSpeechOnCancellation
         self.onPrefetch = onPrefetch
+        self.onCancelPrefetch = onCancelPrefetch
     }
 
     var hasPendingPrefetch: Bool {
@@ -3149,6 +3333,7 @@ private final class PrefetchingTTSEngine: TTSPrefetchingEngine {
 
     func cancelPrefetch() {
         cancelPrefetchCount += 1
+        onCancelPrefetch?()
         if cancelsPendingPrefetch {
             let continuations = prefetchContinuations.values
             prefetchContinuations = [:]

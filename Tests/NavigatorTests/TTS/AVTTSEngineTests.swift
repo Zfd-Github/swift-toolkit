@@ -4,8 +4,8 @@
 //  available in the top-level LICENSE file of the project.
 //
 
-@testable import ReadiumNavigator
 import AVFoundation
+@testable import ReadiumNavigator
 import ReadiumShared
 import XCTest
 
