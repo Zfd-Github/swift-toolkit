@@ -17,7 +17,7 @@
 - All four tokenizer destinations call `commitTokenization`; no caller writes playback utterances or buffered-group utterances after tokenization.
 - Preserve weak-self scopes across engine speech/prefetch, iterator movement, cancellation drain, and waiter suspension.
 - Use controllable gates, not sleeps, for all race assertions.
-- Run `scripts/test.sh NavigatorTests` for the affected suite and `scripts/test.sh` before handoff.
+- Run `scripts/test.sh ReadiumNavigatorTests` for the affected suite and `scripts/test.sh` before handoff.
 - Commit only to `hometail/readium-3.11`; never create or push a `codex/*` branch.
 
 ---
@@ -50,7 +50,7 @@ func testNavigationSupersededTokenizationRetainsPreparedStartText() async throws
 
 - [ ] **Step 2: Verify the test is red**
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testNavigationSupersededTokenizationRetainsPreparedStartText`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testNavigationSupersededTokenizationRetainsPreparedStartText`
 
 Expected: FAIL because a superseded recovery path still retains raw content or the behavior cannot be represented.
 
@@ -74,7 +74,7 @@ func testBufferedGroupRetokenizeReentryStopDoesNotCommitStaleResult() async thro
 }
 ```
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests`
 
 Expected: the two prepared-content tests fail for `prefix kept body`; the strengthened existing stable-slot characterization passes.
 
@@ -108,7 +108,7 @@ func testReplacingPlaybackOperationLeavesOnlyNewestWorkerPlayable() async throws
 
 - [ ] **Step 2: Verify the test is red**
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testReplacingPlaybackOperationLeavesOnlyNewestWorkerPlayable`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testReplacingPlaybackOperationLeavesOnlyNewestWorkerPlayable`
 
 Expected: FAIL until replacement has one task/lifecycle source of truth.
 
@@ -151,9 +151,9 @@ Replace `setCurrentTask(_:) ` and dispersed forward task fields with helpers tha
 
 - [ ] **Step 5: Verify behavior and commit**
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testReplacingPlaybackOperationLeavesOnlyNewestWorkerPlayable`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testReplacingPlaybackOperationLeavesOnlyNewestWorkerPlayable`
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testStopDuringForwardPrefetchWaitDoesNotDeadlock`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testStopDuringForwardPrefetchWaitDoesNotDeadlock`
 
 Expected: PASS.
 
@@ -184,7 +184,7 @@ func testSupersededFetchIsRecordedBeforeOppositeUndo() async throws {
 
 - [ ] **Step 2: Verify the test is red**
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testSupersededFetchIsRecordedBeforeOppositeUndo`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testSupersededFetchIsRecordedBeforeOppositeUndo`
 
 Expected: FAIL while fetch accounting is not committed before stale-operation exit.
 
@@ -228,13 +228,13 @@ In `loadNextUtterancesFromIterator` and `loadNextForwardGroup`, compute prepared
 
 - [ ] **Step 5: Verify and commit**
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testSupersededFetchIsRecordedBeforeOppositeUndo`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testSupersededFetchIsRecordedBeforeOppositeUndo`
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testPendingOppositeUndoAccountsForCancelThatStillReturnsElement`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testPendingOppositeUndoAccountsForCancelThatStillReturnsElement`
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testCancellingAfterEmptyRetokenizedGroupRewindsAllBufferedContent`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testCancellingAfterEmptyRetokenizedGroupRewindsAllBufferedContent`
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testPreviousCancelsSuspendedPrefetchAndRollsBackEmptyElement`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testPreviousCancelsSuspendedPrefetchAndRollsBackEmptyElement`
 
 Expected: PASS; second is not skipped/duplicated and empty group accounting is recoverable.
 
@@ -265,7 +265,7 @@ func testForwardCandidateCommitRejectsConfigSupersededToken() async throws {
 
 - [ ] **Step 2: Verify the test is red**
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testForwardCandidateCommitRejectsConfigSupersededToken`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testForwardCandidateCommitRejectsConfigSupersededToken`
 
 Expected: FAIL until candidate collection shares the same validation as every other destination.
 
@@ -294,15 +294,15 @@ Convert `consumeForwardGroup`, `loadNextUtterancesFromIterator`, `loadNextForwar
 
 - [ ] **Step 5: Verify and commit**
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testNavigationSupersededTokenizationRetainsPreparedStartText`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testNavigationSupersededTokenizationRetainsPreparedStartText`
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testConfigRetryExhaustionRetainsPreparedStartText`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testConfigRetryExhaustionRetainsPreparedStartText`
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testForwardCandidateCommitRejectsConfigSupersededToken`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testForwardCandidateCommitRejectsConfigSupersededToken`
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testBufferedGroupRetokenizeReentryConfigDoesNotCommitStaleResult`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testBufferedGroupRetokenizeReentryConfigDoesNotCommitStaleResult`
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testTokenizeReentryDoesNotCommitStaleForwardUtterances`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testTokenizeReentryDoesNotCommitStaleForwardUtterances`
 
 Expected: PASS.
 
@@ -333,7 +333,7 @@ func testInvalidatingForwardOperationDrainsAndRejectsStaleReadyResult() async th
 
 - [ ] **Step 2: Verify the test is red**
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testInvalidatingForwardOperationDrainsAndRejectsStaleReadyResult`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testInvalidatingForwardOperationDrainsAndRejectsStaleReadyResult`
 
 Expected: FAIL until task, ready queue, drain, and waiter ownership are atomic.
 
@@ -347,15 +347,15 @@ Migrate every entry point: `config.didSet`, `deinit`, `prefetch(from:)`, `start`
 
 - [ ] **Step 5: Run all verification and commit**
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests`
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testReleasingSynthesizerDuringForwardEnginePrefetchCancelsWork`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testReleasingSynthesizerDuringForwardEnginePrefetchCancelsWork`
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testReleasingSynthesizerDuringForwardPrefetchWaitAllowsDeinit`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testReleasingSynthesizerDuringForwardPrefetchWaitAllowsDeinit`
 
-Run: `scripts/test.sh NavigatorTests --filter PublicationSpeechSynthesizerTests/testReleasingSynthesizerAfterEmptyContentWhileIteratorIsSuspended`
+Run: `scripts/test.sh ReadiumNavigatorTests/PublicationSpeechSynthesizerTests/testReleasingSynthesizerAfterEmptyContentWhileIteratorIsSuspended`
 
-Run: `scripts/test.sh NavigatorTests`
+Run: `scripts/test.sh ReadiumNavigatorTests`
 
 Run: `scripts/test.sh`
 
