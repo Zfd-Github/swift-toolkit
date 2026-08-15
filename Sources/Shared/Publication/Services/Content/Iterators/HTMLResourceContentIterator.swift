@@ -355,7 +355,8 @@ public class HTMLResourceContentIterator: ContentIterator {
                 }
 
                 if let startDOMRange, isInsideStartElement,
-                   textNodeIndex < startDOMRange.start.textNodeIndex {
+                   textNodeIndex < startDOMRange.start.textNodeIndex
+                {
                     return
                 }
 

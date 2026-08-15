@@ -265,7 +265,7 @@ public class PDFResourceContentIterator: ContentIterator, Loggable {
                 pageIndex,
                 SharedTaskValue {
                     do {
-                        return .success(try await document.pageText(at: pageIndex))
+                        return try await .success(document.pageText(at: pageIndex))
                     } catch {
                         return .failure(error)
                     }

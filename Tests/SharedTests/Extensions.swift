@@ -24,8 +24,13 @@ final class AsyncGate: @unchecked Sendable {
     private var continuations: [CheckedContinuation<Void, Never>] = []
     private var opened = false
 
-    var waiterCount: Int { lock.withLock { continuations.count } }
-    var isOpen: Bool { lock.withLock { opened } }
+    var waiterCount: Int {
+        lock.withLock { continuations.count }
+    }
+
+    var isOpen: Bool {
+        lock.withLock { opened }
+    }
 
     func wait() async {
         await withCheckedContinuation { continuation in
