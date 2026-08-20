@@ -3848,6 +3848,26 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return recovery.isApplied ? result : recovery
     }
 
+    private func recoverPoisonedSpreadsIfNeeded(
+        after mutation: NavigationMutationResult,
+        stableLocator: Locator?,
+        operation: NavigationOperationToken
+    ) async -> NavigationMutationResult {
+        let result = await recoverPoisonedSpreadsIfNeeded(
+            after: mutation.result,
+            stableLocator: mutation.stableLocator ?? stableLocator,
+            operation: operation
+        )
+        guard result.isApplied else {
+            return mutation.replacingResult(
+                result,
+                stableLocator: stableLocator,
+                failureStage: mutation.failureStage ?? .settleRecovery
+            )
+        }
+        return mutation
+    }
+
     /// Closes the transaction only after a partial mutation has either restored
     /// and verified its stable locator or isolated the untrusted generation.
     private func finalizeNavigationMutation(
@@ -6049,27 +6069,56 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func go(to locator: Locator, options: NavigatorGoOptions) async -> Bool {
+        await navigate(to: locator, options: options).isApplied
+    }
+
+    public func navigate(
+        to locator: Locator,
+        options: NavigatorGoOptions
+    ) async -> NavigationOutcome {
         invalidateCurrentLocationRefresh()
         let normalized = publication.normalizeLocator(locator)
+        var mutation: NavigationMutationResult?
         let result = await navigationExecutor.submit(
             intent: .absolute(normalized.href.string),
             timeout: navigationOperationTimeout
         ) { [weak self] operation in
             guard let self else { return .cancelled }
             let stableLocator = currentLocation
-            let result = await performLocatorNavigation(
+            let navigation = await performLocatorNavigation(
                 to: normalized,
                 options: options,
                 operation: operation,
                 stableLocator: stableLocator
             )
-            return await recoverPoisonedSpreadsIfNeeded(
-                after: result,
+            let recovered = await recoverPoisonedSpreadsIfNeeded(
+                after: navigation,
                 stableLocator: stableLocator,
                 operation: operation
             )
+            mutation = recovered
+            return recovered.result
         }
-        return result.isApplied
+        let completed: NavigationMutationResult
+        if result.isApplied {
+            completed = mutation ?? .init(
+                result: result,
+                mayHaveMutated: false,
+                failureStage: .preflight
+            )
+        } else if let mutation {
+            completed = mutation.replacingResult(
+                result,
+                failureStage: mutation.failureStage ?? .settleRecovery
+            )
+        } else {
+            completed = .rejected(
+                result,
+                mayHaveMutated: false,
+                stage: .preflight
+            )
+        }
+        return NavigationOutcome(completed)
     }
 
     func performLocatorNavigationForTesting(
@@ -6083,6 +6132,20 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             options: options,
             operation: operation,
             stableLocator: stableLocator
+        ).result
+    }
+
+    func performLocatorNavigationMutationForTesting(
+        to locator: Locator,
+        options: NavigatorGoOptions = .init(animated: false),
+        operation: NavigationOperationToken,
+        stableLocator: Locator? = nil
+    ) async -> NavigationMutationResult {
+        await performLocatorNavigation(
+            to: locator,
+            options: options,
+            operation: operation,
+            stableLocator: stableLocator
         )
     }
 
@@ -6091,25 +6154,65 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         options: NavigatorGoOptions,
         operation: NavigationOperationToken,
         stableLocator: Locator?
-    ) async -> NavigationResult {
-        if let result = operation.check() { return result }
+    ) async -> NavigationMutationResult {
+        if let result = operation.check() {
+            return .rejected(
+                result,
+                mayHaveMutated: false,
+                stableLocator: stableLocator,
+                stage: .preflight
+            )
+        }
         let settleResult = await snapshotProvider.settleCapture(operation: operation)
-        guard settleResult.isApplied else { return settleResult }
+        guard settleResult.isApplied else {
+            return .rejected(
+                settleResult,
+                mayHaveMutated: false,
+                stableLocator: stableLocator,
+                stage: .settleRecovery
+            )
+        }
         // `settle()` can suspend while gestures and recovery callbacks run.
         // Acquire the navigation lease afterwards so it is still valid when
         // the jump starts mutating pagination/WebView state.
         let leaseResult = await awaitPageTurnNavigationLease(operation: operation)
-        guard leaseResult.isApplied else { return leaseResult }
+        guard leaseResult.isApplied else {
+            return .rejected(
+                leaseResult,
+                mayHaveMutated: false,
+                stableLocator: stableLocator,
+                stage: .preflight
+            )
+        }
         guard let locator = resolveLocatorProgression(locator) else {
-            return .failed(EPUBNavigatorViewController.EPUBError.spreadNotLoaded)
+            return .rejected(
+                .failed(EPUBNavigatorViewController.EPUBError.spreadNotLoaded),
+                mayHaveMutated: false,
+                stableLocator: stableLocator,
+                stage: .linkResolution
+            )
         }
         let recovery = await replacePoisonedPaginationIfNeeded(
             stableLocator: currentLocation,
             replacementLocator: locator,
             operation: operation
         )
-        guard recovery.isApplied else { return recovery }
-        if let result = operation.check() { return result }
+        guard recovery.isApplied else {
+            return .rejected(
+                recovery,
+                mayHaveMutated: false,
+                stableLocator: stableLocator,
+                stage: .settleRecovery
+            )
+        }
+        if let result = operation.check() {
+            return .rejected(
+                result,
+                mayHaveMutated: false,
+                stableLocator: stableLocator,
+                stage: .preflight
+            )
+        }
         snapshotProvider.invalidate()
         let options = EPUBPageTurnInteraction.discreteNavigationOptions(
             options,
@@ -6172,14 +6275,24 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             let spreadIndex = spreads.firstIndexWithReadingOrderIndex(index),
             on(.jump(locator))
         else {
-            return .spreadNotLoaded
+            return .rejected(
+                .spreadNotLoaded,
+                mayHaveMutated: false,
+                stableLocator: stableLocator,
+                stage: .targetLoad
+            )
         }
 
         let mutation: NavigationMutationResult
         if let goToIndex = pageTurnGoToIndexForTesting {
             // This hook replaces the mutation itself, so its result is always
             // treated as potentially having changed the visible position.
-            mutation = await .init(result: goToIndex(locator), mayHaveMutated: true)
+            let result = await goToIndex(locator)
+            mutation = .init(
+                result: result,
+                mayHaveMutated: true,
+                failureStage: result.isApplied ? nil : .pageViewMutation
+            )
         } else {
             mutation = await paginationView.goToIndexWithMutation(
                 spreadIndex,
@@ -6205,29 +6318,38 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         operation: NavigationOperationToken,
         stableLocator: Locator?,
         emitJumped: Bool = false
-    ) async -> NavigationResult {
+    ) async -> NavigationMutationResult {
         let stableLocator = mutation.stableLocator ?? stableLocator
-        let moved = mutation.mayHaveMutated
-        let verified: NavigationResult
+        let mutation = mutation.preservingStableLocator(stableLocator)
+        let verified: NavigationMutationResult
         if !mutation.result.isApplied {
-            verified = mutation.result
+            verified = mutation
         } else {
-            verified = await verifyLocatorNavigation(
+            let result = await verifyLocatorNavigation(
                 locator,
-                moved: moved,
+                moved: mutation.mayHaveMutated,
                 expectedSpreadIndex: expectedSpreadIndex,
                 operation: operation
             )
+            verified = result.isApplied
+                ? mutation
+                : mutation.replacingResult(
+                    result,
+                    stableLocator: stableLocator,
+                    failureStage: .verification
+                )
         }
-        if verified.isApplied {
+        if verified.result.isApplied {
             guard
                 let pagination = paginationView,
                 let spread = pagination.currentView as? EPUBSpreadView
             else {
                 return await restoreAfterFailedLocatorNavigation(
-                    .spreadNotLoaded,
-                    moved: moved,
-                    stableLocator: stableLocator,
+                    verified.replacingResult(
+                        .spreadNotLoaded,
+                        stableLocator: stableLocator,
+                        failureStage: .verification
+                    ),
                     operation: operation,
                     emitJumped: emitJumped
                 )
@@ -6252,27 +6374,33 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             )
             guard case let .applied((location?, newViewport)) = calculation else {
                 return await restoreAfterFailedLocatorNavigation(
-                    calculation.result,
-                    moved: moved,
-                    stableLocator: stableLocator,
+                    verified.replacingResult(
+                        calculation.result,
+                        stableLocator: stableLocator,
+                        failureStage: .locationCalculation
+                    ),
                     operation: operation,
                     emitJumped: emitJumped
                 )
             }
             guard location.href.isEquivalentTo(locator.href) else {
                 return await restoreAfterFailedLocatorNavigation(
-                    .spreadNotLoaded,
-                    moved: moved,
-                    stableLocator: stableLocator,
+                    verified.replacingResult(
+                        .spreadNotLoaded,
+                        stableLocator: stableLocator,
+                        failureStage: .locationCalculation
+                    ),
                     operation: operation,
                     emitJumped: emitJumped
                 )
             }
             guard calculatedLocator(location, matchesNavigationTarget: locator) else {
                 return await restoreAfterFailedLocatorNavigation(
-                    .spreadNotLoaded,
-                    moved: moved,
-                    stableLocator: stableLocator,
+                    verified.replacingResult(
+                        .spreadNotLoaded,
+                        stableLocator: stableLocator,
+                        failureStage: .locationCalculation
+                    ),
                     operation: operation,
                     emitJumped: emitJumped
                 )
@@ -6285,9 +6413,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 )
                 guard visibility.isApplied else {
                     return await restoreAfterFailedLocatorNavigation(
-                        visibility,
-                        moved: moved,
-                        stableLocator: stableLocator,
+                        verified.replacingResult(
+                            visibility,
+                            stableLocator: stableLocator,
+                            failureStage: .verification
+                        ),
                         operation: operation,
                         emitJumped: emitJumped
                     )
@@ -6314,11 +6444,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 ) == nil
             else {
                 return await restoreAfterFailedLocatorNavigation(
-                    operation.check(
-                        paginationGeneration: paginationGeneration
-                    ) ?? .superseded,
-                    moved: moved,
-                    stableLocator: stableLocator,
+                    verified.replacingResult(
+                        operation.check(
+                            paginationGeneration: paginationGeneration
+                        ) ?? .superseded,
+                        stableLocator: stableLocator,
+                        failureStage: .verification
+                    ),
                     operation: operation,
                     emitJumped: emitJumped
                 )
@@ -6328,9 +6460,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             let committedLocation = location.preservingTargetAnchors(from: locator)
             guard publishCurrentLocation(location: committedLocation, viewport: newViewport) else {
                 return await restoreAfterFailedLocatorNavigation(
-                    .spreadNotLoaded,
-                    moved: moved,
-                    stableLocator: stableLocator,
+                    verified.replacingResult(
+                        .spreadNotLoaded,
+                        stableLocator: stableLocator,
+                        failureStage: .publication
+                    ),
                     operation: operation,
                     emitJumped: emitJumped
                 )
@@ -6339,12 +6473,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 on(.jumped)
             }
             delegate?.navigator(self, didJumpTo: locator)
-            return verified
+            return .init(
+                result: .applied,
+                mayHaveMutated: verified.mayHaveMutated,
+                stableLocator: committedLocation,
+                stableVerified: true
+            )
         }
         return await restoreAfterFailedLocatorNavigation(
             verified,
-            moved: moved,
-            stableLocator: stableLocator,
             operation: operation,
             emitJumped: emitJumped
         )
@@ -6476,12 +6613,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func restoreAfterFailedLocatorNavigation(
-        _ result: NavigationResult,
-        moved: Bool,
-        stableLocator: Locator?,
+        _ mutation: NavigationMutationResult,
         operation: NavigationOperationToken,
         emitJumped: Bool
-    ) async -> NavigationResult {
+    ) async -> NavigationMutationResult {
+        let stableLocator = mutation.stableLocator
+        let moved = mutation.mayHaveMutated
         var restored = false
         if moved, let stableLocator {
             let restore = await restorePageTurnLocator(
@@ -6499,12 +6636,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             // We cannot safely leave a partially mutated reading position live.
             // Defer a poisoned replacement to an executor-owned recovery; an
             // already-expired operation cannot extend its absolute deadline.
-            poisonVisibleSpreads(with: result)
+            poisonVisibleSpreads(with: mutation.result)
         }
         if emitJumped {
             on(.jumped)
         }
-        return result
+        return restored ? mutation.verifiedStableLocation() : mutation
     }
 
     private func verifyLocatorNavigation(
@@ -6579,7 +6716,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 stableLocator: stableLocator
             )
             return await recoverPoisonedSpreadsIfNeeded(
-                after: navigation,
+                after: navigation.result,
                 stableLocator: stableLocator,
                 operation: operation
             )

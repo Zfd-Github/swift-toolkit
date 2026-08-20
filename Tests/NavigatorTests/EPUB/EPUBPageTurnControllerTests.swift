@@ -4366,12 +4366,16 @@ struct EPUBPageTurnControllerTests {
             intent: .absolute(target.href.string),
             timeout: .seconds(1)
         )
-        let result = await navigator.performLocatorNavigationForTesting(
+        let result = await navigator.performLocatorNavigationMutationForTesting(
             to: target,
             operation: operation,
             stableLocator: stable
         )
-        #expect(result.isApplied == false)
+        #expect(result.result.isApplied == false)
+        #expect(result.mayHaveMutated)
+        #expect(result.stableLocator == stable)
+        #expect(!result.stableVerified)
+        #expect(result.failureStage == .verification)
         #expect(restored?.locations.progression == 0.1)
         #expect(delegate.jumpCount == 0)
     }
@@ -4407,6 +4411,65 @@ struct EPUBPageTurnControllerTests {
         #expect(result.isApplied)
         #expect(delegate.jumpCount == 1)
         #expect(delegate.jumpedLocators.first?.locations.progression == 0.8)
+    }
+
+    @Test("navigate exposes applied only after verified locator publication")
+    func navigateExposesAppliedAfterVerifiedLocatorPublication() async throws {
+        let (navigator, delegate) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        navigator.pageTurnDisplayFrameWaiterForTesting = {}
+        var mutationTarget: Locator?
+        navigator.pageTurnGoToIndexForTesting = { locator in
+            mutationTarget = locator
+            return .applied
+        }
+        navigator.pageTurnMultiColumnGeometryForTesting = (
+            pageWidth: 390,
+            contentWidth: 3900,
+            progression: 0.8
+        )
+        let target = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(progression: 0.8),
+            text: .init(highlight: "Page")
+        )
+        navigator.locatorNavigationDOMTargetVerifierForTesting = { locator in
+            locator == target
+        }
+
+        let outcome = await navigator.navigate(
+            to: target,
+            options: .init(animated: false)
+        )
+
+        #expect(outcome == .applied)
+        #expect(mutationTarget == target)
+        #expect(delegate.jumpedLocators == [target])
+    }
+
+    @Test("legacy locator go remains a Bool applied wrapper")
+    func legacyLocatorGoRemainsBoolAppliedWrapper() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 1
+        )
+        navigator.pageTurnDisplayFrameWaiterForTesting = {}
+        navigator.pageTurnGoToIndexForTesting = { _ in .applied }
+        navigator.pageTurnMultiColumnGeometryForTesting = (
+            pageWidth: 390,
+            contentWidth: 3900,
+            progression: 0.8
+        )
+        let target = Locator(
+            href: AnyURL(string: "chapter-1.xhtml")!,
+            mediaType: .xhtml,
+            locations: .init(progression: 0.8)
+        )
+
+        #expect(await navigator.go(to: target, options: .init(animated: false)))
     }
 
     @Test("goToIndex timeout after mutation still restores the stable locator")
