@@ -976,6 +976,7 @@ final class PaginationView: UIView, Loggable {
             }
             if axis == .horizontalPaged {
                 setNeedsLayout()
+                layoutIfNeeded()
             }
         }
 
