@@ -280,6 +280,11 @@ final class NavigationOperation: @unchecked Sendable {
         }
     }
 
+    func rebindPaginationGenerationForRecovery(_ generation: UInt64) {
+        precondition(phase == .recovering)
+        paginationGeneration = generation
+    }
+
     func bindSpreadGeneration(_ generation: UInt64) {
         spreadGeneration = generation
     }

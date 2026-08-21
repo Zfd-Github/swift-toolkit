@@ -3775,6 +3775,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         } else {
             targetIndex = min(currentSpreadIndex, max(0, spreads.count - 1))
         }
+        operation.rebindPaginationGenerationForRecovery(paginationView.generation)
         let replacementMutation = await paginationView.goToIndexWithMutation(
             targetIndex,
             location: PageLocation(locator),

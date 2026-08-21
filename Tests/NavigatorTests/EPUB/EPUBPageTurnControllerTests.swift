@@ -4839,6 +4839,44 @@ struct EPUBPageTurnControllerTests {
         #expect(!paginationView.loadedViews.isEmpty)
     }
 
+    @Test("poison recovery rebinds the operation to the replacement pagination generation")
+    func poisonRecoveryRebindsOperationToReplacementPaginationGeneration() async throws {
+        let (navigator, _) = try await makeLoadedNavigator(
+            pageTurnStyle: .none,
+            chapterCount: 2
+        )
+        let window = UIWindow(frame: navigator.view.bounds)
+        window.addSubview(navigator.view)
+        window.isHidden = false
+        defer { window.isHidden = true }
+        await nextMainRunLoop()
+
+        let paginationView = try #require(currentPaginationView(in: navigator))
+        let stableLocator = try #require(navigator.currentLocation)
+        let currentSpread = try #require(paginationView.currentView as? EPUBSpreadView)
+        let originalGeneration = paginationView.generation
+        let operation = NavigationOperation(
+            operationID: 51,
+            intent: .reload("poison-recovery"),
+            timeout: .seconds(15)
+        )
+        operation.bindPaginationGeneration(originalGeneration)
+
+        currentSpread.poison(with: .webContentTerminated)
+        paginationView.isolateForDeferredReload(with: .webContentTerminated)
+        operation.beginRecovery()
+
+        #expect(paginationView.generation > originalGeneration)
+        let result = await navigator.replacePoisonedPaginationForTesting(
+            stableLocator: stableLocator,
+            operation: operation
+        )
+
+        #expect(result.isApplied)
+        #expect(paginationView.currentIndex == 0)
+        #expect(paginationView.loadedViews[0] != nil)
+    }
+
     @Test("timeout isolation preserves the exact original surface preview")
     func timeoutIsolationPreservesExactOriginalPreview() async throws {
         let (navigator, delegate) = try await makeLoadedNavigator(
