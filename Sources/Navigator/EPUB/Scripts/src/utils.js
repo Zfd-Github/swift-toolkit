@@ -42,7 +42,6 @@ window.addEventListener(
 );
 
 function onViewportWidthChanged() {
-  viewportWidth = window.innerWidth;
   appendVirtualColumnIfNeeded();
   snapCurrentPosition();
 }
@@ -77,7 +76,6 @@ function appendVirtualColumnIfNeeded() {
 
 var lastKnownProgressions;
 var ticking = false;
-var viewportWidth = 0;
 var viewportRect = null;
 var documentHeightObserver = null;
 
@@ -432,6 +430,7 @@ function scrollTo({ left, top, animated } = {}) {
 
 // Snap the offset to the screen width (page width).
 function snapOffset(offset) {
+  const viewportWidth = window.innerWidth;
   const delta = isRTL() ? -1 : 1;
   const value = offset + delta;
   return value - (value % viewportWidth);
